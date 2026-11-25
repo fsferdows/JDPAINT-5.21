@@ -966,6 +966,35 @@ body, html {
   border: 1px solid #d1d5db;
 }
 
+.layer-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  border: 1px solid rgba(0, 0, 0, 0.35);
+  flex-shrink: 0;
+}
+
+.layer-hole-tag {
+  font-size: 9px;
+  font-weight: bold;
+  padding: 0 3px;
+  border-radius: 2px;
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fcd34d;
+  flex-shrink: 0;
+}
+
+.tb-input {
+  background: #ffffff;
+  border: 1px solid #7f9db9;
+  border-radius: 2px;
+  font-size: 11px;
+  padding: 1px 3px;
+  height: 20px;
+  text-align: center;
+}
+
 .layer-name {
   flex: 1;
   overflow: hidden;

@@ -1,5 +1,7 @@
 // High-Speed 2D Vector to 3D Relief Puffing Engine (JDPaint Domain Forming & Stroke Emboss)
-// Optimized with shared offscreen canvas & tight Bounding-Box Scoped Euclidean Distance Transform (20x-50x faster!)
+// Optimized with shared offscreen canvas, compound evenodd holes, & adaptive Bounding-Box EDT
+
+import { CadCanvas } from './cadCanvas.js';
 
 export class VectorPuffEngine {
   static _sharedCanvas = null;
@@ -62,11 +64,30 @@ export class VectorPuffEngine {
       minY = Math.min(ent.y1, ent.y2) * scaleY; maxY = Math.max(ent.y1, ent.y2) * scaleY;
     } else if ((ent.type === 'polyline' || ent.type === 'curve') && ent.points?.length > 0) {
       let lx = Infinity, rx = -Infinity, ty = Infinity, by = -Infinity;
-      for (const p of ent.points) {
-        if (p.x < lx) lx = p.x;
-        if (p.x > rx) rx = p.x;
-        if (p.y < ty) ty = p.y;
-        if (p.y > by) by = p.y;
+      const expandRing = (ring) => {
+        if (!ring) return;
+        for (const p of ring) {
+          if (p.x < lx) lx = p.x;
+          if (p.x > rx) rx = p.x;
+          if (p.y < ty) ty = p.y;
+          if (p.y > by) by = p.y;
+          if (p.hIn) {
+            if (p.hIn.x < lx) lx = p.hIn.x;
+            if (p.hIn.x > rx) rx = p.hIn.x;
+            if (p.hIn.y < ty) ty = p.hIn.y;
+            if (p.hIn.y > by) by = p.hIn.y;
+          }
+          if (p.hOut) {
+            if (p.hOut.x < lx) lx = p.hOut.x;
+            if (p.hOut.x > rx) rx = p.hOut.x;
+            if (p.hOut.y < ty) ty = p.hOut.y;
+            if (p.hOut.y > by) by = p.hOut.y;
+          }
+        }
+      };
+      expandRing(ent.points);
+      if (ent.holes && ent.holes.length > 0) {
+        for (const hole of ent.holes) expandRing(hole);
       }
       minX = lx * scaleX; maxX = rx * scaleX;
       minY = ty * scaleY; maxY = by * scaleY;
@@ -131,6 +152,7 @@ export class VectorPuffEngine {
         shape: ent.relief?.shape || defaultPuff.shape || 'dome',
         heightMm: ent.relief?.heightMm ?? defaultPuff.heightMm ?? 4.0,
         radiusMm: ent.relief?.radiusMm ?? defaultPuff.radiusMm ?? 12.0,
+        adaptiveRadius: ent.relief?.adaptiveRadius ?? defaultPuff.adaptiveRadius ?? true,
         mode: ent.relief?.mode || defaultPuff.mode || 'max',
         forceCloseOpen: false,
       };
@@ -144,37 +166,45 @@ export class VectorPuffEngine {
   }
 
   static traceSmoothPath(ctx, pts, isClosed, scaleX, scaleY) {
-    if (!pts || pts.length < 2) return;
-    let ring = pts;
-    if (isClosed && pts.length >= 3 && Math.hypot(pts[0].x - pts[pts.length - 1].x, pts[0].y - pts[pts.length - 1].y) < 0.05) {
-      ring = pts.slice(0, -1);
-    }
-    const M = ring.length;
-    if (M === 2 || !isClosed) {
-      ctx.moveTo(pts[0].x * scaleX, pts[0].y * scaleY);
-      if (pts.length === 2) {
-        ctx.lineTo(pts[1].x * scaleX, pts[1].y * scaleY);
+    CadCanvas.traceSmoothCanvasPath(ctx, pts, isClosed, (x) => x * scaleX, (y) => y * scaleY);
+  }
+
+  /**
+   * Trace closed outer contour + all compound holes into current Canvas2D path for evenodd fill.
+   */
+  static traceClosedEntitySubpaths(ctx, ent, scaleX, scaleY) {
+    if (ent.type === 'rect') {
+      const rr = (ent.cornerRadius || 0) * scaleX;
+      if (rr > 0.5 && typeof ctx.roundRect === 'function') {
+        ctx.roundRect(ent.x * scaleX, ent.y * scaleY, ent.w * scaleX, ent.h * scaleY, rr);
       } else {
-        for (let i = 1; i < pts.length - 1; i++) {
-          const mx = (pts[i].x + pts[i + 1].x) / 2;
-          const my = (pts[i].y + pts[i + 1].y) / 2;
-          ctx.quadraticCurveTo(pts[i].x * scaleX, pts[i].y * scaleY, mx * scaleX, my * scaleY);
-        }
-        ctx.lineTo(pts[pts.length - 1].x * scaleX, pts[pts.length - 1].y * scaleY);
+        ctx.rect(ent.x * scaleX, ent.y * scaleY, ent.w * scaleX, ent.h * scaleY);
       }
-      if (isClosed) ctx.closePath();
       return;
     }
-
-    const startMidX = (ring[M - 1].x + ring[0].x) / 2;
-    const startMidY = (ring[M - 1].y + ring[0].y) / 2;
-    ctx.moveTo(startMidX * scaleX, startMidY * scaleY);
-    for (let i = 0; i < M; i++) {
-      const pi = ring[i];
-      const pnext = ring[(i + 1) % M];
-      ctx.quadraticCurveTo(pi.x * scaleX, pi.y * scaleY, ((pi.x + pnext.x) / 2) * scaleX, ((pi.y + pnext.y) / 2) * scaleY);
+    if (ent.type === 'circle') {
+      ctx.arc(ent.cx * scaleX, ent.cy * scaleY, Math.max(0.1, ent.r) * scaleX, 0, Math.PI * 2);
+      return;
     }
-    ctx.closePath();
+    const tracePolyRing = (ring) => {
+      if (!ring || ring.length < 3) return;
+      ctx.moveTo(ring[0].x * scaleX, ring[0].y * scaleY);
+      for (let i = 1; i < ring.length; i++) ctx.lineTo(ring[i].x * scaleX, ring[i].y * scaleY);
+      ctx.closePath();
+    };
+    if (ent.type === 'curve' && ent.points?.length >= 2) {
+      VectorPuffEngine.traceSmoothPath(ctx, ent.points, true, scaleX, scaleY);
+      if (ent.holes && ent.holes.length > 0) {
+        for (const hole of ent.holes) {
+          if (hole.length >= 2) VectorPuffEngine.traceSmoothPath(ctx, hole, true, scaleX, scaleY);
+        }
+      }
+    } else if (ent.type === 'polyline' && ent.points?.length >= 3) {
+      tracePolyRing(ent.points);
+      if (ent.holes && ent.holes.length > 0) {
+        for (const hole of ent.holes) tracePolyRing(hole);
+      }
+    }
   }
 
   /**
@@ -185,35 +215,14 @@ export class VectorPuffEngine {
     const ctx = maskCanvas.getContext('2d', { willReadFrequently: true });
     ctx.clearRect(0, 0, N, N);
     ctx.fillStyle = '#ffffff';
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth = 2.0;
 
     const scaleX = N / wMm;
     const scaleY = N / hMm;
 
     for (const ent of entities) {
       ctx.beginPath();
-      if (ent.type === 'rect') {
-        const rr = (ent.cornerRadius || 0) * scaleX;
-        if (rr > 0.5 && typeof ctx.roundRect === 'function') {
-          ctx.roundRect(ent.x * scaleX, ent.y * scaleY, ent.w * scaleX, ent.h * scaleY, rr);
-        } else {
-          ctx.rect(ent.x * scaleX, ent.y * scaleY, ent.w * scaleX, ent.h * scaleY);
-        }
-      } else if (ent.type === 'circle') {
-        ctx.arc(ent.cx * scaleX, ent.cy * scaleY, Math.max(0.1, ent.r) * scaleX, 0, Math.PI * 2);
-      } else if ((ent.type === 'polyline' || ent.type === 'curve') && ent.points?.length >= 3) {
-        if (ent.type === 'curve') {
-          VectorPuffEngine.traceSmoothPath(ctx, ent.points, true, scaleX, scaleY);
-        } else {
-          const pts = ent.points;
-          ctx.moveTo(pts[0].x * scaleX, pts[0].y * scaleY);
-          for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x * scaleX, pts[i].y * scaleY);
-          ctx.closePath();
-        }
-      }
-      ctx.fill();
-      ctx.stroke();
+      VectorPuffEngine.traceClosedEntitySubpaths(ctx, ent, scaleX, scaleY);
+      ctx.fill('evenodd');
     }
 
     const data = ctx.getImageData(0, 0, N, N).data;
@@ -229,6 +238,7 @@ export class VectorPuffEngine {
       shape = 'dome',
       heightMm = 4.0,
       radiusMm = 12.0,
+      adaptiveRadius = true,
       mode = 'max',
       clearBefore = false,
       useLayerSettings = false,
@@ -248,10 +258,11 @@ export class VectorPuffEngine {
             shape: ent.relief.shape || shape,
             heightMm: ent.relief.heightMm ?? heightMm,
             radiusMm: ent.relief.radiusMm ?? radiusMm,
+            adaptiveRadius: ent.relief.adaptiveRadius ?? adaptiveRadius,
             mode: ent.relief.mode || mode,
             forceCloseOpen,
           }
-        : { shape, heightMm, radiusMm, mode, forceCloseOpen };
+        : { shape, heightMm, radiusMm, adaptiveRadius, mode, forceCloseOpen };
 
       VectorPuffEngine.applyEntityToRelief(ent, reliefEngine, cfg);
     }
@@ -261,13 +272,14 @@ export class VectorPuffEngine {
   }
 
   /**
-   * High-Speed Bounding-Box Scoped Entity Rasterization & EDT Puffing
+   * High-Speed Bounding-Box Scoped Entity Rasterization & Adaptive EDT Puffing
    */
   static applyEntityToRelief(ent, reliefEngine, cfg) {
     const {
       shape = 'dome',
       heightMm = 4.0,
       radiusMm = 12.0,
+      adaptiveRadius = false,
       mode = 'max',
       forceCloseOpen = false,
     } = cfg;
@@ -323,26 +335,8 @@ export class VectorPuffEngine {
     } else {
       ctx.fillStyle = '#ffffff';
       ctx.beginPath();
-      if (ent.type === 'rect') {
-        const rr = (ent.cornerRadius || 0) * scaleX;
-        if (rr > 0.5 && typeof ctx.roundRect === 'function') {
-          ctx.roundRect(ent.x * scaleX, ent.y * scaleY, ent.w * scaleX, ent.h * scaleY, rr);
-        } else {
-          ctx.rect(ent.x * scaleX, ent.y * scaleY, ent.w * scaleX, ent.h * scaleY);
-        }
-      } else if (ent.type === 'circle') {
-        ctx.arc(ent.cx * scaleX, ent.cy * scaleY, Math.max(0.1, ent.r) * scaleX, 0, Math.PI * 2);
-      } else if (ent.type === 'curve') {
-        VectorPuffEngine.traceSmoothPath(ctx, ent.points, true, scaleX, scaleY);
-      } else if (ent.type === 'polyline') {
-        const pts = ent.points;
-        ctx.moveTo(pts[0].x * scaleX, pts[0].y * scaleY);
-        for (let i = 1; i < pts.length; i++) {
-          ctx.lineTo(pts[i].x * scaleX, pts[i].y * scaleY);
-        }
-        ctx.closePath();
-      }
-      ctx.fill();
+      VectorPuffEngine.traceClosedEntitySubpaths(ctx, ent, scaleX, scaleY);
+      ctx.fill('evenodd');
     }
 
     // Read ONLY the bounding-box pixels with sub-pixel coverage anti-aliasing
@@ -363,9 +357,16 @@ export class VectorPuffEngine {
 
     // Run Exact Euclidean Distance Transform ONLY on the bw x bh sub-tile!
     const distField = VectorPuffEngine.computeInteriorDistanceRect(mask, box.bw, box.bh);
+    let actualMaxDistPx = 0;
+    for (let i = 0; i < tileLen; i++) {
+      if (mask[i] === 1 && distField[i] > actualMaxDistPx) actualMaxDistPx = distField[i];
+    }
 
     const effectiveRadiusMm = isStroke ? strokeHalfWidthMm : radiusMm;
-    const targetRadiusPixels = Math.max(1, effectiveRadiusMm / mmPerPixel);
+    const rawTargetPx = Math.max(1.0, effectiveRadiusMm / mmPerPixel);
+    const targetRadiusPixels = (adaptiveRadius || ent.relief?.adaptiveRadius) && actualMaxDistPx > 0
+      ? Math.min(rawTargetPx, Math.max(1.2, actualMaxDistPx))
+      : rawTargetPx;
     const normHeight = Math.min(1.0, Math.max(0.0, Math.abs(heightMm) / maxDepth));
 
     for (let ly = 0; ly < box.bh; ly++) {

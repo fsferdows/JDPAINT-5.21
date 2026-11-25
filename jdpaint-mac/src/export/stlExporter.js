@@ -140,36 +140,60 @@ export class StlExporter {
   }
 
   /**
-   * Export 2D CAD vector geometry to standard ASCII AutoCAD R12 DXF (metric mm, upright CNC Y+ axis)
+   * Export 2D CAD vector geometry to standard ASCII AutoCAD R12 DXF with per-layer separation (metric mm, upright CNC Y+ axis)
    */
   static exportToDXF(cadCanvas) {
     const h = cadCanvas.workpieceHeight || 100;
-    const polylines = cadCanvas.getPolylinesForCAM();
+    const items = typeof cadCanvas.getPolylinesForCAMWithMeta === 'function'
+      ? cadCanvas.getPolylinesForCAMWithMeta()
+      : cadCanvas.getPolylinesForCAM().map((points) => ({ points, layerName: '0' }));
+
+    const sanitizeLayer = (name) => String(name || '0').replace(/[^A-Za-z0-9_-]/g, '_').replace(/^_+|_+$/g, '') || '0';
+    const layerNames = [];
+    const seen = new Set();
+    for (const item of items) {
+      const ln = sanitizeLayer(item.layerName);
+      if (!seen.has(ln)) { seen.add(ln); layerNames.push(ln); }
+    }
+    if (layerNames.length === 0) layerNames.push('0');
+
     const lines = [
       '0', 'SECTION',
       '2', 'HEADER',
       '9', '$INSUNITS', '70', '4', // 4 = Millimeters
       '0', 'ENDSEC',
       '0', 'SECTION',
-      '2', 'ENTITIES',
+      '2', 'TABLES',
+      '0', 'TABLE',
+      '2', 'LAYER',
+      '70', String(layerNames.length),
     ];
 
-    for (const poly of polylines) {
+    layerNames.forEach((ln, idx) => {
+      const aciColor = String((idx % 7) + 1);
+      lines.push('0', 'LAYER', '2', ln, '70', '0', '62', aciColor, '6', 'CONTINUOUS');
+    });
+
+    lines.push('0', 'ENDTAB', '0', 'ENDSEC', '0', 'SECTION', '2', 'ENTITIES');
+
+    for (const item of items) {
+      const poly = item.points;
+      const layer = sanitizeLayer(item.layerName);
       if (!poly || poly.length < 2) continue;
       if (poly.length === 2) {
         lines.push(
           '0', 'LINE',
-          '8', '0',
+          '8', layer,
           '10', poly[0].x.toFixed(4), '20', (h - poly[0].y).toFixed(4), '30', '0.0',
           '11', poly[1].x.toFixed(4), '21', (h - poly[1].y).toFixed(4), '31', '0.0'
         );
       } else {
         const isClosed = Math.hypot(poly[0].x - poly[poly.length - 1].x, poly[0].y - poly[poly.length - 1].y) < 0.05;
         const pts = isClosed ? poly.slice(0, -1) : poly;
-        lines.push('0', 'POLYLINE', '8', '0', '66', '1', '70', isClosed ? '1' : '0');
+        lines.push('0', 'POLYLINE', '8', layer, '66', '1', '70', isClosed ? '1' : '0');
         for (const p of pts) {
           lines.push(
-            '0', 'VERTEX', '8', '0',
+            '0', 'VERTEX', '8', layer,
             '10', p.x.toFixed(4),
             '20', (h - p.y).toFixed(4),
             '30', '0.0'

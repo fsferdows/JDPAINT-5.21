@@ -484,11 +484,26 @@ document.addEventListener('DOMContentLoaded', () => {
         scheduleAutoSync3D();
       });
 
+      // Perceptual swatch chip
+      const swatch = document.createElement('span');
+      swatch.className = 'layer-swatch';
+      swatch.style.backgroundColor = ent.fillColor || ent.color || '#38bdf8';
+      swatch.title = `Layer Fill: ${ent.fillColor || ent.color || '#38bdf8'}`;
+
       // Layer name
       const nameSpan = document.createElement('span');
       nameSpan.className = 'layer-name';
       nameSpan.textContent = ent.name || `Layer #${i + 1}`;
-      nameSpan.title = `${ent.name} (${ent.type})`;
+      nameSpan.title = `${ent.name} (${ent.type})${ent.layerGroup ? ` — ${ent.layerGroup}` : ''}`;
+
+      // Compound hole indicator badge
+      let holeTag = null;
+      if (ent.holes && ent.holes.length > 0) {
+        holeTag = document.createElement('span');
+        holeTag.className = 'layer-hole-tag';
+        holeTag.textContent = `-${ent.holes.length}h`;
+        holeTag.title = `${ent.holes.length} compound cutout hole(s) — click "Release Holes" to separate`;
+      }
 
       // Move Up (higher draw/merge priority)
       const upBtn = document.createElement('button');
@@ -551,7 +566,11 @@ document.addEventListener('DOMContentLoaded', () => {
         syncSelectedLayerInspector();
       });
 
-      row.append(eyeBtn, lockBtn, badge, nameSpan, upBtn, downBtn, delBtn);
+      if (holeTag) {
+        row.append(eyeBtn, lockBtn, swatch, badge, nameSpan, holeTag, upBtn, downBtn, delBtn);
+      } else {
+        row.append(eyeBtn, lockBtn, swatch, badge, nameSpan, upBtn, downBtn, delBtn);
+      }
       layerListContainer.appendChild(row);
     }
   }
@@ -796,10 +815,26 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const btnLayerNodeEdit = document.getElementById('layer-btn-node-edit');
   if (btnLayerNodeEdit) btnLayerNodeEdit.addEventListener('click', () => selectTool('node'));
+  const btnLayerToggleCorner = document.getElementById('layer-btn-toggle-corner');
+  if (btnLayerToggleCorner) {
+    btnLayerToggleCorner.addEventListener('click', () => {
+      if (!cadCanvas.toggleSelectedNodeCorner()) {
+        statusMode.textContent = 'Select a node first in Node Edit (N) mode to toggle Corner/Smooth.';
+      }
+    });
+  }
   const btnLayerClosePath = document.getElementById('layer-btn-close-path');
   if (btnLayerClosePath) btnLayerClosePath.addEventListener('click', () => cadCanvas.closeSelectedCurve());
   const btnLayerSmooth = document.getElementById('layer-btn-smooth');
   if (btnLayerSmooth) btnLayerSmooth.addEventListener('click', () => cadCanvas.smoothSelectedCurve());
+  const btnLayerBreakHoles = document.getElementById('layer-btn-break-holes');
+  if (btnLayerBreakHoles) {
+    btnLayerBreakHoles.addEventListener('click', () => {
+      const released = cadCanvas.breakApartCompound();
+      if (released > 0) statusMode.textContent = `Released ${released} compound hole(s) into independent editable layers.`;
+      else alert('Selected layer has no compound inner holes to release.');
+    });
+  }
 
   const btnShowAllLayers = document.getElementById('btn-layers-show-all');
   if (btnShowAllLayers) {
@@ -825,6 +860,21 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  function getTraceOptions() {
+    return {
+      threshold: parseFloat(document.getElementById('trace-threshold-mode')?.value) || -1,
+      invert: document.getElementById('relief-invert-check')?.checked || false,
+      traceMode: document.getElementById('trace-mode-select')?.value || 'auto',
+      detail: (parseInt(sliderTraceDetail?.value || '50', 10)) / 100,
+      colorCount: Math.max(2, Math.min(16, parseInt(document.getElementById('trace-colors')?.value || '6', 10) || 6)),
+      stackMethod: document.getElementById('trace-stack-mode')?.value || 'stacked',
+      corners: (parseInt(document.getElementById('trace-corners')?.value || '65', 10)) / 100,
+      noisePx: Math.max(0, parseInt(document.getElementById('trace-noise')?.value || '10', 10) || 0),
+      ignoreBg: document.getElementById('trace-ignore-bg')?.checked ?? true,
+      maxDepthMm: reliefEngine.maxDepth || 8.0,
+    };
+  }
+
   // ============================================================
   // AUTO-TRACE PICTURE TO 2D VECTORS (Instant 2D Conversion!)
   // ============================================================
@@ -834,23 +884,18 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    const thresholdVal = parseFloat(document.getElementById('trace-threshold-mode')?.value) || -1;
-    const invert = document.getElementById('relief-invert-check')?.checked || false;
-    const traceMode = document.getElementById('trace-mode-select')?.value || 'auto';
-    const detail = (parseInt(sliderTraceDetail?.value || '50', 10)) / 100;
-
-    statusMode.textContent = `Tracing (${traceMode.toUpperCase()}, ${Math.round(detail * 100)}% detail) into separate editable 2D CAD vector layers...`;
+    const opts = getTraceOptions();
+    statusMode.textContent = `Tracing (${opts.traceMode.toUpperCase()}, ${opts.colorCount} colors/tones, ${Math.round(opts.detail * 100)}% detail) into separate 2D compound vector layers...`;
     setTimeout(() => {
       const count = cadCanvas.autoTraceReferenceImage({
-        threshold: thresholdVal,
-        invert,
-        traceMode,
-        detail,
-        simplification: 0.22,
+        ...opts,
         smoothCurves: true,
+        autoEnable3D: true,
       });
       selectTool('select');
-      statusMode.textContent = `Auto-Trace complete! Generated ${count} separate 2D layers (${traceMode}). Use Pen (B) to replace/edit sections, Reshape (H), or Node Edit (N)!`;
+      renderLayerList();
+      syncSelectedLayerInspector();
+      statusMode.textContent = `Auto-Trace complete! Generated ${count} compound 2D layers (${opts.traceMode}). Use Node Edit (N) to tweak Bezier handles, or Canvas → 3D!`;
     }, 30);
   }
 
@@ -906,7 +951,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // ============================================================
-  // ONE-CLICK AUTO DUAL CONVERSION (Editable 2D Layers + 3D Relief!)
+  // ONE-CLICK AUTO DUAL CONVERSION (100% Synced 2D Vector Layers + 3D Relief!)
   // ============================================================
   function runOneClickAuto() {
     if (!loadedImageElement) {
@@ -914,45 +959,47 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    statusMode.textContent = 'Running Full One-Click Vectorization + High-Accuracy 3D Relief...';
+    statusMode.textContent = 'Running Illustrator-Grade Image Trace + 100% Layer-Synchronized 3D Relief...';
     setTimeout(() => {
-      const thresholdVal = parseFloat(document.getElementById('trace-threshold-mode')?.value) || -1;
-      const invert = document.getElementById('relief-invert-check')?.checked || false;
-      const traceMode = document.getElementById('trace-mode-select')?.value || 'auto';
-      const detail = (parseInt(sliderTraceDetail?.value || '50', 10)) / 100;
+      const opts = getTraceOptions();
       const style = document.getElementById('relief-style')?.value || 'sculpted';
       const edgeStrength = parseFloat(document.getElementById('relief-edge-strength')?.value) || 0.35;
       const removeWhiteBg = document.getElementById('relief-remove-bg')?.checked ?? true;
 
-      // 1. Generate High-Accuracy Base Photo Heightmap & keep as controllable Base Layer
+      // 1. Pre-compute optional photo texture buffer (kept available in Base Layer panel)
       reliefEngine.loadImageHighAccuracy(loadedImageElement, {
         style,
         edgeStrength,
-        invert,
+        invert: opts.invert,
         removeWhiteBg,
         denoise: true,
       });
       basePhotoBuffer = new Float32Array(reliefEngine.data);
-      basePhotoEnabled = true;
-      basePhotoWeight = 1.0;
-      updateBasePhotoBox();
 
-      // 2. Trace editable 2D vector contour layers (start as 2D guide layers so raw photo relief stays crisp; click any 2D badge to boost/carve in 3D!)
+      // 2. Trace editable 2D compound Bezier vector layers (with autoEnable3D: true!)
       const vectorCount = cadCanvas.autoTraceReferenceImage({
-        threshold: thresholdVal,
-        invert,
-        traceMode,
-        detail,
-        simplification: 0.22,
+        ...opts,
         smoothCurves: true,
-        autoEnable3D: false,
+        autoEnable3D: true,
       });
+
+      // 3. Drive 3D Relief directly from the exact traced 2D vector layers for 100% 2D↔3D fidelity!
+      if (vectorCount > 0) {
+        basePhotoEnabled = false;
+        basePhotoWeight = 0.25;
+        updateBasePhotoBox();
+        rebuild3DFromLayers(true);
+      } else {
+        basePhotoEnabled = true;
+        basePhotoWeight = 1.0;
+        updateBasePhotoBox();
+      }
 
       selectTool('select');
       renderLayerList();
       syncSelectedLayerInspector();
       if (panel3D.style.display === 'none') setViewMode('split');
-      statusMode.textContent = `One-Click complete! ${vectorCount} separate 2D Layers + Upright 3D Relief ready. Edit any layer in 2D or toggle 2D/3D in Layers!`;
+      statusMode.textContent = `1-Click Complete! ${vectorCount} compound 2D Layers ↔ 3D Relief synced 100% (${opts.traceMode}). Edit any layer & watch 3D update!`;
     }, 30);
   }
 
@@ -1216,12 +1263,20 @@ document.addEventListener('DOMContentLoaded', () => {
     else document.exitFullscreen?.();
   });
 
-  // Vector Interior Fill Tint Toggle
+  // Vector Interior Fill Tint & Illustrator Color Swatch Toggles
   const btnToggleFills = document.getElementById('btn-toggle-fills');
   if (btnToggleFills) {
     btnToggleFills.addEventListener('click', () => {
       btnToggleFills.classList.toggle('active');
       cadCanvas.showFills = btnToggleFills.classList.contains('active');
+      cadCanvas.requestRender();
+    });
+  }
+  const btnToggleColorFills = document.getElementById('btn-toggle-color-fills');
+  if (btnToggleColorFills) {
+    btnToggleColorFills.addEventListener('click', () => {
+      btnToggleColorFills.classList.toggle('active');
+      cadCanvas.showColorFills = btnToggleColorFills.classList.contains('active');
       cadCanvas.requestRender();
     });
   }
@@ -1674,8 +1729,37 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   };
 
+  function ringToSvgSubpath(points, isClosed) {
+    if (!points || points.length < 2) return '';
+    if (CadCanvas.hasCubicHandles(points)) {
+      const ring = CadCanvas.normalizeClosedRing(points, isClosed);
+      if (ring.length < 2) return '';
+      const d = [`M ${ring[0].x.toFixed(3)} ${ring[0].y.toFixed(3)}`];
+      const segCount = isClosed ? ring.length : ring.length - 1;
+      for (let i = 0; i < segCount; i++) {
+        const a = ring[i];
+        const b = ring[(i + 1) % ring.length];
+        if (!a.hOut && !b.hIn) {
+          d.push(`L ${b.x.toFixed(3)} ${b.y.toFixed(3)}`);
+        } else {
+          const c1 = a.hOut || a;
+          const c2 = b.hIn || b;
+          d.push(`C ${c1.x.toFixed(3)} ${c1.y.toFixed(3)}, ${c2.x.toFixed(3)} ${c2.y.toFixed(3)}, ${b.x.toFixed(3)} ${b.y.toFixed(3)}`);
+        }
+      }
+      if (isClosed) d.push('Z');
+      return d.join(' ');
+    }
+    const sampled = CadCanvas.sampleCurvePoints(points, isClosed, 6);
+    if (sampled.length < 2) return '';
+    const d = [`M ${sampled[0].x.toFixed(3)} ${sampled[0].y.toFixed(3)}`];
+    for (let i = 1; i < sampled.length; i++) d.push(`L ${sampled[i].x.toFixed(3)} ${sampled[i].y.toFixed(3)}`);
+    if (isClosed) d.push('Z');
+    return d.join(' ');
+  }
+
   // ============================================================
-  // SVG EXPORT (2D Vectors to SVG file)
+  // SVG EXPORT (True Cubic Bezier + Compound Holes SVG Export)
   // ============================================================
   function exportSVG() {
     const w = cadCanvas.workpieceWidth;
@@ -1691,35 +1775,42 @@ document.addEventListener('DOMContentLoaded', () => {
     svg += `  <rect width="${w}" height="${h}" fill="none" stroke="#999" stroke-width="0.2"/>\n`;
 
     for (const ent of entities) {
-      const color = ent.color || '#38bdf8';
-      const sw = (ent.width || 1.5) * 0.4;
+      if (ent.visible === false) continue;
+      const strokeCol = ent.color || '#38bdf8';
+      const fillAttr = ent.isClosed && cadCanvas.showColorFills && ent.fillColor ? ent.fillColor : 'none';
+      const sw = ((ent.width || 1.5) * 0.3).toFixed(3);
+      const idAttr = ent.name ? ` id="${escapeXml(ent.name)}"` : '';
 
       if (ent.type === 'line') {
-        svg += `  <line x1="${ent.x1.toFixed(3)}" y1="${ent.y1.toFixed(3)}" x2="${ent.x2.toFixed(3)}" y2="${ent.y2.toFixed(3)}" stroke="${color}" stroke-width="${sw}" fill="none"/>\n`;
+        svg += `  <line${idAttr} x1="${ent.x1.toFixed(3)}" y1="${ent.y1.toFixed(3)}" x2="${ent.x2.toFixed(3)}" y2="${ent.y2.toFixed(3)}" stroke="${strokeCol}" stroke-width="${sw}" fill="none"/>\n`;
       } else if (ent.type === 'rect') {
         const rxAttr = ent.cornerRadius > 0 ? ` rx="${ent.cornerRadius.toFixed(3)}" ry="${ent.cornerRadius.toFixed(3)}"` : '';
-        svg += `  <rect x="${ent.x.toFixed(3)}" y="${ent.y.toFixed(3)}" width="${ent.w.toFixed(3)}" height="${ent.h.toFixed(3)}"${rxAttr} stroke="${color}" stroke-width="${sw}" fill="none"/>\n`;
+        svg += `  <rect${idAttr} x="${ent.x.toFixed(3)}" y="${ent.y.toFixed(3)}" width="${ent.w.toFixed(3)}" height="${ent.h.toFixed(3)}"${rxAttr} stroke="${strokeCol}" stroke-width="${sw}" fill="${fillAttr}"/>\n`;
       } else if (ent.type === 'circle') {
-        svg += `  <circle cx="${ent.cx.toFixed(3)}" cy="${ent.cy.toFixed(3)}" r="${ent.r.toFixed(3)}" stroke="${color}" stroke-width="${sw}" fill="none"/>\n`;
-      } else if (ent.type === 'polyline') {
-        const pts = ent.points.map(p => `${p.x.toFixed(3)},${p.y.toFixed(3)}`).join(' ');
-        if (ent.isClosed) {
-          svg += `  <polygon points="${pts}" stroke="${color}" stroke-width="${sw}" fill="none"/>\n`;
+        svg += `  <circle${idAttr} cx="${ent.cx.toFixed(3)}" cy="${ent.cy.toFixed(3)}" r="${ent.r.toFixed(3)}" stroke="${strokeCol}" stroke-width="${sw}" fill="${fillAttr}"/>\n`;
+      } else if ((ent.type === 'polyline' || ent.type === 'curve') && ent.points?.length >= 2) {
+        const subpaths = [];
+        if (ent.type === 'curve') {
+          subpaths.push(ringToSvgSubpath(ent.points, !!ent.isClosed));
+          if (ent.holes) {
+            for (const hole of ent.holes) subpaths.push(ringToSvgSubpath(hole, true));
+          }
         } else {
-          svg += `  <polyline points="${pts}" stroke="${color}" stroke-width="${sw}" fill="none"/>\n`;
-        }
-      } else if (ent.type === 'curve') {
-        if (ent.points.length >= 2) {
-          const sampled = CadCanvas.sampleCurvePoints(ent.points, !!ent.isClosed, 6);
-          const ptsAttr = sampled.map(p => `${p.x.toFixed(3)},${p.y.toFixed(3)}`).join(' ');
-          if (ent.isClosed) {
-            svg += `  <polygon points="${ptsAttr}" stroke="${color}" stroke-width="${sw}" fill="none"/>\n`;
-          } else {
-            svg += `  <polyline points="${ptsAttr}" stroke="${color}" stroke-width="${sw}" fill="none"/>\n`;
+          const polySub = (pts, closed) => {
+            if (!pts || pts.length < 2) return '';
+            return `M ${pts.map((p) => `${p.x.toFixed(3)} ${p.y.toFixed(3)}`).join(' L ')}${closed ? ' Z' : ''}`;
+          };
+          subpaths.push(polySub(ent.points, !!ent.isClosed));
+          if (ent.holes) {
+            for (const hole of ent.holes) subpaths.push(polySub(hole, true));
           }
         }
+        const dAttr = subpaths.filter(Boolean).join(' ');
+        if (dAttr) {
+          svg += `  <path${idAttr} d="${dAttr}" fill="${fillAttr}" fill-rule="evenodd" stroke="${strokeCol}" stroke-width="${sw}"/>\n`;
+        }
       } else if (ent.type === 'text') {
-        svg += `  <text x="${ent.x.toFixed(3)}" y="${ent.y.toFixed(3)}" font-size="${(ent.size || 16) * 0.4}" font-weight="${ent.fontWeight || 'bold'}" font-family="${escapeXml(ent.fontFamily || 'sans-serif')}" fill="${color}">${escapeXml(ent.text)}</text>\n`;
+        svg += `  <text${idAttr} x="${ent.x.toFixed(3)}" y="${ent.y.toFixed(3)}" font-size="${(ent.size || 16) * 0.4}" font-weight="${ent.fontWeight || 'bold'}" font-family="${escapeXml(ent.fontFamily || 'sans-serif')}" fill="${strokeCol}">${escapeXml(ent.text)}</text>\n`;
       }
     }
 
@@ -1732,7 +1823,7 @@ document.addEventListener('DOMContentLoaded', () => {
     a.download = 'jdpaint-vectors.svg';
     a.click();
     URL.revokeObjectURL(url);
-    statusMode.textContent = `Exported ${entities.length} entities to SVG file.`;
+    statusMode.textContent = `Exported ${entities.length} entities (Cubic Bezier SVG) to file.`;
   }
 
   function escapeXml(str) {

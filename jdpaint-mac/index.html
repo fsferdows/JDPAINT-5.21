@@ -227,14 +227,18 @@
         <button class="tb-btn" id="btn-clear-pic" title="Remove Background Picture">Remove</button>
         <span class="tb-sep"></span>
         <!-- AUTO-TRACE 2D VECTORS & 3D RELIEF BUTTONS -->
-        <select id="trace-mode-select" class="tb-select" title="Choose Tracing Algorithm: Auto Smart handles wood photos, colored motifs & line art">
+        <select id="trace-mode-select" class="tb-select" title="Adobe Illustrator-style Image Trace Presets: Auto Smart picks Color, Grayscale, B&W Logo, or Wood Relief automatically">
           <option value="auto" selected>Trace: Auto Smart</option>
-          <option value="wood">Trace: Wood Carving Photo</option>
-          <option value="lineart">Trace: Line Art / Ink</option>
+          <option value="color">Trace: Color Layers (CIELAB)</option>
+          <option value="grayscale">Trace: Grayscale (3D Stack)</option>
+          <option value="bw-logo">Trace: B&amp;W Logo (Exact)</option>
+          <option value="wood">Trace: Wood Carving / Relief</option>
           <option value="edge">Trace: Carved Groove Edges</option>
         </select>
+        <span class="tb-label" title="Number of Color Clusters / Grayscale Tone Layers (2-16)">Colors:</span>
+        <input type="number" id="trace-colors" class="tb-input" min="2" max="16" value="6" style="width: 38px;" title="Number of Color or Tone Layers (2-16)">
         <span class="tb-label">Detail:</span>
-        <input type="range" id="slider-trace-detail" min="10" max="90" value="50" style="width: 52px;" title="Adjust Trace Capture Sensitivity (Lower = simpler clean shapes, Higher = capture fine wood grain/petals)">
+        <input type="range" id="slider-trace-detail" min="10" max="90" value="50" style="width: 52px;" title="Adjust Trace Path Precision (Higher = tighter fit to fine curves)">
         <span id="lbl-trace-detail" style="font-size: 10px; width: 24px;">50%</span>
         <button class="tb-btn btn-highlight-green" id="btn-auto-trace-2d" title="Automatically trace picture into editable 2D CAD vector layers!">⚡ Auto-Trace 2D</button>
         <button class="tb-btn btn-highlight" id="btn-puff-3d" title="Convert selected 2D Pen/Curve/Shape into 3D relief!">💨 Selection → 3D</button>
@@ -257,6 +261,7 @@
         <button class="tb-btn chip-toggle active" id="snap-end" title="Snap to Endpoints / Midpoints / Centers / On-Path">Object Snap</button>
         <button class="tb-btn chip-toggle" id="snap-ortho" title="Ortho Lock (F8)">Ortho (90°)</button>
         <button class="tb-btn chip-toggle active" id="btn-toggle-fills" title="Show soft translucent vector fills inside closed 2D layouts">Fill Tint</button>
+        <button class="tb-btn chip-toggle active" id="btn-toggle-color-fills" title="Show traced Illustrator CIELAB/tone color swatches inside closed 2D vector paths">Color Swatch</button>
         <span class="tb-sep"></span>
         <select id="select-symmetry" class="tb-select" title="Live Bilateral/Radial Symmetry Drawing (automatically mirrors whatever you draw across the center!)">
           <option value="none" selected>Symmetry: Off</option>
@@ -558,9 +563,11 @@
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:4px;">
               <button class="win-push-btn" id="layer-btn-node-edit" style="padding:3px;">☩ Edit Nodes</button>
+              <button class="win-push-btn" id="layer-btn-toggle-corner" style="padding:3px;" title="Switch active Bezier anchor between Sharp Corner and Smooth Curve (or double-click node)">◈ Corner/Smooth</button>
               <button class="win-push-btn" id="layer-btn-close-path" style="padding:3px;">⤸ Close Path</button>
               <button class="win-push-btn" id="layer-btn-smooth" style="padding:3px;">〰 Smooth</button>
               <button class="win-push-btn" id="layer-btn-to-curve" style="padding:3px;">➰ To Curve</button>
+              <button class="win-push-btn" id="layer-btn-break-holes" style="padding:3px;" title="Release compound inner holes into separate selectable layers">✂️ Release Holes</button>
             </div>
             <button class="win-push-btn primary" id="layer-btn-apply-3d" style="width:100%;margin-top:5px;">⚡ Apply Layer to 3D</button>
           </fieldset>
@@ -753,6 +760,30 @@
             <div class="row">
               <label>Invert Dark/Bright:</label>
               <input type="checkbox" id="relief-invert-check">
+            </div>
+            <div class="row">
+              <label>Color Layer Mode:</label>
+              <select id="trace-stack-mode" class="win-input">
+                <option value="stacked" selected>Stacked (Gap-Free 3D)</option>
+                <option value="abutting">Cutout / Abutting</option>
+              </select>
+            </div>
+            <div class="row">
+              <label>Corner Snap (%):</label>
+              <div class="unit-box">
+                <input type="number" id="trace-corners" value="65" step="5" min="10" max="95">
+              </div>
+            </div>
+            <div class="row">
+              <label>Noise Speckle Filter:</label>
+              <div class="unit-box">
+                <input type="number" id="trace-noise" value="10" step="2" min="0" max="80">
+                <span>px</span>
+              </div>
+            </div>
+            <div class="row">
+              <label>Ignore Outer Background:</label>
+              <input type="checkbox" id="trace-ignore-bg" checked>
             </div>
             <div class="row">
               <label>Cut White Background:</label>
