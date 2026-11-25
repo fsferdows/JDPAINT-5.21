@@ -95,10 +95,33 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       });
       document.getElementById('fl-cancel')?.addEventListener('click', () => {
-        cadCanvas.currentDraft = null;
-        cadCanvas.requestRender();
+        cadCanvas.cancelCurrentDraft();
         updateFloatingCadBar();
       });
+      return;
+    }
+
+    // Case 1.5: Smart Polyline Tool active -> Show Instant Design Detection & Tracing Sub-Modes!
+    if (cadCanvas.activeTool === 'polyline' && !cadCanvas.currentDraft) {
+      cadFloatingBar.style.display = 'flex';
+      const sm = cadCanvas.polylineSmartMode || 'capture';
+      const hasPic = !!cadCanvas._edgeGuide;
+      cadFloatingBar.innerHTML = `
+        <span style="color:#22d3ee;font-weight:bold;">Smart Polyline${hasPic ? '' : ' (Load Picture for Edge/Shape Detect)'}:</span>
+        <button class="cad-float-btn${sm === 'capture' ? ' primary' : ''}" id="fl-poly-capture" title="Hover over any design shape on picture & Left-Click to capture whole shape cleanly">✨ Detect &amp; Grab Shape</button>
+        <button class="cad-float-btn${sm === 'magnetic' ? ' primary' : ''}" id="fl-poly-magnetic" title="Click points along outline — curve automatically hugs photo edges!">🧲 Edge Follower</button>
+        <button class="cad-float-btn${sm === 'manual' ? ' primary' : ''}" id="fl-poly-manual" title="Classic straight point-to-point CAD polyline">📏 Straight Line</button>
+      `;
+      const setPolyMode = (mode) => {
+        cadCanvas.polylineSmartMode = mode;
+        cadCanvas.detectedShapePreview = null;
+        cadCanvas.liveEdgePath = null;
+        cadCanvas.requestRender();
+        updateFloatingCadBar();
+      };
+      document.getElementById('fl-poly-capture')?.addEventListener('click', () => setPolyMode('capture'));
+      document.getElementById('fl-poly-magnetic')?.addEventListener('click', () => setPolyMode('magnetic'));
+      document.getElementById('fl-poly-manual')?.addEventListener('click', () => setPolyMode('manual'));
       return;
     }
 
@@ -259,6 +282,11 @@ document.addEventListener('DOMContentLoaded', () => {
       viewport3D.activeSculptMode = null;
       const prevTool = cadCanvas.activeTool;
       cadCanvas.activeTool = toolName;
+      if (toolName !== 'polyline') {
+        cadCanvas.detectedShapePreview = null;
+        cadCanvas.liveEdgePath = null;
+      }
+      updateFloatingCadBar();
 
       // Re-clicking Polygon tool lets user set sides & Star mode quickly
       if (toolName === 'polygon' && prevTool === 'polygon') {
@@ -282,7 +310,7 @@ document.addEventListener('DOMContentLoaded', () => {
       else if (toolName === 'ellipse') hint = 'Click center and drag outward to draw Ellipse / Oval.';
       else if (toolName === 'polygon') hint = `Drag to draw ${cadCanvas.polygonSides}-${cadCanvas.polygonStarMode ? 'Point Star' : 'Gon'} (click Poly/Star again to change sides).`;
       else if (toolName === 'eraser') hint = 'Click or drag across vector layers to erase them.';
-      else if (toolName === 'polyline') hint = 'Click points to draw straight segments. Double-click or press Enter to finish.';
+      else if (toolName === 'polyline') hint = 'Hover over any design shape on picture -> click to Capture Shape, or trace curves along photo edges automatically!';
       else hint = 'Click and drag in the 2D CAD plane to draft geometry.';
       statusMode.textContent = `2D Tool: ${toolName.toUpperCase()}. ${hint}`;
     }

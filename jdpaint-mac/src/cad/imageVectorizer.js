@@ -930,7 +930,7 @@ export class ImageVectorizer {
       chromaDiff[i] = dc;
       const dl = Math.abs(L[i] - lMed);
       const tolC = L[i] < 28 ? 34 : 20;
-      if (dc <= tolC && dl <= 48) panelMask[i] = 1;
+      if (dc <= tolC && dl <= 36) panelMask[i] = 1;
     }
 
     // Smooth column profile across middle vertical band [15..85% H] and walk outward from center
@@ -1064,24 +1064,62 @@ export class ImageVectorizer {
     return out;
   }
 
+  static separableExtrema(src, w, h, radius, isMax = true) {
+    const n = w * h;
+    const temp = new Float32Array(n);
+    const out = new Float32Array(n);
+    for (let y = 0; y < h; y++) {
+      const row = y * w;
+      for (let x = 0; x < w; x++) {
+        let best = src[row + x];
+        const l = Math.max(0, x - radius), r = Math.min(w - 1, x + radius);
+        if (isMax) {
+          for (let xx = l; xx <= r; xx++) if (src[row + xx] > best) best = src[row + xx];
+        } else {
+          for (let xx = l; xx <= r; xx++) if (src[row + xx] < best) best = src[row + xx];
+        }
+        temp[row + x] = best;
+      }
+    }
+    for (let x = 0; x < w; x++) {
+      for (let y = 0; y < h; y++) {
+        let best = temp[y * w + x];
+        const t = Math.max(0, y - radius), b = Math.min(h - 1, y + radius);
+        if (isMax) {
+          for (let yy = t; yy <= b; yy++) {
+            const v = temp[yy * w + x];
+            if (v > best) best = v;
+          }
+        } else {
+          for (let yy = t; yy <= b; yy++) {
+            const v = temp[yy * w + x];
+            if (v < best) best = v;
+          }
+        }
+        out[y * w + x] = best;
+      }
+    }
+    return out;
+  }
+
   /**
-   * Preset D: Furniture Design & Wood Carving Isolator (ROI-Masked, Grain-Suppressed, Non-Overlapping).
+   * Preset D: Morphological White-Hat + Valley-Cut Crevice + Black-Hat Groove Furniture Isolator.
+   * Keeps adjacent petals sharply separated, keeps frame molds hollow with real holes, and isolates louvers cleanly!
    */
   static traceWoodReliefLayers(rArr, gArr, bArr, lumaRaw, denoisedLuma, otsu, w, h, opts) {
     const n = w * h;
-    // 1. Automatically locate ONLY the furniture panel / carved door surface (drops room walls, plants, bricks, rugs, corner logos)
     const roi = ImageVectorizer.detectFurnitureROI(rArr, gArr, bArr, lumaRaw, w, h);
 
-    // Build interior ROI weight mask & suppress non-wood color/banner watermark overlays (keeps natural warm wood highlights!)
+    // 1. Suppress exterior background & non-wood colorful watermarks ("DTECH", "WOOD WORLD", "Doors Fair")
     const roiMask = new Uint8Array(n);
     const chromaMask = new Float32Array(n);
-    const watermarkTol = roi.chromaMed > 14 ? 16 : 22;
+    const watermarkTol = roi.chromaMed > 14 ? 15 : 22;
     for (let y = roi.y0; y <= roi.y1; y++) {
       const row = y * w;
       for (let x = roi.x0; x <= roi.x1; x++) {
         const i = row + x;
         const dc = roi.chromaDiff[i];
-        if (dc > watermarkTol && (roi.L[i] > roi.lMed + 10 || dc > 24)) {
+        if (dc > watermarkTol && (roi.L[i] > roi.lMed + 8 || dc > 23)) {
           chromaMask[i] = dc > watermarkTol + 4 ? 0 : Math.max(0, 1.0 - (dc - watermarkTol) / 4.0);
           roiMask[i] = chromaMask[i] > 0.25 ? 1 : 0;
         } else {
@@ -1091,65 +1129,78 @@ export class ImageVectorizer {
       }
     }
 
-    // 2. Mild edge-preserving smooth preserves fine louvers & flower stems while quieting wood-grain speckle
-    const smoothLuma = ImageVectorizer.guidedFilter(denoisedLuma, w, h, 1, 110);
-    // 3. Estimate local uncarved wood background surface strictly inside ROI (immune to camera lighting gradients)
-    const planeR = Math.max(6, Math.round(Math.min(roi.w, roi.h) * 0.036));
+    // 2. Clean 2px wood/bamboo grain suppression via Guided Filter + Masked Local Wood Plane
+    const smoothLuma = ImageVectorizer.guidedFilter(denoisedLuma, w, h, 2, 135);
+    const planeR = Math.max(7, Math.round(Math.min(roi.w, roi.h) * 0.042));
     const localPlane = ImageVectorizer.maskedBoxMean(smoothLuma, roiMask, w, h, planeR);
 
-    // 4. Bidirectional Carving Departure + Edge Gradient (merges raised highlights & deep grooves of each petal!)
-    const rawEnergy = new Float32Array(n);
-    const innerPad = 4;
+    // 3. Multi-scale Morphological White-Hat (raised petals/letters) & Black-Hat (dark louvers/crevices)
+    const morphR = Math.max(3, Math.min(9, Math.round(Math.min(roi.w, roi.h) * 0.019)));
+    const closedLuma = ImageVectorizer.separableExtrema(
+      ImageVectorizer.separableExtrema(smoothLuma, w, h, morphR, true), w, h, morphR, false
+    );
+    const openedLuma = ImageVectorizer.separableExtrema(
+      ImageVectorizer.separableExtrema(smoothLuma, w, h, morphR, false), w, h, morphR, true
+    );
+
+    const raisedScore = new Float32Array(n);
+    const grooveScore = new Float32Array(n);
+    const innerPad = 5;
     const xMin = Math.max(1, roi.x0 + innerPad), xMax = Math.min(w - 2, roi.x1 - innerPad);
     const yMin = Math.max(1, roi.y0 + innerPad), yMax = Math.min(h - 2, roi.y1 - innerPad);
 
-    const roiSamples = [];
+    const rSamples = [], gSamples = [];
     for (let y = yMin; y <= yMax; y++) {
       const row = y * w;
       for (let x = xMin; x <= xMax; x++) {
         const i = row + x;
-        const gx = -smoothLuma[i - w - 1] + smoothLuma[i - w + 1] - 2 * smoothLuma[i - 1] + 2 * smoothLuma[i + 1] - smoothLuma[i + w - 1] + smoothLuma[i + w + 1];
-        const gy = -smoothLuma[i - w - 1] - 2 * smoothLuma[i - w] - smoothLuma[i - w + 1] + smoothLuma[i + w - 1] + 2 * smoothLuma[i + w] + smoothLuma[i + w + 1];
-        const grad = Math.hypot(gx, gy) * 0.25;
-        const reliefDiff = Math.abs(smoothLuma[i] - localPlane[i]);
-        const score = Math.min(255, (reliefDiff * 1.55 + grad * 0.72) * chromaMask[i]);
-        rawEnergy[i] = score;
-        if ((i & 3) === 0) roiSamples.push(score);
+        if (!roiMask[i]) continue;
+        const wh = Math.max(0, smoothLuma[i] - openedLuma[i]);
+        const posDiff = Math.max(0, smoothLuma[i] - localPlane[i]);
+        const bh = Math.max(0, closedLuma[i] - smoothLuma[i]);
+        const negDiff = Math.max(0, localPlane[i] - smoothLuma[i]);
+
+        // Emphasize sharp local morphological peaks/valleys so flat shaded panels stay empty & petals stay discrete!
+        const rVal = Math.min(255, (wh * 1.48 + posDiff * 0.24) * chromaMask[i]);
+        const gVal = Math.min(255, (bh * 1.48 + negDiff * 0.28) * chromaMask[i]);
+        raisedScore[i] = rVal;
+        grooveScore[i] = gVal;
+        if ((i & 3) === 0) { rSamples.push(rVal); gSamples.push(gVal); }
       }
     }
 
-    // 5. Estimate quiet uncarved wood grain floor (P45) & cap P88 outlier highlights so louvers & subtle stems survive Otsu
-    roiSamples.sort((a, b) => a - b);
-    const grainFloor = roiSamples.length > 20 ? roiSamples[Math.floor(roiSamples.length * 0.45)] : 8;
-    const p88Cap = roiSamples.length > 20 ? Math.max(36, roiSamples[Math.floor(roiSamples.length * 0.88)]) : 100;
-    const p85Energy = roiSamples.length > 20 ? roiSamples[Math.floor(roiSamples.length * 0.85)] : 60;
+    rSamples.sort((a, b) => a - b);
+    gSamples.sort((a, b) => a - b);
+    const rFloor = rSamples.length > 20 ? rSamples[Math.floor(rSamples.length * 0.55)] : 4;
+    const gFloor = gSamples.length > 20 ? gSamples[Math.floor(gSamples.length * 0.55)] : 4;
+    const rCap = rSamples.length > 20 ? Math.max(32, rSamples[Math.floor(rSamples.length * 0.90)]) : 95;
+    const gCap = gSamples.length > 20 ? Math.max(32, gSamples[Math.floor(gSamples.length * 0.90)]) : 95;
 
-    const cleanEnergy = new Float32Array(n);
-    const energyHist = new Uint32Array(256);
-    let fgSum = 0;
+    const cleanRaised = new Float32Array(n);
+    const cleanGroove = new Float32Array(n);
+    const rHist = new Uint32Array(256), gHist = new Uint32Array(256);
+    let rCnt = 0, gCnt = 0;
+
     for (let y = yMin; y <= yMax; y++) {
       const row = y * w;
       for (let x = xMin; x <= xMax; x++) {
         const i = row + x;
-        const clipped = Math.min(p88Cap, rawEnergy[i]);
-        const v = Math.min(255, Math.max(0, (rawEnergy[i] - grainFloor * 0.75) * 1.70));
-        cleanEnergy[i] = v;
-        const hv = Math.min(255, Math.max(0, Math.round((clipped - grainFloor * 0.75) * 1.70)));
-        if (hv > 3) {
-          energyHist[hv]++;
-          fgSum++;
-        }
+        const rv = Math.min(255, Math.max(0, (raisedScore[i] - rFloor * 1.32) * 1.75));
+        const gv = Math.min(255, Math.max(0, (grooveScore[i] - gFloor * 1.32) * 1.75));
+        cleanRaised[i] = rv;
+        cleanGroove[i] = gv;
+        const rh = Math.min(255, Math.round(Math.min(rCap * 1.75, rv)));
+        const gh = Math.min(255, Math.round(Math.min(gCap * 1.75, gv)));
+        if (rh > 4) { rHist[rh]++; rCnt++; }
+        if (gh > 4) { gHist[gh]++; gCnt++; }
       }
     }
 
-    const smoothedScore = ImageVectorizer.guidedFilter(cleanEnergy, w, h, 1, 65);
-    const roiOtsu = fgSum > 40 ? ImageVectorizer.computeOtsuThreshold(energyHist, fgSum) : 26;
-
-    // 6. Calibrated Threshold capturing recessed moldings, horizontal slats AND fine floral petals without grain noise
-    const detailAdj = (0.5 - opts.detailFactor) * 26;
-    const primaryTh = opts.threshold > 0
-      ? Math.max(10, opts.threshold * 165)
-      : Math.max(12, Math.min(54, roiOtsu * 0.56 + detailAdj));
+    const rOtsu = rCnt > 40 ? ImageVectorizer.computeOtsuThreshold(rHist, rCnt) : 26;
+    const gOtsu = gCnt > 40 ? ImageVectorizer.computeOtsuThreshold(gHist, gCnt) : 26;
+    const detailAdj = (0.5 - opts.detailFactor) * 24;
+    const rTh = opts.threshold > 0 ? Math.max(10, opts.threshold * 145) : Math.max(15, Math.min(58, rOtsu * 0.64 + detailAdj));
+    const gTh = opts.threshold > 0 ? Math.max(10, opts.threshold * 145) : Math.max(15, Math.min(58, gOtsu * 0.64 + detailAdj));
 
     const sx = opts.bounds.w / w;
     const sy = opts.bounds.h / h;
@@ -1157,107 +1208,85 @@ export class ImageVectorizer {
     const roiMaxSpanH = roi.h * sy * 0.88;
     const roiEdgeLeftMm = opts.bounds.x + (roi.x0 + 6) * sx;
     const roiEdgeRightMm = opts.bounds.x + (roi.x1 - 6) * sx;
-    const minFeatureAreaPx = Math.max(opts.minAreaPx || 10, Math.round(roi.w * roi.h * 0.00018));
+    const roiEdgeTopMm = opts.bounds.y + (roi.y0 + 6) * sy;
+    const roiEdgeBotMm = opts.bounds.y + (roi.y1 - 6) * sy;
+    const minWoodSpanMm = Math.max(opts.minSpanMm || 0.9, 1.1);
+    const minFeatureAreaPx = Math.max(opts.minAreaPx || 12, Math.round(roi.w * roi.h * 0.00024));
 
-    const scalar1 = new Float32Array(n);
-    const mask1 = new Uint8Array(n);
+    const raisedMask = new Uint8Array(n);
+    const raisedScalar = new Float32Array(n);
+    const grooveMask = new Uint8Array(n);
+    const grooveScalar = new Float32Array(n);
+
     for (let i = 0; i < n; i++) {
-      scalar1[i] = -smoothedScore[i];
-      mask1[i] = roiMask[i] && smoothedScore[i] >= primaryTh ? 1 : 0;
+      const isCreviceCut = cleanGroove[i] >= gTh * 0.72 && cleanGroove[i] > cleanRaised[i] * 0.90;
+      const rSolid = roiMask[i] && cleanRaised[i] >= rTh && !isCreviceCut;
+      raisedMask[i] = rSolid ? 1 : 0;
+      raisedScalar[i] = isCreviceCut ? 12 : -cleanRaised[i];
+
+      const gSolid = roiMask[i] && cleanGroove[i] >= gTh && cleanGroove[i] >= cleanRaised[i] * 0.95;
+      grooveMask[i] = gSolid ? 1 : 0;
+      grooveScalar[i] = -cleanGroove[i];
     }
-    const cleaned1 = ImageVectorizer.morphClose(mask1, w, h, opts.detailFactor < 0.40 ? 1 : 0);
-    const rawLoops1 = ImageVectorizer.marchSquares(cleaned1, w, h, scalar1, -primaryTh);
 
-    const tracedRaw = ImageVectorizer.vectorizeMaskLoops(rawLoops1, smoothedScore, w, h, -1, {
-      ...opts,
-      minAreaPx: minFeatureAreaPx,
-      maxContours: opts.maxContours,
-      fillColor: '#f59e0b',
-      strokeColor: '#38bdf8',
-      layerGroup: 'Furniture Carving',
-      namePrefix: 'Carved Motif',
-      toneLevel: 1,
-      toneTotal: 1,
-      heightMm: Number((opts.maxDepthMm * 0.72).toFixed(2)),
-      shape: 'dome',
-      mode: 'max',
-      adaptiveRadius: true,
-      rejectFullFrame: true,
-    });
-
-    // Unnest huge enclosing panel borders into independent foreground motifs & strip outer door-jamb edge slivers
-    const woodEnts = [];
-    for (const ent of tracedRaw) {
+    const filterWoodEnts = (ents) => ents.filter((ent) => {
       let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
       for (const p of ent.points) {
         if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
         if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
       }
       const ew = maxX - minX, eh = maxY - minY;
-      const isOuterJambSliver =
-        (minX <= roiEdgeLeftMm || maxX >= roiEdgeRightMm) &&
-        ew < roi.w * sx * 0.09 &&
-        eh > roi.h * sy * 0.25;
-      if (isOuterJambSliver) continue;
-      const isHugeOuterSlab = (ew > roiMaxSpanW && eh > roiMaxSpanH);
-      const isLargePanelContainer = (ent.holes && ent.holes.length >= 3) && (ew > roi.w * sx * 0.35 || eh > roi.h * sy * 0.25);
+      if (ew > roiMaxSpanW && eh > roiMaxSpanH) return false;
+      if ((minX <= roiEdgeLeftMm || maxX >= roiEdgeRightMm) && ew < roi.w * sx * 0.08 && eh > roi.h * sy * 0.25) return false;
+      if ((minY <= roiEdgeTopMm || maxY >= roiEdgeBotMm) && eh < roi.h * sy * 0.07 && ew > roi.w * sx * 0.25) return false;
+      // Drop super-thin bamboo/wood grain hairlines (extreme aspect ratio & very shallow thickness)
+      const shortSide = Math.min(ew, eh);
+      const longSide = Math.max(ew, eh);
+      if (shortSide < 1.95 && longSide / Math.max(0.2, shortSide) > 10.5 && (!ent.holes || ent.holes.length === 0)) return false;
+      return true;
+    });
 
-      if (isHugeOuterSlab || isLargePanelContainer) {
-        if (!isHugeOuterSlab) {
-          // Keep panel molding frame clean, promoting interior motifs independently!
-          const panelFrame = { ...ent, holes: [] };
-          woodEnts.push(panelFrame);
-        }
-        if (ent.holes && ent.holes.length > 0) {
-          ent.holes.forEach((holePts, hIdx) => {
-            woodEnts.push({
-              ...ent,
-              points: holePts,
-              holes: [],
-              fillColor: '#fbbf24',
-              strokeColor: '#38bdf8',
-              layerGroup: 'Carved Flower & Motif',
-              name: `Carved Detail #${woodEnts.length + 1}`,
-              relief: { ...(ent.relief || {}), heightMm: Number((opts.maxDepthMm * 0.85).toFixed(2)) },
-            });
-          });
-        }
-      } else {
-        woodEnts.push(ent);
-      }
-    }
+    const cleanR = ImageVectorizer.morphClose(raisedMask, w, h, 0);
+    const rLoops = ImageVectorizer.marchSquares(cleanR, w, h, raisedScalar, -rTh);
+    const raisedEnts = filterWoodEnts(ImageVectorizer.vectorizeMaskLoops(rLoops, cleanRaised, w, h, -1, {
+      ...opts,
+      minAreaPx: minFeatureAreaPx,
+      minSpanMm: minWoodSpanMm,
+      maxContours: Math.floor(opts.maxContours * 0.65),
+      fillColor: '#fbbf24',
+      strokeColor: '#fbbf24',
+      layerGroup: 'Raised Petals & Motifs',
+      namePrefix: 'Carved Motif',
+      toneLevel: 2,
+      toneTotal: 2,
+      heightMm: Number((opts.maxDepthMm * 0.88).toFixed(2)),
+      shape: 'dome',
+      mode: 'max',
+      adaptiveRadius: true,
+      rejectFullFrame: true,
+    }));
 
-    // Optional peak detail accent tier ONLY if user explicitly requests high Colors/Levels >= 8
-    const levels = Math.round(opts.toneLevels || 3);
-    if (levels >= 8 && p85Energy > primaryTh * 1.4) {
-      const peakTh = Math.min(200, primaryTh + Math.max(24, (p85Energy - primaryTh) * 0.75));
-      const scalar2 = new Float32Array(n);
-      const mask2 = new Uint8Array(n);
-      for (let i = 0; i < n; i++) {
-        scalar2[i] = -smoothedScore[i];
-        mask2[i] = roiMask[i] && smoothedScore[i] >= peakTh ? 1 : 0;
-      }
-      const cleaned2 = ImageVectorizer.morphClose(mask2, w, h, 0);
-      const rawLoops2 = ImageVectorizer.marchSquares(cleaned2, w, h, scalar2, -peakTh);
-      const peaks = ImageVectorizer.vectorizeMaskLoops(rawLoops2, smoothedScore, w, h, -1, {
-        ...opts,
-        maxContours: Math.max(15, Math.floor(opts.maxContours * 0.35)),
-        fillColor: '#fde047',
-        strokeColor: '#fbbf24',
-        layerGroup: 'Carving Crown Accents',
-        namePrefix: 'Carving Crown',
-        toneLevel: 2,
-        toneTotal: 2,
-        heightMm: Number((opts.maxDepthMm * 0.95).toFixed(2)),
-        shape: 'dome',
-        mode: 'max',
-        adaptiveRadius: true,
-        rejectFullFrame: true,
-      });
-      woodEnts.push(...peaks);
-    }
+    const cleanG = ImageVectorizer.morphClose(grooveMask, w, h, 0);
+    const gLoops = ImageVectorizer.marchSquares(cleanG, w, h, grooveScalar, -gTh);
+    const grooveEnts = filterWoodEnts(ImageVectorizer.vectorizeMaskLoops(gLoops, cleanGroove, w, h, -1, {
+      ...opts,
+      minAreaPx: minFeatureAreaPx,
+      minSpanMm: minWoodSpanMm,
+      maxContours: Math.floor(opts.maxContours * 0.45),
+      fillColor: '#0ea5e9',
+      strokeColor: '#38bdf8',
+      layerGroup: 'Carved Grooves & Panels',
+      namePrefix: 'Molding / Groove',
+      toneLevel: 1,
+      toneTotal: 2,
+      heightMm: Number((opts.maxDepthMm * 0.38).toFixed(2)),
+      shape: 'vcarve',
+      mode: 'max',
+      adaptiveRadius: true,
+      rejectFullFrame: true,
+    }));
 
-    return woodEnts.slice(0, opts.maxContours);
+    return [...grooveEnts, ...raisedEnts].slice(0, opts.maxContours);
   }
 
   /**
@@ -1636,6 +1665,95 @@ export class ImageVectorizer {
       Q = R;
     }
     return Q;
+  }
+
+  /**
+   * Iterative Ramer-Douglas-Peucker polyline simplification for `{x, y}` anchor arrays.
+   */
+  static simplifyRDP(pts, epsilon = 0.4) {
+    if (!pts || pts.length <= 2) return pts ? pts.map((p) => ({ ...p })) : [];
+    const n = pts.length;
+    const keep = new Uint8Array(n);
+    keep[0] = 1;
+    keep[n - 1] = 1;
+    const stack = [[0, n - 1]];
+    const sqEps = epsilon * epsilon;
+
+    while (stack.length > 0) {
+      const [start, end] = stack.pop();
+      if (end - start <= 1) continue;
+      const a = pts[start], b = pts[end];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const lenSq = dx * dx + dy * dy;
+      let maxDistSq = -1;
+      let maxIdx = -1;
+
+      for (let i = start + 1; i < end; i++) {
+        const p = pts[i];
+        let dSq;
+        if (lenSq < 1e-12) {
+          dSq = (p.x - a.x) ** 2 + (p.y - a.y) ** 2;
+        } else {
+          const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq));
+          const px = a.x + t * dx, py = a.y + t * dy;
+          dSq = (p.x - px) ** 2 + (p.y - py) ** 2;
+        }
+        if (dSq > maxDistSq) {
+          maxDistSq = dSq;
+          maxIdx = i;
+        }
+      }
+
+      if (maxIdx !== -1 && maxDistSq > sqEps) {
+        keep[maxIdx] = 1;
+        stack.push([start, maxIdx], [maxIdx, end]);
+      }
+    }
+
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      if (keep[i]) out.push({ ...pts[i] });
+    }
+    return out;
+  }
+
+  /**
+   * Corner-preserving open/closed path smoother built on Taubin open-span smoothing.
+   */
+  static cornerPreservingSmooth(pts, closed = false) {
+    if (!pts || pts.length < 4) return pts ? pts.map((p) => ({ ...p })) : [];
+    const n = pts.length;
+    const isCorner = new Uint8Array(n);
+    isCorner[0] = closed ? 0 : 1;
+    isCorner[n - 1] = closed ? 0 : 1;
+
+    for (let i = 0; i < n; i++) {
+      if (!closed && (i === 0 || i === n - 1)) continue;
+      const prev = pts[(i - 1 + n) % n];
+      const curr = pts[i];
+      const next = pts[(i + 1) % n];
+      const v1x = curr.x - prev.x, v1y = curr.y - prev.y;
+      const v2x = next.x - curr.x, v2y = next.y - curr.y;
+      const d1 = Math.hypot(v1x, v1y), d2 = Math.hypot(v2x, v2y);
+      if (d1 < 1e-6 || d2 < 1e-6) continue;
+      const dot = (v1x * v2x + v1y * v2y) / (d1 * d2);
+      if (dot < 0.65) isCorner[i] = 1;
+    }
+
+    const out = [];
+    let spanStart = 0;
+    for (let i = 1; i < n; i++) {
+      if (isCorner[i] || i === n - 1) {
+        const span = pts.slice(spanStart, i + 1).map((p) => [p.x, p.y]);
+        const smoothed = span.length >= 4 ? ImageVectorizer.taubinSmoothOpen(span, 2) : span;
+        for (let k = (out.length === 0 ? 0 : 1); k < smoothed.length; k++) {
+          const isEndCorner = k === smoothed.length - 1 && isCorner[i];
+          out.push({ x: smoothed[k][0], y: smoothed[k][1], corner: isEndCorner });
+        }
+        spanStart = i;
+      }
+    }
+    return out;
   }
 
   /**
