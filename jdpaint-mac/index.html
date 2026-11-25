@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Beijing Jingdiao CNC CAD/CAM System - [JDPaint 5.21 (Mac Edition) - Untitled.jdp]</title>
+  <link rel="stylesheet" href="./src/styles/app.css">
+</head>
+<body>
+  <div id="jdpaint-window">
+    <!-- Classic Windows Title Bar -->
+    <div class="win-titlebar">
+      <div class="win-title">
+        <span class="win-icon">📐</span>
+        <span class="win-title-text">JDPaint 5.21 (Mac Edition) - CAD/CAM & 3D Relief Studio - [Untitled.jdp]</span>
+      </div>
+      <div class="win-controls">
+        <button class="win-btn win-min" title="Minimize">🗕</button>
+        <button class="win-btn win-max" title="Maximize">🗖</button>
+        <button class="win-btn win-close" title="Close">✕</button>
+      </div>
+    </div>
+
+    <!-- Classic Menu Bar (100% English JDPaint Edition) -->
+    <nav class="win-menubar">
+      <!-- File -->
+      <div class="menu-item">
+        <button class="menu-title">File(<u>F</u>)</button>
+        <div class="menu-dropdown">
+          <button id="menu-file-new"><span class="icon">📄</span>New Project(<u>N</u>)<span class="accel">Ctrl+N</span></button>
+          <button id="menu-file-open"><span class="icon">📂</span>Open Project(<u>O</u>)...<span class="accel">Ctrl+O</span></button>
+          <button id="menu-file-save"><span class="icon">💾</span>Save Project(<u>S</u>)<span class="accel">Ctrl+S</span></button>
+          <hr>
+          <label class="menu-label-btn">
+            <span class="icon">📐</span>Import 2D Vector (SVG)...
+            <input type="file" id="input-import-svg" accept=".svg,image/svg+xml" style="display:none;">
+          </label>
+          <label class="menu-label-btn">
+            <span class="icon">🖼️</span>Load Background Picture to Trace...
+            <input type="file" id="input-ref-image" accept="image/*" style="display:none;">
+          </label>
+          <button id="menu-file-trace-2d"><span class="icon">⚡</span>Auto-Trace Picture to 2D Vectors...</button>
+          <button id="menu-file-convert-3d"><span class="icon">🏔️</span>Convert Picture to High-Accuracy 3D Relief...</button>
+          <hr>
+          <button id="menu-file-export-gcode"><span class="icon">⚙️</span>Export CNC G-Code (.nc / .eng)<span class="accel">F9</span></button>
+          <button id="menu-file-export-stl"><span class="icon">🧊</span>Export 3D STL Mesh...</button>
+          <button id="menu-file-export-obj"><span class="icon">📦</span>Export Wavefront OBJ Model...</button>
+          <button id="menu-file-export-svg"><span class="icon">🎨</span>Export 2D Vectors (SVG)...</button>
+          <button id="menu-file-export-dxf"><span class="icon">📐</span>Export 2D CAD (AutoCAD DXF)...</button>
+          <hr>
+          <button id="menu-file-exit">Exit(<u>X</u>)<span class="accel">Alt+F4</span></button>
+        </div>
+      </div>
+
+      <!-- Edit -->
+      <div class="menu-item">
+        <button class="menu-title">Edit(<u>E</u>)</button>
+        <div class="menu-dropdown">
+          <button id="menu-edit-undo"><span class="icon">↩️</span>Undo(<u>U</u>)<span class="accel">Ctrl+Z</span></button>
+          <button id="menu-edit-redo"><span class="icon">↪️</span>Redo(<u>R</u>)<span class="accel">Ctrl+Y</span></button>
+          <hr>
+          <button id="menu-edit-delete">Delete Selection(<u>D</u>)<span class="accel">Del</span></button>
+          <button id="menu-edit-clear-ref">Remove Background Picture</button>
+          <button id="menu-edit-selectall">Select All(<u>A</u>)<span class="accel">Ctrl+A</span></button>
+        </div>
+      </div>
+
+      <!-- View -->
+      <div class="menu-item">
+        <button class="menu-title">View(<u>V</u>)</button>
+        <div class="menu-dropdown">
+          <button id="menu-view-split"><span class="icon">◫</span>Split View (2D CAD + 3D Relief)</button>
+          <button id="menu-view-cad"><span class="icon">📐</span>2D CAD Plane (Top View)</button>
+          <button id="menu-view-3d"><span class="icon">🏔️</span>3D Isometric View</button>
+          <hr>
+          <button id="menu-view-fit"><span class="icon">⊡</span>Fit Workpiece to Window<span class="accel">F3</span></button>
+          <button id="menu-view-zoomin"><span class="icon">🔍+</span>Zoom In</button>
+          <button id="menu-view-zoomout"><span class="icon">🔍-</span>Zoom Out</button>
+          <hr>
+          <button id="menu-view-grid"><span class="icon">▦</span>Toggle Snap Grid</button>
+        </div>
+      </div>
+
+      <!-- Draw -->
+      <div class="menu-item">
+        <button class="menu-title">Draw(<u>D</u>)</button>
+        <div class="menu-dropdown">
+          <button class="act-tool" data-tool="select"><span class="icon">↖</span>Pick / Transform Tool (V)</button>
+          <button class="act-tool" data-tool="node"><span class="icon">☩</span>Node / Shape Edit Tool (N)</button>
+          <button class="act-tool" data-tool="reshape"><span class="icon">〰️</span>Reshape Outline Brush (H)</button>
+          <hr>
+          <button class="act-tool" data-tool="pen"><span class="icon">✒️</span>Pen / Bezier Curve Tool (B)</button>
+          <button class="act-tool" data-tool="freehand"><span class="icon">🖌️</span>Freehand Sketch Brush (F)</button>
+          <button class="act-tool" data-tool="polyline"><span class="icon">〽</span>Polyline Tool (P)</button>
+          <button class="act-tool" data-tool="line"><span class="icon">╱</span>Line Segment Tool (L)</button>
+          <button class="act-tool" data-tool="arc"><span class="icon">⌒</span>3-Point Arc Tool (A)</button>
+          <hr>
+          <button class="act-tool" data-tool="rect"><span class="icon">▭</span>Rectangle Tool (R)</button>
+          <button class="act-tool" data-tool="circle"><span class="icon">○</span>Circle Tool (C)</button>
+          <button class="act-tool" data-tool="ellipse"><span class="icon">⬭</span>Ellipse / Oval Tool (O)</button>
+          <button class="act-tool" data-tool="polygon"><span class="icon">⬠</span>Polygon / Star Tool (G)</button>
+          <button class="act-tool" data-tool="text"><span class="icon">T</span>Text Engraving Tool (T)</button>
+          <hr>
+          <button class="act-tool" data-tool="knife"><span class="icon">✂️</span>Knife / Split Curve Tool (K)</button>
+          <button class="act-tool" data-tool="eraser"><span class="icon">🧹</span>Eraser Tool (E)</button>
+        </div>
+      </div>
+
+      <!-- Transform -->
+      <div class="menu-item">
+        <button class="menu-title">Transform(<u>T</u>)</button>
+        <div class="menu-dropdown">
+          <button id="menu-trans-duplicate">Duplicate Selected Layer<span class="accel">Ctrl+D</span></button>
+          <button id="menu-trans-array">Grid Array Repeat (Pattern)...</button>
+          <button id="menu-trans-simplify">Simplify Traced Nodes</button>
+          <hr>
+          <button id="menu-trans-center">Center Design on Stock</button>
+          <button id="menu-trans-fit">Scale & Fit Design to Stock</button>
+          <hr>
+          <button id="menu-align-left">Align Left</button>
+          <button id="menu-align-center-h">Align Center (Horizontal)</button>
+          <button id="menu-align-right">Align Right</button>
+          <button id="menu-align-top">Align Top</button>
+          <button id="menu-align-middle-v">Align Middle (Vertical)</button>
+          <button id="menu-align-bottom">Align Bottom</button>
+          <hr>
+          <button id="menu-trans-mirror-h">Mirror Horizontal (Flip X)</button>
+          <button id="menu-trans-mirror-v">Mirror Vertical (Flip Y)</button>
+          <button id="menu-trans-rot90">Rotate 90° Clockwise</button>
+          <button id="menu-trans-fillet">Fillet / Round Corners (3mm)</button>
+          <button id="menu-trans-offset">Offset Contour Outward (+2mm)</button>
+          <button id="menu-trans-offset-in">Offset Contour Inward (-2mm)</button>
+        </div>
+      </div>
+
+      <!-- 3D Relief -->
+      <div class="menu-item">
+        <button class="menu-title">Relief(<u>A</u>)</button>
+        <div class="menu-dropdown">
+          <button id="menu-relief-rosette"><span class="icon">🌸</span>Load Classical Floral Medallion</button>
+          <button id="menu-relief-dome"><span class="icon">⚪</span>Radial Dome / Surface Puff</button>
+          <button id="menu-relief-pyramid"><span class="icon">🔺</span>Beveled Pyramid Relief</button>
+          <hr>
+          <button id="menu-relief-smooth"><span class="icon">✨</span>Smooth Surface (Blur Noise Filter)</button>
+          <button id="menu-relief-invert"><span class="icon">🔄</span>Invert Relief (Male / Female Mold)</button>
+          <button id="menu-relief-clear"><span class="icon">🗑️</span>Clear Relief Heights</button>
+        </div>
+      </div>
+
+      <!-- Toolpath / CAM -->
+      <div class="menu-item">
+        <button class="menu-title">Machining(<u>M</u>)</button>
+        <div class="menu-dropdown">
+          <button id="menu-cam-surface"><span class="icon">⚡</span>Calculate 3D Surface Relief Toolpath<span class="accel">F9</span></button>
+          <button id="menu-cam-profile"><span class="icon">✂️</span>Calculate 2D Contour Profile Cut...</button>
+          <hr>
+          <button id="menu-cam-clear"><span class="icon">🧹</span>Clear Toolpaths</button>
+          <button id="menu-cam-export"><span class="icon">💾</span>Generate CNC G-Code / Engrave File...</button>
+        </div>
+      </div>
+
+      <!-- Help -->
+      <div class="menu-item">
+        <button class="menu-title">Help(<u>H</u>)</button>
+        <div class="menu-dropdown">
+          <button id="menu-help-about"><span class="icon">ℹ️</span>About JDPaint 5.21 (Mac Edition)...</button>
+        </div>
+      </div>
+    </nav>
+
+    <!-- Primary Standard Win32 Toolbar -->
+    <div class="win-toolbar-row">
+      <div class="toolbar-band">
+        <span class="grip"></span>
+        <button class="tb-btn" id="tb-new" title="New Project (Ctrl+N)">📄</button>
+        <button class="tb-btn" id="tb-open" title="Open Project (Ctrl+O)">📂</button>
+        <button class="tb-btn" id="tb-save" title="Save Project (Ctrl+S)">💾</button>
+        <span class="tb-sep"></span>
+        <button class="tb-btn" id="tb-undo" title="Undo (Ctrl+Z)">↩️</button>
+        <button class="tb-btn" id="tb-redo" title="Redo (Ctrl+Y)">↪️</button>
+        <span class="tb-sep"></span>
+        <button class="tb-btn" id="tb-zoomin" title="Zoom In">🔍⁺</button>
+        <button class="tb-btn" id="tb-zoomout" title="Zoom Out">🔍⁻</button>
+        <button class="tb-btn" id="tb-fit" title="Fit to Window (F3)">⊡</button>
+        <span class="tb-sep"></span>
+        <button class="tb-btn" id="tb-view-top" title="Top 2D View">⊞ Top (2D)</button>
+        <button class="tb-btn" id="tb-view-iso" title="Isometric 3D View">🧊 Iso (3D)</button>
+        <button class="tb-btn active" id="tb-view-split" title="Split Screen (2D + 3D)">◫ Split View</button>
+        <span class="tb-sep"></span>
+        <label class="tb-label">3D Material:</label>
+        <select id="select-material" class="tb-select" title="Realistic Studio Material Shading">
+          <option value="wood" selected>Walnut / Rosewood</option>
+          <option value="oak">Honey Golden Oak</option>
+          <option value="jade">Hetian Jade</option>
+          <option value="brass">Polished Brass</option>
+          <option value="stone">Dark Granite Slate</option>
+          <option value="heatmap">Elevation Heatmap</option>
+        </select>
+        <span class="tb-sep"></span>
+        <button class="tb-btn" id="tb-wireframe" title="Toggle Wireframe Mesh">Wireframe</button>
+        <button class="tb-btn active" id="tb-show-paths" title="Toggle Toolpath Trajectory">Toolpaths</button>
+        <span class="tb-sep"></span>
+        <button class="tb-btn btn-highlight" id="tb-calc-cam" title="Calculate 3D Toolpaths (F9)">⚡ Toolpaths</button>
+        <button class="tb-btn" id="tb-sim-cam" title="Animate 3D CNC Spindle Cutting Simulation">▶ Simulate</button>
+        <button class="tb-btn btn-highlight-green" id="tb-export-nc" title="Generate CNC G-Code">💾 G-Code</button>
+        <button class="tb-btn chip-toggle active" id="tb-toggle-inspector" style="margin-left:auto;" title="Toggle Right Inspector Drawer">◨ Inspector</button>
+      </div>
+    </div>
+
+    <!-- Secondary Command Strip: Picture Tracing Layer & Auto-Vectorize Controls -->
+    <div class="win-toolbar-row sub-row">
+      <div class="toolbar-band">
+        <span class="grip"></span>
+        <label class="tb-btn" style="cursor: pointer;" title="Import SVG Vector File directly into editable CAD layers">
+          📐 SVG...
+          <input type="file" id="input-import-svg-bar" accept=".svg,image/svg+xml" style="display:none;">
+        </label>
+        <!-- Image Reference Tracing Controls -->
+        <label class="tb-btn btn-highlight" style="cursor: pointer;" title="Load reference picture to trace with Pen or Polyline">
+          🖼️ Load Picture...
+          <input type="file" id="input-ref-image-bar" accept="image/*" style="display:none;">
+        </label>
+        <span class="tb-label">Opacity:</span>
+        <input type="range" id="slider-pic-opacity" min="0" max="100" value="50" style="width: 60px;" title="Adjust Picture Transparency for Tracing">
+        <span id="label-pic-opacity" style="font-size: 11px; width: 28px;">50%</span>
+        <button class="tb-btn chip-toggle active" id="btn-toggle-pic" title="Show or Hide Background Picture">Show</button>
+        <button class="tb-btn" id="btn-clear-pic" title="Remove Background Picture">Remove</button>
+        <span class="tb-sep"></span>
+        <!-- AUTO-TRACE 2D VECTORS & 3D RELIEF BUTTONS -->
+        <select id="trace-mode-select" class="tb-select" title="Choose Tracing Algorithm: Auto Smart handles wood photos, colored motifs & line art">
+          <option value="auto" selected>Trace: Auto Smart</option>
+          <option value="wood">Trace: Wood Carving Photo</option>
+          <option value="lineart">Trace: Line Art / Ink</option>
+          <option value="edge">Trace: Carved Groove Edges</option>
+        </select>
+        <span class="tb-label">Detail:</span>
+        <input type="range" id="slider-trace-detail" min="10" max="90" value="50" style="width: 52px;" title="Adjust Trace Capture Sensitivity (Lower = simpler clean shapes, Higher = capture fine wood grain/petals)">
+        <span id="lbl-trace-detail" style="font-size: 10px; width: 24px;">50%</span>
+        <button class="tb-btn btn-highlight-green" id="btn-auto-trace-2d" title="Automatically trace picture into editable 2D CAD vector layers!">⚡ Auto-Trace 2D</button>
+        <button class="tb-btn btn-highlight" id="btn-puff-3d" title="Convert selected 2D Pen/Curve/Shape into 3D relief!">💨 Selection → 3D</button>
+        <button class="tb-btn btn-highlight" id="btn-rebuild-3d" title="Rebuild full 3D Relief from all visible 2D layers">🔄 Canvas → 3D</button>
+        <button class="tb-btn" id="btn-extract-2d" title="Extract editable 2D vector contour layers from current 3D Relief">📐 3D → 2D</button>
+        <button class="tb-btn btn-highlight" id="btn-one-click-auto" title="One-Click: Trace picture into 2D layers AND generate 3D relief!">✨ 1-Click (2D+3D)</button>
+        <button class="tb-btn" id="btn-pic-to-relief" title="Convert loaded picture directly into High-Accuracy 3D heightmap">Pic → 3D</button>
+        <span class="tb-sep"></span>
+        <!-- Curve Editing Helpers -->
+        <button class="tb-btn" id="btn-to-curve" title="Convert selected Rectangle/Circle/Line into editable 2D node curve">➰ → Curve</button>
+        <button class="tb-btn" id="btn-join-paths" title="Join/Weld selected cut or Pen curves into one closed outline (J)">🔗 Join</button>
+        <button class="tb-btn" id="btn-fillet-corners" title="Round / Fillet sharp corners on selected Rect or Polyline (3mm)">◠ Fillet</button>
+        <button class="tb-btn" id="btn-simplify-curve" title="Reduce extra nodes on traced curves for easier manual reshaping">⌖ Simplify</button>
+        <button class="tb-btn" id="btn-close-path" title="Close current or selected open curve into a closed polygon">⤸ Close Path</button>
+        <button class="tb-btn" id="btn-smooth-curve" title="Smooth jagged nodes on selected curve">〰 Smooth</button>
+        <button class="tb-btn" id="btn-finish-curve" title="Finish current Pen or Polyline path (or press Enter / double-click)">✓ Finish Path</button>
+        <span class="tb-sep"></span>
+        <span class="tb-label">Snapping:</span>
+        <button class="tb-btn chip-toggle" id="snap-grid" title="Snap to 1mm Grid (Off for smooth free drawing)">Grid Snap</button>
+        <button class="tb-btn chip-toggle active" id="snap-end" title="Snap to Endpoints / Midpoints / Centers / On-Path">Object Snap</button>
+        <button class="tb-btn chip-toggle" id="snap-ortho" title="Ortho Lock (F8)">Ortho (90°)</button>
+        <button class="tb-btn chip-toggle active" id="btn-toggle-fills" title="Show soft translucent vector fills inside closed 2D layouts">Fill Tint</button>
+        <span class="tb-sep"></span>
+        <select id="select-symmetry" class="tb-select" title="Live Bilateral/Radial Symmetry Drawing (automatically mirrors whatever you draw across the center!)">
+          <option value="none" selected>Symmetry: Off</option>
+          <option value="mirrorX">🪞 Mirror Left ↔ Right</option>
+          <option value="mirrorY">🪞 Mirror Top ↕ Bottom</option>
+          <option value="quad">🌸 4-Way Quadrant</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Main CAD/CAM Workspace -->
+    <div class="win-workspace">
+      <!-- Left CAD & Sculpting Toolbox -->
+      <aside class="win-toolbox-left">
+        <div class="toolbox-header">2D Design</div>
+        <div class="toolbox-grid">
+          <button class="tb-tool-btn active" data-tool="select" title="Pick / Transform (V): Drag to move, drag 8 handles to resize, green handle to rotate">
+            <span class="tool-icon">↖</span>
+            <span class="tool-name">Select</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="node" title="Node Edit (N): Click curve to edit nodes, click edge to add+drag node, right-click node to delete">
+            <span class="tool-icon">☩</span>
+            <span class="tool-name">Node Edit</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="reshape" title="Path Reshape Brush (H): Drag smoothly over ANY traced outline to bend & fix its shape!">
+            <span class="tool-icon">〰️</span>
+            <span class="tool-name">Reshape</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="pen" title="Pen Curve (B): Click points to trace smooth Bezier curves, press Enter or click start to close">
+            <span class="tool-icon">✒️</span>
+            <span class="tool-name">Pen Curve</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="freehand" title="Freehand Brush (F): Hold & drag smoothly to sketch freeform curves">
+            <span class="tool-icon">🖌️</span>
+            <span class="tool-name">Freehand</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="polyline" title="Polyline (P): Click points for straight segments, dbl-click or Enter to finish">
+            <span class="tool-icon">〽</span>
+            <span class="tool-name">Polyline</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="line" title="Line Segment (L)">
+            <span class="tool-icon">╱</span>
+            <span class="tool-name">Line</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="arc" title="3-Point Arc (A): Click start, click end, click bulge curve">
+            <span class="tool-icon">⌒</span>
+            <span class="tool-name">3-Pt Arc</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="rect" title="Rectangle (R)">
+            <span class="tool-icon">▭</span>
+            <span class="tool-name">Rect</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="circle" title="Circle (C)">
+            <span class="tool-icon">○</span>
+            <span class="tool-name">Circle</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="ellipse" title="Ellipse / Oval (O)">
+            <span class="tool-icon">⬭</span>
+            <span class="tool-name">Ellipse</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="polygon" title="Polygon / Star (G): Click again to configure sides/star">
+            <span class="tool-icon">⬠</span>
+            <span class="tool-name">Poly/Star</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="text" title="Text Engraving (T)">
+            <span class="tool-icon">T</span>
+            <span class="tool-name">Text</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="knife" title="Knife / Split Tool (K): Click any curve/line to cut & separate it into layers">
+            <span class="tool-icon">✂️</span>
+            <span class="tool-name">Split Cut</span>
+          </button>
+          <button class="tb-tool-btn" id="tb-tool-join" title="Join / Weld Selected Curves into One Outline (J)">
+            <span class="tool-icon">🔗</span>
+            <span class="tool-name">Join Path</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="eraser" title="Eraser Tool (E): Click or drag across any vector to erase it">
+            <span class="tool-icon">🧹</span>
+            <span class="tool-name">Eraser</span>
+          </button>
+          <button class="tb-tool-btn" id="tb-tool-duplicate" title="Duplicate Selected Layer (Ctrl+D)">
+            <span class="tool-icon">⧉</span>
+            <span class="tool-name">Duplicate</span>
+          </button>
+          <button class="tb-tool-btn" id="tb-tool-offset" title="Offset Contour by +2mm">
+            <span class="tool-icon">⤢</span>
+            <span class="tool-name">Offset</span>
+          </button>
+          <button class="tb-tool-btn btn-highlight" id="tb-tool-puff" title="Convert selected 2D vectors into 3D relief">
+            <span class="tool-icon">💨</span>
+            <span class="tool-name">To 3D</span>
+          </button>
+          <button class="tb-tool-btn" id="tb-tool-to2d" title="Extract editable 2D contours from 3D relief">
+            <span class="tool-icon">📐</span>
+            <span class="tool-name">To 2D</span>
+          </button>
+        </div>
+
+        <div class="toolbox-header" style="margin-top: 6px;">3D Sculpt</div>
+        <div class="toolbox-grid">
+          <button class="tb-tool-btn" data-tool="sculpt-raise" title="3D Sculpt: Raise / Add Height on 3D surface">
+            <span class="tool-icon">▲</span>
+            <span class="tool-name">Raise</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="sculpt-lower" title="3D Sculpt: Lower / Carve Grooves into surface">
+            <span class="tool-icon">▼</span>
+            <span class="tool-name">Carve</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="sculpt-smooth" title="3D Sculpt: Smooth Brush to blend rough areas">
+            <span class="tool-icon">✨</span>
+            <span class="tool-name">Smooth</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="sculpt-flatten" title="3D Sculpt: Flatten / Erase back to base">
+            <span class="tool-icon">⌫</span>
+            <span class="tool-name">Flatten</span>
+          </button>
+        </div>
+
+        <div class="toolbox-header" style="margin-top: 6px;">Sculpt Size</div>
+        <div style="padding: 2px 4px; font-size: 10px; display: flex; flex-direction: column; gap: 3px;">
+          <span>Radius: <b id="brush-rad-val">10mm</b></span>
+          <input type="range" id="brush-radius" min="2" max="50" value="10" style="width: 100%;">
+          <span>Strength: <b id="brush-str-val">30%</b></span>
+          <input type="range" id="brush-strength" min="5" max="100" value="30" style="width: 100%;">
+        </div>
+      </aside>
+
+      <!-- Center Viewport Area (Split 2D / 3D) -->
+      <section class="win-viewport-container" id="viewport-container">
+        <!-- 2D CAD Vector Canvas Viewport -->
+        <div class="cad-viewport-panel" id="panel-cad">
+          <div class="viewport-title-banner">
+            <span class="vp-tag">2D CAD Plane [Top View] - Vector Drafting & Image Tracing</span>
+            <div class="vp-controls-inline">
+              <span id="ref-image-status" style="color: #4ade80;">No background image loaded</span>
+              <span id="cad-zoom-label" style="margin-left: 8px;">Scale: 100%</span>
+            </div>
+          </div>
+          <div class="canvas-mount" id="cad-canvas-wrapper">
+            <canvas id="cad-canvas"></canvas>
+            <!-- Floating Quick-Edit & Precision Dimension Pill Bar -->
+            <div id="cad-floating-bar" class="cad-floating-bar" style="display:none;"></div>
+          </div>
+        </div>
+
+        <!-- Draggable Split Resizer between 2D & 3D Views -->
+        <div class="split-resizer" id="split-resizer" title="Drag to resize 2D CAD & 3D Relief panels"></div>
+
+        <!-- 3D Surface / Toolpath WebGL Viewport -->
+        <div class="three-viewport-panel" id="panel-3d">
+          <div class="viewport-title-banner">
+            <span class="vp-tag" id="label-3d-view">3D Isometric View [Iso View] - 3D Relief & CNC Toolpaths</span>
+            <div class="vp-controls-inline">
+              <span id="vp-material-label">Material: Walnut</span>
+              <button class="vp-mini-btn" id="btn-recenter-3d" title="Reset Camera View">Reset View</button>
+            </div>
+          </div>
+          <div class="canvas-mount" id="three-canvas-wrapper">
+            <!-- Three.js renderer mounts here -->
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Inspector & Parameter Pane -->
+      <aside class="win-inspector-right">
+        <!-- Panel Tabs -->
+        <div class="inspector-tabs">
+          <button class="insp-tab active" data-tab="tab-layers" id="tab-btn-layers">Layers (<span id="layer-count-badge">0</span>)</button>
+          <button class="insp-tab" data-tab="tab-relief">3D Relief</button>
+          <button class="insp-tab" data-tab="tab-cam">Machining</button>
+          <button class="insp-tab" data-tab="tab-stats">NC Output</button>
+        </div>
+
+        <!-- Tab 0: Layer Manager & 2D/3D Per-Layer Editor -->
+        <div class="insp-tab-content active" id="tab-layers">
+          <fieldset class="win-group">
+            <legend>2D ↔ 3D Layer Stack & Sync</legend>
+            <div class="row" style="margin-bottom: 6px;">
+              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-weight:bold;color:#0a246a;">
+                <input type="checkbox" id="chk-auto-sync-3d" checked>
+                Auto-Sync 2D Edits → 3D
+              </label>
+            </div>
+            <div style="display:flex;gap:4px;margin-bottom:4px;">
+              <button class="win-push-btn primary" id="btn-layer-rebuild-3d" style="flex:1;" title="Rebuild 3D relief cleanly from all visible layers">🔄 Rebuild 3D</button>
+              <button class="win-push-btn" id="btn-layer-extract-2d" style="flex:1;" title="Extract 2D contour layers from 3D relief">📐 3D → 2D</button>
+            </div>
+            <div style="display:flex;gap:4px;">
+              <button class="win-push-btn" id="btn-layers-show-all" style="flex:1;padding:3px;">👁️ Show All</button>
+              <button class="win-push-btn" id="btn-layers-delete-sel" style="flex:1;padding:3px;">🗑️ Delete Sel</button>
+            </div>
+            <div class="align-strip" style="margin-top:5px;">
+              <button class="win-push-btn" id="btn-align-left" title="Align Left Edge">⫷</button>
+              <button class="win-push-btn" id="btn-align-center-h" title="Center Horizontally">⫼</button>
+              <button class="win-push-btn" id="btn-align-right" title="Align Right Edge">⫸</button>
+              <button class="win-push-btn" id="btn-align-top" title="Align Top Edge">⊤</button>
+              <button class="win-push-btn" id="btn-align-middle-v" title="Center Vertically">⊟</button>
+              <button class="win-push-btn" id="btn-align-bottom" title="Align Bottom Edge">⊥</button>
+              <button class="win-push-btn" id="btn-align-center-stock" title="Center Selection on Stock" style="grid-column:span 2;">⌖ Stock Center</button>
+            </div>
+          </fieldset>
+
+          <!-- Base Picture Heightmap Layer (when picture converted to 3D) -->
+          <fieldset class="win-group" id="base-photo-layer-box" style="display:none;">
+            <legend>Base Picture 3D Layer</legend>
+            <div class="row">
+              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
+                <input type="checkbox" id="chk-base-photo-enabled" checked>
+                Show Base Photo 3D
+              </label>
+              <button class="vp-mini-btn" id="btn-clear-base-photo" title="Remove raw photo heightmap so only manual 2D vector layers form 3D">Clear Base</button>
+            </div>
+            <div class="row" style="margin-top:3px;">
+              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:10px;color:#0a246a;">
+                <input type="checkbox" id="chk-clip-base-to-2d" checked>
+                Clip Photo 3D to Edited 2D Outlines
+              </label>
+            </div>
+            <div class="row" style="margin-top:4px;">
+              <label>Photo Depth Weight:</label>
+              <span id="lbl-base-photo-weight" style="font-size:10px;font-weight:bold;">100%</span>
+            </div>
+            <input type="range" id="slider-base-photo-weight" min="0" max="150" value="100" style="width:100%;">
+          </fieldset>
+
+          <!-- Scrollable List of Individual 2D/3D Layers -->
+          <fieldset class="win-group">
+            <legend>Design & Traced Layers</legend>
+            <div id="layer-list-container" class="layer-list-box">
+              <div class="layer-empty-hint">Draw with Pen/Shapes or Auto-Trace a picture to edit layers here.</div>
+            </div>
+          </fieldset>
+
+          <!-- Per-Layer 2D & 3D Inspector -->
+          <fieldset class="win-group" id="selected-layer-props" style="display:none;">
+            <legend>Selected Layer Controls</legend>
+            <div class="row">
+              <label>Name:</label>
+              <input type="text" id="layer-prop-name" class="win-input" style="width:135px;">
+            </div>
+            <div class="row">
+              <label style="display:flex;align-items:center;gap:4px;font-weight:bold;color:#1b5e20;">
+                <input type="checkbox" id="layer-prop-3d-enabled" checked>
+                Convert this Layer to 3D
+              </label>
+            </div>
+            <div class="row">
+              <label>3D Mode:</label>
+              <select id="layer-prop-mode" class="win-input" style="width:125px;">
+                <option value="max">Raise (Merge Max)</option>
+                <option value="add">Add Height (+)</option>
+                <option value="sub">Carve / Engrave (-)</option>
+              </select>
+            </div>
+            <div class="row">
+              <label>3D Profile:</label>
+              <select id="layer-prop-shape" class="win-input" style="width:125px;">
+                <option value="dome">Dome / Arc</option>
+                <option value="cone">Cone / Bevel</option>
+                <option value="smooth">Smooth S-Curve</option>
+                <option value="ogee">Ogee Molding</option>
+                <option value="vcarve">V-Carve Ridge</option>
+                <option value="scoop">Concave Scoop</option>
+                <option value="flat">Flat Extrude</option>
+              </select>
+            </div>
+            <div class="row" id="layer-prop-text-row" style="display:none;">
+              <label>Text & Font:</label>
+              <div style="display:flex;gap:3px;width:135px;">
+                <input type="text" id="layer-prop-text" class="win-input" style="flex:1;min-width:0;">
+                <select id="layer-prop-font" class="win-input" style="width:54px;">
+                  <option value="serif">Serif</option>
+                  <option value="sans-serif">Sans</option>
+                  <option value="monospace">Mono</option>
+                  <option value="cursive">Script</option>
+                </select>
+              </div>
+            </div>
+            <div class="row">
+              <label>Height Z:</label>
+              <div class="unit-box">
+                <input type="number" id="layer-prop-height" value="4.0" step="0.5" min="0.2" max="20">
+                <span>mm</span>
+              </div>
+            </div>
+            <div class="row">
+              <label>Width / R:</label>
+              <div class="unit-box">
+                <input type="number" id="layer-prop-radius" value="10.0" step="0.5" min="0.5" max="40">
+                <span>mm</span>
+              </div>
+            </div>
+            <div class="row" id="layer-prop-open-row">
+              <label>Open Path:</label>
+              <select id="layer-prop-open-style" class="win-input" style="width:125px;">
+                <option value="stroke">3D Stroke Ridge</option>
+                <option value="fill">Fill Closed Region</option>
+              </select>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:4px;">
+              <button class="win-push-btn" id="layer-btn-node-edit" style="padding:3px;">☩ Edit Nodes</button>
+              <button class="win-push-btn" id="layer-btn-close-path" style="padding:3px;">⤸ Close Path</button>
+              <button class="win-push-btn" id="layer-btn-smooth" style="padding:3px;">〰 Smooth</button>
+              <button class="win-push-btn" id="layer-btn-to-curve" style="padding:3px;">➰ To Curve</button>
+            </div>
+            <button class="win-push-btn primary" id="layer-btn-apply-3d" style="width:100%;margin-top:5px;">⚡ Apply Layer to 3D</button>
+          </fieldset>
+        </div>
+
+        <!-- Tab 1: CAM Parameters -->
+        <div class="insp-tab-content" id="tab-cam">
+          <fieldset class="win-group">
+            <legend>Cutter Selection</legend>
+            <div class="row">
+              <label>Cutter Type:</label>
+              <select id="tool-type" class="win-input">
+                <option value="ball" selected>Ball-Nose Cutter</option>
+                <option value="flat">Flat Endmill</option>
+                <option value="vcarve">V-Bit Engraver</option>
+              </select>
+            </div>
+            <div class="row">
+              <label>Cutter Diameter D:</label>
+              <div class="unit-box">
+                <input type="number" id="tool-diameter" value="3.175" step="0.1" min="0.1">
+                <span>mm</span>
+              </div>
+            </div>
+            <div class="row">
+              <label>Stepover Spacing:</label>
+              <div class="unit-box">
+                <input type="number" id="tool-stepover" value="0.3" step="0.05" min="0.05">
+                <span>mm</span>
+              </div>
+            </div>
+          </fieldset>
+
+          <fieldset class="win-group">
+            <legend>Depths & Feedrates</legend>
+            <div class="row">
+              <label>Safe Clearance Z:</label>
+              <div class="unit-box">
+                <input type="number" id="cam-safe-z" value="5.0" step="0.5" min="1.0">
+                <span>mm</span>
+              </div>
+            </div>
+            <div class="row">
+              <label>Cutting Feedrate (F):</label>
+              <div class="unit-box">
+                <input type="number" id="cam-feedrate" value="1500" step="100" min="100">
+                <span>mm/min</span>
+              </div>
+            </div>
+            <div class="row">
+              <label>Plunge Feedrate (Fz):</label>
+              <div class="unit-box">
+                <input type="number" id="cam-plunge" value="500" step="50" min="50">
+                <span>mm/min</span>
+              </div>
+            </div>
+            <div class="row">
+              <label>Spindle Speed (S):</label>
+              <div class="unit-box">
+                <input type="number" id="cam-spindle" value="18000" step="1000" min="1000">
+                <span>RPM</span>
+              </div>
+            </div>
+          </fieldset>
+
+          <div class="action-btn-block">
+            <button class="win-push-btn primary" id="btn-calc-surface-toolpath">⚡ Calculate 3D Relief Toolpaths (F9)</button>
+            <button class="win-push-btn" id="btn-calc-profile-toolpath">✂️ Calculate 2D Contour Profile Cut</button>
+            <button class="win-push-btn" id="btn-clear-toolpath">🧹 Clear Toolpaths</button>
+          </div>
+        </div>
+
+        <!-- Tab 2: Relief Parameters -->
+        <div class="insp-tab-content" id="tab-relief">
+          <fieldset class="win-group">
+            <legend>Workpiece Dimensions & Stock Presets</legend>
+            <div class="row">
+              <label>Board Preset:</label>
+              <select id="prop-stock-preset" class="win-input" style="width: 135px;">
+                <option value="">Custom Stock</option>
+                <option value="100,100,8">100×100mm Coaster</option>
+                <option value="200,150,12">200×150mm Plaque</option>
+                <option value="300,200,15">300×200mm Signboard</option>
+                <option value="300,500,18">300×500mm Door Panel</option>
+              </select>
+            </div>
+            <div class="row">
+              <label>Width (X):</label>
+              <div class="unit-box">
+                <input type="number" id="prop-width" value="100" step="5" min="10">
+                <span>mm</span>
+              </div>
+            </div>
+            <div class="row">
+              <label>Height (Y):</label>
+              <div class="unit-box">
+                <input type="number" id="prop-height" value="100" step="5" min="10">
+                <span>mm</span>
+              </div>
+            </div>
+            <div class="row">
+              <label>Max Relief Depth (Z):</label>
+              <div class="unit-box">
+                <input type="number" id="prop-relief-depth" value="8.0" step="0.5" min="0.5">
+                <span>mm</span>
+              </div>
+            </div>
+            <div class="row">
+              <label>Base Plane Z:</label>
+              <div class="unit-box">
+                <input type="number" id="prop-base-height" value="0.0" step="0.5" min="0">
+                <span>mm</span>
+              </div>
+            </div>
+            <div class="row">
+              <label>Grid Resolution:</label>
+              <select id="prop-grid-res" class="win-input">
+                <option value="128">128 × 128 (Fast Preview)</option>
+                <option value="256" selected>256 × 256 (Standard Fine)</option>
+                <option value="512">512 × 512 (Ultra High Detail)</option>
+              </select>
+            </div>
+          </fieldset>
+
+          <fieldset class="win-group">
+            <legend>2D Vector to 3D Relief Puffing (JDPaint Domain Forming)</legend>
+            <div class="row">
+              <label>Puff Profile:</label>
+              <select id="puff-shape" class="win-input">
+                <option value="dome" selected>Dome / Arc (Spherical)</option>
+                <option value="cone">Cone / Bevel (Pyramid)</option>
+                <option value="smooth">Smooth S-Curve (Cosine)</option>
+                <option value="ogee">Ogee Furniture Molding</option>
+                <option value="vcarve">V-Carve Chisel Ridge</option>
+                <option value="scoop">Concave Scoop / Dish</option>
+                <option value="flat">Flat Extrusion (Stepped)</option>
+              </select>
+            </div>
+            <div class="row">
+              <label>Puff Height Z:</label>
+              <div class="unit-box">
+                <input type="number" id="puff-height" value="4.0" step="0.5" min="0.2" max="20.0">
+                <span>mm</span>
+              </div>
+            </div>
+            <div class="row">
+              <label>Puff Radius R:</label>
+              <div class="unit-box">
+                <input type="number" id="puff-radius" value="12.0" step="1.0" min="1.0" max="50.0">
+                <span>mm</span>
+              </div>
+            </div>
+            <div class="row">
+              <label>Merge Mode:</label>
+              <select id="puff-mode" class="win-input">
+                <option value="max" selected>Merge High (Max Peak)</option>
+                <option value="add">Add Height (Accumulate)</option>
+                <option value="sub">Carve Out (Subtract)</option>
+              </select>
+            </div>
+            <button class="win-push-btn primary" id="btn-do-puff" style="margin-top: 6px;">💨 Puff Selected 2D Vectors to 3D</button>
+          </fieldset>
+
+          <fieldset class="win-group">
+            <legend>Picture Tracing & 3D Conversion Settings</legend>
+            <div class="row">
+              <label>Relief Style:</label>
+              <select id="relief-style" class="win-input">
+                <option value="sculpted" selected>Sculpted (Edge Enhanced)</option>
+                <option value="organic">Smooth Organic</option>
+                <option value="linear">Direct Luminance Height</option>
+              </select>
+            </div>
+            <div class="row">
+              <label>Edge Crispness:</label>
+              <div class="unit-box">
+                <input type="number" id="relief-edge-strength" value="0.35" step="0.05" min="0" max="1.0">
+              </div>
+            </div>
+            <div class="row">
+              <label>Trace Sensitivity:</label>
+              <select id="trace-threshold-mode" class="win-input">
+                <option value="-1" selected>Auto Optimal (Otsu)</option>
+                <option value="0.25">High Contrast (0.25)</option>
+                <option value="0.40">Standard Drawing (0.40)</option>
+                <option value="0.60">Fine Lines (0.60)</option>
+                <option value="0.75">Deep Shadows (0.75)</option>
+              </select>
+            </div>
+            <div class="row">
+              <label>Invert Dark/Bright:</label>
+              <input type="checkbox" id="relief-invert-check">
+            </div>
+            <div class="row">
+              <label>Cut White Background:</label>
+              <input type="checkbox" id="relief-remove-bg" checked>
+            </div>
+          </fieldset>
+
+          <div class="action-btn-block">
+            <button class="win-push-btn primary" id="btn-side-convert-pic">🏔️ Convert Pic to High-Accuracy 3D</button>
+            <button class="win-push-btn" id="btn-side-trace-2d">⚡ Auto-Trace Picture to 2D Vectors</button>
+            <button class="win-push-btn" id="btn-side-puff">💨 Puff 2D Vectors to 3D</button>
+            <button class="win-push-btn" id="btn-side-smooth">✨ Smooth Surface (Noise Filter)</button>
+            <button class="win-push-btn" id="btn-side-invert">🔄 Invert Relief (Male/Female)</button>
+          </div>
+        </div>
+
+        <!-- Tab 3: Statistics & NC Output -->
+        <div class="insp-tab-content" id="tab-stats">
+          <fieldset class="win-group">
+            <legend>Machining Statistics</legend>
+            <div class="stat-grid">
+              <div class="stat-col"><span class="k">Toolpath Waypoints:</span><span class="v" id="stat-points">0</span></div>
+              <div class="stat-col"><span class="k">Total Cutting Distance:</span><span class="v" id="stat-distance">0.00 m</span></div>
+              <div class="stat-col"><span class="k">Est. Machining Time:</span><span class="v" id="stat-time">0 min 00 s</span></div>
+              <div class="stat-col"><span class="k">Workpiece Bounds:</span><span class="v" id="stat-bounds">100 × 100 × 8 mm</span></div>
+            </div>
+          </fieldset>
+
+          <div class="action-btn-block">
+            <button class="win-push-btn primary" id="btn-export-nc-tab">💾 Generate CNC G-Code File...</button>
+            <button class="win-push-btn" id="btn-export-stl-tab">🧊 Export 3D Binary STL...</button>
+            <button class="win-push-btn" id="btn-export-obj-tab">📦 Export 3D Wavefront OBJ...</button>
+            <button class="win-push-btn" id="btn-export-dxf-tab">📐 Export 2D CAD (DXF)...</button>
+            <button class="win-push-btn" id="btn-export-svg-tab">🎨 Export 2D Vector (SVG)...</button>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <!-- Classic Windows Status Bar -->
+    <footer class="win-statusbar">
+      <div class="sb-cell sb-prompt" id="status-mode">Ready. Select a tool or load an image to start designing. Press F9 to calculate toolpaths.</div>
+      <div class="sb-cell sb-coord" id="status-cursor">X: 0.000 mm  Y: 0.000 mm  Z: 0.000 mm</div>
+      <div class="sb-cell sb-snap" id="status-snap-info">Snap: ON | Ortho: OFF | Grid: ON</div>
+      <div class="sb-cell sb-unit">Unit: Metric (mm)</div>
+      <div class="sb-cell sb-engine">CNC Engine 5.21 (Ready)</div>
+    </footer>
+  </div>
+
+  <!-- NC G-Code Dialog -->
+  <dialog id="dialog-gcode" class="win-modal">
+    <div class="modal-window">
+      <div class="modal-titlebar">
+        <span>CNC G-Code Generator Wizard</span>
+        <button id="modal-close" class="modal-close-x">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="dialog-field-row">
+          <label>CNC Controller Dialect:</label>
+          <select id="select-dialect" class="win-input">
+            <option value="jingdiao" selected>Beijing Jingdiao Engrave (*.eng / *.nc)</option>
+            <option value="grbl">Standard ISO G-Code / GRBL / Mach3 (*.nc)</option>
+            <option value="fanuc">Fanuc / Industrial CNC (*.tap)</option>
+          </select>
+        </div>
+        <div class="code-box-label">Generated CNC Program Code Preview:</div>
+        <textarea id="gcode-preview-text" class="modal-textarea" readonly spellcheck="false"></textarea>
+      </div>
+      <div class="modal-bottom-bar">
+        <button id="btn-copy-gcode" class="win-push-btn">📋 Copy Code to Clipboard</button>
+        <button id="btn-download-gcode" class="win-push-btn primary">💾 Save CNC File (*.nc / *.eng)</button>
+        <button id="btn-cancel-gcode" class="win-push-btn">Close</button>
+      </div>
+    </div>
+  </dialog>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

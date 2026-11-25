@@ -1,0 +1,18 @@
+{
+  "name": "jdpaint-mac",
+  "version": "5.21.0",
+  "description": "JDPaint 5.21 Mac Edition - 2D CAD & 3D Relief Sculpting & CNC Toolpath Studio",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "vite --open"
+  },
+  "dependencies": {
+    "three": "^0.182.0"
+  },
+  "devDependencies": {
+    "vite": "^6.2.0"
+  }
+}

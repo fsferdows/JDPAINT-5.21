@@ -1,0 +1,1031 @@
+/* ============================================================
+   JDPaint 5.21 (Mac Edition) - 100% Authentic Win32 CAD/CAM Theme
+   ============================================================ */
+
+:root {
+  --win-bg: #ece9d8;
+  --win-face: #f0f0e8;
+  --win-dark: #707070;
+  --win-darker: #404040;
+  --win-light: #ffffff;
+  --win-blue: #0055ea;
+  --win-blue-end: #3b82f6;
+  --win-select: #0a246a;
+  --win-border: #919b9c;
+  --cad-bg: #000000;
+  --font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  font-family: var(--font-family);
+  -webkit-font-smoothing: antialiased;
+}
+
+body, html {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background-color: var(--win-bg);
+  color: #000000;
+  user-select: none;
+  font-size: 12px;
+}
+
+#jdpaint-window {
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+  border: 1px solid #716f64;
+  background-color: var(--win-bg);
+}
+
+/* ============================================================
+   1. Classic Windows Title Bar
+   ============================================================ */
+.win-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 28px;
+  background: linear-gradient(90deg, #0054e3 0%, #2b70f0 40%, #3d95f8 100%);
+  color: #ffffff;
+  padding: 0 4px 0 8px;
+  border-bottom: 1px solid #002d80;
+}
+
+.win-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: bold;
+  font-size: 12px;
+  letter-spacing: 0.2px;
+  text-shadow: 1px 1px 1px rgba(0, 0, 0, 0.4);
+}
+
+.win-icon {
+  font-size: 14px;
+}
+
+.win-controls {
+  display: flex;
+  gap: 2px;
+}
+
+.win-btn {
+  width: 22px;
+  height: 20px;
+  background: linear-gradient(180deg, #ffffff 0%, #ece9d8 30%, #d8d0c4 100%);
+  border: 1px solid #5a5850;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: bold;
+  color: #333333;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.win-btn:hover {
+  background: #ffffff;
+}
+
+.win-btn:active {
+  background: #c0b8ac;
+  border-style: inset;
+}
+
+.win-close:hover {
+  background: #e81123;
+  color: white;
+}
+
+/* ============================================================
+   2. Win32 Menu Bar
+   ============================================================ */
+.win-menubar {
+  display: flex;
+  align-items: center;
+  background-color: var(--win-bg);
+  border-bottom: 1px solid #d0ccc0;
+  padding: 1px 4px;
+  height: 22px;
+}
+
+.menu-item {
+  position: relative;
+}
+
+.menu-title {
+  background: transparent;
+  border: 1px solid transparent;
+  color: #000000;
+  padding: 2px 7px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.menu-title u {
+  text-decoration: underline;
+}
+
+.menu-item:hover .menu-title {
+  background-color: #316ac5;
+  color: #ffffff;
+  border-radius: 2px;
+}
+
+.menu-dropdown {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  background-color: #ffffff;
+  border: 1px solid #716f64;
+  box-shadow: 2px 2px 6px rgba(0,0,0,0.3);
+  min-width: 220px;
+  padding: 2px;
+  z-index: 1000;
+}
+
+.menu-item:hover .menu-dropdown {
+  display: block;
+}
+
+.menu-dropdown button, .menu-label-btn {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 4px 10px;
+  background: transparent;
+  border: none;
+  color: #000000;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.menu-dropdown button .icon, .menu-label-btn .icon {
+  margin-right: 8px;
+  width: 16px;
+  display: inline-block;
+  text-align: center;
+}
+
+.menu-dropdown button .accel {
+  margin-left: auto;
+  color: #707070;
+  font-size: 11px;
+}
+
+.menu-dropdown button:hover, .menu-label-btn:hover {
+  background-color: #316ac5;
+  color: #ffffff;
+}
+
+.menu-dropdown button:hover .accel {
+  color: #ffffff;
+}
+
+.menu-dropdown hr {
+  border: none;
+  border-top: 1px solid #e0dfd8;
+  border-bottom: 1px solid #ffffff;
+  margin: 3px 0;
+}
+
+/* ============================================================
+   3. Classic Toolbar Strips
+   ============================================================ */
+.win-toolbar-row {
+  display: flex;
+  align-items: center;
+  background-color: var(--win-bg);
+  border-bottom: 1px solid #b5b1a4;
+  padding: 2px 4px;
+  min-height: 28px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.win-toolbar-row.sub-row {
+  background-color: #f4f2e8;
+  border-bottom: 1px solid #9c9789;
+}
+
+.toolbar-band {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+  row-gap: 2px;
+  width: 100%;
+}
+
+.grip {
+  width: 3px;
+  height: 20px;
+  border-left: 1px solid #ffffff;
+  border-right: 1px solid #808080;
+  margin: 0 4px 0 2px;
+}
+
+.tb-btn {
+  background-color: transparent;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  padding: 2px 6px;
+  font-size: 12px;
+  color: #000000;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+}
+
+.tb-btn:hover {
+  background-color: #fbf9f4;
+  border-top: 1px solid #ffffff;
+  border-left: 1px solid #ffffff;
+  border-right: 1px solid #707070;
+  border-bottom: 1px solid #707070;
+}
+
+.tb-btn:active, .tb-btn.active {
+  background-color: #e2decb;
+  border-top: 1px solid #707070;
+  border-left: 1px solid #707070;
+  border-right: 1px solid #ffffff;
+  border-bottom: 1px solid #ffffff;
+  font-weight: bold;
+}
+
+.tb-btn.btn-highlight {
+  background: linear-gradient(180deg, #fff 0%, #ffe082 100%);
+  border: 1px solid #c99700;
+  font-weight: bold;
+  color: #944f00;
+}
+
+.tb-btn.btn-highlight:hover {
+  background: #ffecb3;
+}
+
+.tb-btn.btn-highlight-green {
+  background: linear-gradient(180deg, #fff 0%, #c8e6c9 100%);
+  border: 1px solid #388e3c;
+  font-weight: bold;
+  color: #1b5e20;
+}
+
+.chip-toggle.active {
+  background-color: #c4dcff;
+  border: 1px solid #316ac5;
+  color: #0a246a;
+}
+
+.tb-sep {
+  width: 1px;
+  height: 18px;
+  background-color: #b5b1a4;
+  border-right: 1px solid #ffffff;
+  margin: 0 3px;
+}
+
+.tb-label {
+  font-size: 11px;
+  color: #404040;
+  margin: 0 4px;
+}
+
+.tb-select {
+  background: #ffffff;
+  border: 1px solid #7f9db9;
+  border-radius: 1px;
+  font-size: 11px;
+  padding: 1px 4px;
+  height: 21px;
+}
+
+/* ============================================================
+   4. Main CAD/CAM Workspace
+   ============================================================ */
+.win-workspace {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  border-top: 1px solid #ffffff;
+}
+
+/* Left Toolbox */
+.win-toolbox-left {
+  width: clamp(84px, 7vw, 102px);
+  flex-shrink: 0;
+  background-color: var(--win-bg);
+  border-right: 1px solid #848278;
+  display: flex;
+  flex-direction: column;
+  padding: 4px 3px;
+  overflow-y: auto;
+}
+
+.toolbox-header {
+  background: linear-gradient(90deg, #3a6ea5 0%, #76a0d0 100%);
+  color: white;
+  font-size: 10px;
+  font-weight: bold;
+  text-align: center;
+  padding: 2px 0;
+  margin-bottom: 3px;
+  border-radius: 1px;
+}
+
+.toolbox-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+}
+
+.tb-tool-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 40px;
+  background-color: var(--win-bg);
+  border: 1px solid transparent;
+  cursor: pointer;
+  padding: 2px;
+}
+
+.tb-tool-btn .tool-icon {
+  font-size: 15px;
+}
+
+.tb-tool-btn .tool-name {
+  font-size: 10px;
+  margin-top: 2px;
+  color: #222;
+}
+
+.tb-tool-btn:hover {
+  background-color: #faf8f2;
+  border-top: 1px solid #ffffff;
+  border-left: 1px solid #ffffff;
+  border-right: 1px solid #707070;
+  border-bottom: 1px solid #707070;
+}
+
+.tb-tool-btn.active {
+  background-color: #dcd7c4;
+  border-top: 1px solid #707070;
+  border-left: 1px solid #707070;
+  border-right: 1px solid #ffffff;
+  border-bottom: 1px solid #ffffff;
+  font-weight: bold;
+}
+
+.tb-tool-btn.active .tool-name {
+  color: #0054e3;
+  font-weight: bold;
+}
+
+/* Viewports (Center) */
+.win-viewport-container {
+  display: flex;
+  flex: 1;
+  background-color: var(--cad-bg);
+  position: relative;
+  overflow: hidden;
+  border-left: 1px solid #ffffff;
+  border-right: 1px solid #848278;
+}
+
+.cad-viewport-panel, .three-viewport-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 50%;
+  min-width: 160px;
+  min-height: 140px;
+  height: 100%;
+  position: relative;
+}
+
+.split-resizer {
+  width: 5px;
+  flex: 0 0 5px;
+  background: linear-gradient(90deg, #334155 0%, #64748b 50%, #334155 100%);
+  cursor: col-resize;
+  z-index: 15;
+  transition: background 0.15s;
+}
+
+.split-resizer:hover, .split-resizer.dragging {
+  background: #38bdf8;
+}
+
+.viewport-title-banner {
+  height: 20px;
+  background: #2b2b2b;
+  color: #e0e0e0;
+  border-bottom: 1px solid #404040;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px;
+  font-size: 10px;
+  font-weight: bold;
+  letter-spacing: 0.3px;
+}
+
+.vp-tag {
+  color: #60a5fa;
+}
+
+.vp-controls-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.vp-mini-btn {
+  background: #404040;
+  color: #fff;
+  border: 1px solid #606060;
+  font-size: 10px;
+  padding: 1px 4px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.vp-mini-btn:hover {
+  background: #555;
+}
+
+.canvas-mount {
+  flex: 1;
+  width: 100%;
+  height: calc(100% - 20px);
+  position: relative;
+  overflow: hidden;
+  background-color: var(--cad-bg);
+}
+
+#cad-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.cad-floating-bar {
+  position: absolute;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(15, 23, 42, 0.92);
+  border: 1px solid #334155;
+  border-radius: 6px;
+  padding: 5px 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+  color: #e2e8f0;
+  font-size: 11px;
+  z-index: 20;
+  max-width: 96%;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.cad-floating-bar label {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  color: #94a3b8;
+  font-size: 10px;
+}
+
+.cad-floating-bar input[type="number"] {
+  width: 52px;
+  background: #1e293b;
+  color: #f8fafc;
+  border: 1px solid #475569;
+  border-radius: 3px;
+  padding: 2px 4px;
+  font-size: 11px;
+  font-family: monospace;
+  outline: none;
+}
+
+.cad-floating-bar input[type="number"]:focus {
+  border-color: #38bdf8;
+}
+
+.cad-float-btn {
+  background: #1e293b;
+  color: #e2e8f0;
+  border: 1px solid #475569;
+  border-radius: 4px;
+  padding: 3px 7px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.cad-float-btn:hover {
+  background: #334155;
+  border-color: #64748b;
+}
+
+.cad-float-btn.primary {
+  background: #0284c7;
+  border-color: #38bdf8;
+  color: #ffffff;
+  font-weight: bold;
+}
+
+.cad-float-btn.emerald {
+  background: #059669;
+  border-color: #34d399;
+  color: #ffffff;
+  font-weight: bold;
+}
+
+#three-canvas-wrapper canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+  touch-action: none;
+}
+
+/* ============================================================
+   5. Right Inspector & Parameter Pane
+   ============================================================ */
+.win-inspector-right {
+  width: clamp(255px, 22vw, 310px);
+  flex-shrink: 0;
+  background-color: var(--win-bg);
+  border-left: 1px solid #ffffff;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.win-inspector-right.collapsed {
+  display: none !important;
+}
+
+.align-strip {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 2px;
+}
+
+.align-strip .win-push-btn {
+  padding: 2px 3px;
+  font-size: 11px;
+}
+
+.inspector-tabs {
+  display: flex;
+  background-color: #dcd7c4;
+  border-bottom: 1px solid #848278;
+  padding: 2px 2px 0 2px;
+}
+
+.insp-tab {
+  flex: 1;
+  background-color: #d4d0c0;
+  border: 1px solid #848278;
+  border-bottom: none;
+  border-radius: 3px 3px 0 0;
+  padding: 4px 2px;
+  font-size: 11px;
+  cursor: pointer;
+  color: #333;
+}
+
+.insp-tab.active {
+  background-color: var(--win-bg);
+  border-bottom: 1px solid var(--win-bg);
+  margin-bottom: -1px;
+  font-weight: bold;
+  color: #000;
+}
+
+.insp-tab-content {
+  display: none;
+  padding: 6px;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.insp-tab-content.active {
+  display: flex;
+}
+
+.win-group {
+  border: 1px groove #ffffff;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  border-radius: 2px;
+}
+
+.win-group legend {
+  font-size: 11px;
+  font-weight: bold;
+  color: #0054e3;
+  padding: 0 4px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.row label {
+  font-size: 11px;
+  color: #333;
+}
+
+.win-input, .unit-box input {
+  background: #ffffff;
+  border: 1px solid #7f9db9;
+  border-radius: 1px;
+  font-size: 11px;
+  padding: 2px 4px;
+  outline: none;
+}
+
+.unit-box {
+  display: flex;
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #7f9db9;
+  padding-right: 4px;
+  border-radius: 1px;
+}
+
+.unit-box input {
+  border: none;
+  width: 65px;
+  text-align: right;
+  padding: 2px 2px;
+}
+
+.unit-box span {
+  font-size: 10px;
+  color: #666;
+  margin-left: 2px;
+}
+
+.action-btn-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.win-push-btn {
+  background: linear-gradient(180deg, #ffffff 0%, #ece9d8 50%, #d8d0c4 100%);
+  border: 1px solid #716f64;
+  border-radius: 3px;
+  padding: 5px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  color: #000;
+  text-align: center;
+}
+
+.win-push-btn:hover {
+  background: linear-gradient(180deg, #ffffff 0%, #f7f5ed 100%);
+}
+
+.win-push-btn:active {
+  background: #c8c0b0;
+  border-style: inset;
+}
+
+.win-push-btn.primary {
+  background: linear-gradient(180deg, #fff 0%, #ffcc80 100%);
+  border-color: #e65100;
+  font-weight: bold;
+  color: #b71c1c;
+}
+
+.stat-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+}
+
+.stat-col {
+  display: flex;
+  justify-content: space-between;
+}
+
+.stat-col .k {
+  color: #555;
+}
+
+.stat-col .v {
+  font-family: monospace;
+  font-weight: bold;
+  color: #0054e3;
+}
+
+/* ============================================================
+   6. Classic Windows Status Bar
+   ============================================================ */
+.win-statusbar {
+  height: 22px;
+  background-color: var(--win-bg);
+  border-top: 1px solid #b5b1a4;
+  display: flex;
+  align-items: center;
+  padding: 1px 2px;
+  gap: 2px;
+}
+
+.sb-cell {
+  background-color: #f7f5f0;
+  border-top: 1px solid #9c9789;
+  border-left: 1px solid #9c9789;
+  border-right: 1px solid #ffffff;
+  border-bottom: 1px solid #ffffff;
+  padding: 1px 6px;
+  font-size: 11px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
+.sb-prompt {
+  flex: 1;
+  color: #222;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sb-coord {
+  width: 250px;
+  font-family: monospace;
+  font-weight: bold;
+  color: #0054e3;
+}
+
+.sb-snap {
+  width: 140px;
+  color: #555;
+}
+
+.sb-unit {
+  width: 85px;
+  color: #555;
+}
+
+.sb-engine {
+  width: 130px;
+  color: #1b5e20;
+  font-weight: bold;
+}
+
+/* ============================================================
+   7. Windows Modal Dialogs
+   ============================================================ */
+.win-modal {
+  margin: auto;
+  border: none;
+  background: transparent;
+  outline: none;
+}
+
+.win-modal::backdrop {
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.modal-window {
+  background-color: var(--win-bg);
+  border: 2px solid #0054e3;
+  border-radius: 4px;
+  width: 580px;
+  max-width: 94vw;
+  box-shadow: 4px 4px 15px rgba(0,0,0,0.4);
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-titlebar {
+  background: linear-gradient(90deg, #0054e3 0%, #2b70f0 100%);
+  color: #ffffff;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-weight: bold;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.modal-close-x {
+  background: transparent;
+  border: none;
+  color: white;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.modal-body {
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dialog-field-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.code-box-label {
+  font-size: 11px;
+  font-weight: bold;
+  color: #333;
+}
+
+.modal-textarea {
+  width: 100%;
+  height: 240px;
+  background-color: #ffffff;
+  border: 1px solid #7f9db9;
+  font-family: monospace;
+  font-size: 11px;
+  padding: 6px;
+  resize: none;
+  color: #000;
+  white-space: pre;
+}
+
+.modal-bottom-bar {
+  background-color: #e4dfd0;
+  border-top: 1px solid #d0ccc0;
+  padding: 8px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+/* ============================================================
+   8. Layer Manager Panel (Per-Layer 2D & 3D Editing)
+   ============================================================ */
+.layer-list-box {
+  background: #ffffff;
+  border: 1px solid #7f9db9;
+  max-height: 210px;
+  min-height: 75px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.layer-empty-hint {
+  padding: 12px 8px;
+  font-size: 11px;
+  color: #666;
+  text-align: center;
+}
+
+.layer-row {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 4px;
+  border-bottom: 1px solid #ece9d8;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.layer-row:hover {
+  background-color: #eef4ff;
+}
+
+.layer-row.selected {
+  background-color: #316ac5;
+  color: #ffffff;
+}
+
+.layer-row.hidden-layer {
+  opacity: 0.55;
+}
+
+.layer-icon-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 2px;
+  line-height: 1.2;
+  border-radius: 2px;
+}
+
+.layer-icon-btn:hover {
+  background: rgba(255, 255, 255, 0.25);
+  border-color: rgba(0, 0, 0, 0.2);
+}
+
+.layer-badge {
+  font-size: 9px;
+  font-weight: bold;
+  padding: 1px 3px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.layer-badge.mode-3d {
+  background: #dcfce7;
+  color: #166534;
+  border: 1px solid #86efac;
+}
+
+.layer-badge.mode-2d {
+  background: #e5e7eb;
+  color: #374151;
+  border: 1px solid #d1d5db;
+}
+
+.layer-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ============================================================
+   9. Responsive Breakpoints (MacBook, Tablet & Narrow Viewports)
+   ============================================================ */
+@media (max-width: 1100px) {
+  .win-viewport-container {
+    flex-direction: column;
+  }
+  .cad-viewport-panel, .three-viewport-panel {
+    width: 100%;
+    height: auto;
+    min-height: 140px;
+  }
+  .split-resizer {
+    width: 100%;
+    height: 6px;
+    flex: 0 0 6px;
+    background: linear-gradient(180deg, #334155 0%, #64748b 50%, #334155 100%);
+    cursor: row-resize;
+  }
+  .sb-snap, .sb-unit {
+    display: none;
+  }
+  .sb-coord {
+    width: 195px;
+    font-size: 10px;
+  }
+}
+
+@media (max-width: 960px) {
+  .win-inspector-right {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 40;
+    width: 275px;
+    max-width: 82vw;
+    box-shadow: -4px 0 20px rgba(0, 0, 0, 0.45);
+  }
+}
+
+@media (max-width: 820px) {
+  .win-toolbox-left {
+    width: 74px;
+  }
+  .tb-tool-btn {
+    height: 34px;
+  }
+  .tb-tool-btn .tool-name {
+    font-size: 9px;
+  }
+  .win-menubar {
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+}
