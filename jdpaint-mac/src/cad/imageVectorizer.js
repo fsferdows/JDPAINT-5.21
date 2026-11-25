@@ -999,8 +999,8 @@ export class ImageVectorizer {
     const hasBottomBg = ry1 < h - Math.max(5, h * 0.03);
     const edgeGuardX = Math.max(6, Math.round(w * 0.025));
     const edgeGuardY = Math.max(6, Math.round(h * 0.025));
-    const insetX = Math.max(5, Math.round((rx1 - rx0) * 0.028));
-    const insetY = Math.max(5, Math.round((ry1 - ry0) * 0.028));
+    const insetX = Math.max(7, Math.round((rx1 - rx0) * 0.045));
+    const insetY = Math.max(7, Math.round((ry1 - ry0) * 0.042));
 
     const ix0 = hasLeftBg ? Math.min(rx1 - 10, rx0 + insetX) : edgeGuardX;
     const ix1 = hasRightBg ? Math.max(ix0 + 10, rx1 - insetX) : w - 1 - edgeGuardX;
@@ -1103,8 +1103,9 @@ export class ImageVectorizer {
   }
 
   /**
-   * Preset D: Morphological White-Hat + Valley-Cut Crevice + Black-Hat Groove Furniture Isolator.
-   * Keeps adjacent petals sharply separated, keeps frame molds hollow with real holes, and isolates louvers cleanly!
+   * Preset D: Multi-Scale Morphological White-Hat / Black-Hat Wood Relief + High-Contrast Engraved Isolator.
+   * Detects 2-tone burnt/engraved wood logos directly as sharp solid shapes AND separates 3D bas-relief
+   * frames, stems, petals & louvers cleanly without square block artifacts.
    */
   static traceWoodReliefLayers(rArr, gArr, bArr, lumaRaw, denoisedLuma, otsu, w, h, opts) {
     const n = w * h;
@@ -1129,79 +1130,6 @@ export class ImageVectorizer {
       }
     }
 
-    // 2. Clean 2px wood/bamboo grain suppression via Guided Filter + Masked Local Wood Plane
-    const smoothLuma = ImageVectorizer.guidedFilter(denoisedLuma, w, h, 2, 135);
-    const planeR = Math.max(7, Math.round(Math.min(roi.w, roi.h) * 0.042));
-    const localPlane = ImageVectorizer.maskedBoxMean(smoothLuma, roiMask, w, h, planeR);
-
-    // 3. Multi-scale Morphological White-Hat (raised petals/letters) & Black-Hat (dark louvers/crevices)
-    const morphR = Math.max(3, Math.min(9, Math.round(Math.min(roi.w, roi.h) * 0.019)));
-    const closedLuma = ImageVectorizer.separableExtrema(
-      ImageVectorizer.separableExtrema(smoothLuma, w, h, morphR, true), w, h, morphR, false
-    );
-    const openedLuma = ImageVectorizer.separableExtrema(
-      ImageVectorizer.separableExtrema(smoothLuma, w, h, morphR, false), w, h, morphR, true
-    );
-
-    const raisedScore = new Float32Array(n);
-    const grooveScore = new Float32Array(n);
-    const innerPad = 5;
-    const xMin = Math.max(1, roi.x0 + innerPad), xMax = Math.min(w - 2, roi.x1 - innerPad);
-    const yMin = Math.max(1, roi.y0 + innerPad), yMax = Math.min(h - 2, roi.y1 - innerPad);
-
-    const rSamples = [], gSamples = [];
-    for (let y = yMin; y <= yMax; y++) {
-      const row = y * w;
-      for (let x = xMin; x <= xMax; x++) {
-        const i = row + x;
-        if (!roiMask[i]) continue;
-        const wh = Math.max(0, smoothLuma[i] - openedLuma[i]);
-        const posDiff = Math.max(0, smoothLuma[i] - localPlane[i]);
-        const bh = Math.max(0, closedLuma[i] - smoothLuma[i]);
-        const negDiff = Math.max(0, localPlane[i] - smoothLuma[i]);
-
-        // Emphasize sharp local morphological peaks/valleys so flat shaded panels stay empty & petals stay discrete!
-        const rVal = Math.min(255, (wh * 1.48 + posDiff * 0.24) * chromaMask[i]);
-        const gVal = Math.min(255, (bh * 1.48 + negDiff * 0.28) * chromaMask[i]);
-        raisedScore[i] = rVal;
-        grooveScore[i] = gVal;
-        if ((i & 3) === 0) { rSamples.push(rVal); gSamples.push(gVal); }
-      }
-    }
-
-    rSamples.sort((a, b) => a - b);
-    gSamples.sort((a, b) => a - b);
-    const rFloor = rSamples.length > 20 ? rSamples[Math.floor(rSamples.length * 0.55)] : 4;
-    const gFloor = gSamples.length > 20 ? gSamples[Math.floor(gSamples.length * 0.55)] : 4;
-    const rCap = rSamples.length > 20 ? Math.max(32, rSamples[Math.floor(rSamples.length * 0.90)]) : 95;
-    const gCap = gSamples.length > 20 ? Math.max(32, gSamples[Math.floor(gSamples.length * 0.90)]) : 95;
-
-    const cleanRaised = new Float32Array(n);
-    const cleanGroove = new Float32Array(n);
-    const rHist = new Uint32Array(256), gHist = new Uint32Array(256);
-    let rCnt = 0, gCnt = 0;
-
-    for (let y = yMin; y <= yMax; y++) {
-      const row = y * w;
-      for (let x = xMin; x <= xMax; x++) {
-        const i = row + x;
-        const rv = Math.min(255, Math.max(0, (raisedScore[i] - rFloor * 1.32) * 1.75));
-        const gv = Math.min(255, Math.max(0, (grooveScore[i] - gFloor * 1.32) * 1.75));
-        cleanRaised[i] = rv;
-        cleanGroove[i] = gv;
-        const rh = Math.min(255, Math.round(Math.min(rCap * 1.75, rv)));
-        const gh = Math.min(255, Math.round(Math.min(gCap * 1.75, gv)));
-        if (rh > 4) { rHist[rh]++; rCnt++; }
-        if (gh > 4) { gHist[gh]++; gCnt++; }
-      }
-    }
-
-    const rOtsu = rCnt > 40 ? ImageVectorizer.computeOtsuThreshold(rHist, rCnt) : 26;
-    const gOtsu = gCnt > 40 ? ImageVectorizer.computeOtsuThreshold(gHist, gCnt) : 26;
-    const detailAdj = (0.5 - opts.detailFactor) * 24;
-    const rTh = opts.threshold > 0 ? Math.max(10, opts.threshold * 145) : Math.max(15, Math.min(58, rOtsu * 0.64 + detailAdj));
-    const gTh = opts.threshold > 0 ? Math.max(10, opts.threshold * 145) : Math.max(15, Math.min(58, gOtsu * 0.64 + detailAdj));
-
     const sx = opts.bounds.w / w;
     const sy = opts.bounds.h / h;
     const roiMaxSpanW = roi.w * sx * 0.88;
@@ -1213,22 +1141,6 @@ export class ImageVectorizer {
     const minWoodSpanMm = Math.max(opts.minSpanMm || 0.9, 1.1);
     const minFeatureAreaPx = Math.max(opts.minAreaPx || 12, Math.round(roi.w * roi.h * 0.00024));
 
-    const raisedMask = new Uint8Array(n);
-    const raisedScalar = new Float32Array(n);
-    const grooveMask = new Uint8Array(n);
-    const grooveScalar = new Float32Array(n);
-
-    for (let i = 0; i < n; i++) {
-      const isCreviceCut = cleanGroove[i] >= gTh * 0.72 && cleanGroove[i] > cleanRaised[i] * 0.90;
-      const rSolid = roiMask[i] && cleanRaised[i] >= rTh && !isCreviceCut;
-      raisedMask[i] = rSolid ? 1 : 0;
-      raisedScalar[i] = isCreviceCut ? 12 : -cleanRaised[i];
-
-      const gSolid = roiMask[i] && cleanGroove[i] >= gTh && cleanGroove[i] >= cleanRaised[i] * 0.95;
-      grooveMask[i] = gSolid ? 1 : 0;
-      grooveScalar[i] = -cleanGroove[i];
-    }
-
     const filterWoodEnts = (ents) => ents.filter((ent) => {
       let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
       for (const p of ent.points) {
@@ -1239,17 +1151,203 @@ export class ImageVectorizer {
       if (ew > roiMaxSpanW && eh > roiMaxSpanH) return false;
       if ((minX <= roiEdgeLeftMm || maxX >= roiEdgeRightMm) && ew < roi.w * sx * 0.08 && eh > roi.h * sy * 0.25) return false;
       if ((minY <= roiEdgeTopMm || maxY >= roiEdgeBotMm) && eh < roi.h * sy * 0.07 && ew > roi.w * sx * 0.25) return false;
-      // Drop super-thin bamboo/wood grain hairlines (extreme aspect ratio & very shallow thickness)
       const shortSide = Math.min(ew, eh);
       const longSide = Math.max(ew, eh);
       if (shortSide < 1.95 && longSide / Math.max(0.2, shortSide) > 10.5 && (!ent.holes || ent.holes.length === 0)) return false;
       return true;
     });
 
+    // 2. Clean 2px wood/bamboo grain suppression via Guided Filter
+    const smoothLuma = ImageVectorizer.guidedFilter(denoisedLuma, w, h, 2, 130);
+    const innerPad = 5;
+    const xMin = Math.max(1, roi.x0 + innerPad), xMax = Math.min(w - 2, roi.x1 - innerPad);
+    const yMin = Math.max(1, roi.y0 + innerPad), yMax = Math.min(h - 2, roi.y1 - innerPad);
+
+    // Check if wood ROI is a high-contrast 2-tone engraved design (e.g. laser/burnt wood sign) vs 3D bas-relief carving
+    const roiHist = new Uint32Array(256);
+    let roiCnt = 0;
+    for (let y = yMin; y <= yMax; y += 2) {
+      const row = y * w;
+      for (let x = xMin; x <= xMax; x += 2) {
+        const i = row + x;
+        if (!roiMask[i]) continue;
+        roiHist[Math.max(0, Math.min(255, Math.round(smoothLuma[i])))]++;
+        roiCnt++;
+      }
+    }
+    const roiOtsu = roiCnt > 60 ? ImageVectorizer.computeOtsuStats(roiHist, roiCnt) : { threshold: 128, separability: 0, m1: 100, m2: 120 };
+    if (opts.threshold <= 0 && roiOtsu.separability >= 0.80 && Math.abs(roiOtsu.m2 - roiOtsu.m1) >= 68) {
+      // High-contrast engraved wood plaque: use near-full frame with subtle margin so circular badges never clip top/bottom
+      const ex0 = 2, ex1 = w - 3;
+      const ey0 = 2, ey1 = h - 3;
+      const planeR = Math.max(14, Math.round(Math.min(roi.w, roi.h) * 0.08));
+      const bgSeedMask = new Uint8Array(n);
+      const isDarkDesign = roiOtsu.m2 > roiOtsu.m1;
+      for (let y = ey0; y <= ey1; y++) {
+        const row = y * w;
+        for (let x = ex0; x <= ex1; x++) {
+          const i = row + x;
+          if (roi.chromaDiff[i] > 24) continue;
+          const isBgTone = isDarkDesign ? (smoothLuma[i] >= roiOtsu.threshold) : (smoothLuma[i] <= roiOtsu.threshold);
+          if (isBgTone) bgSeedMask[i] = 1;
+        }
+      }
+      const bgPlane = ImageVectorizer.maskedBoxMean(smoothLuma, bgSeedMask, w, h, planeR);
+      const diffField = new Float32Array(n);
+      const diffHist = new Uint32Array(256);
+      let dCnt = 0;
+      for (let y = ey0; y <= ey1; y++) {
+        const row = y * w;
+        for (let x = ex0; x <= ex1; x++) {
+          const i = row + x;
+          if (roi.chromaDiff[i] > 24) continue;
+          const dVal = isDarkDesign
+            ? Math.max(0, bgPlane[i] - smoothLuma[i])
+            : Math.max(0, smoothLuma[i] - bgPlane[i]);
+          diffField[i] = dVal;
+          diffHist[Math.max(0, Math.min(255, Math.round(dVal)))]++;
+          dCnt++;
+        }
+      }
+      const dOtsu = dCnt > 40 ? ImageVectorizer.computeOtsuStats(diffHist, dCnt) : { threshold: 38 };
+      const dTh = Math.max(32, Math.min(78, dOtsu.threshold * 0.92));
+      const engMask = new Uint8Array(n);
+      const engScalar = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        const solid = diffField[i] >= dTh;
+        engMask[i] = solid ? 1 : 0;
+        engScalar[i] = -diffField[i];
+      }
+      const cleanEng = ImageVectorizer.morphClose(engMask, w, h, 0);
+      const eLoops = ImageVectorizer.marchSquares(cleanEng, w, h, engScalar, -dTh);
+      const engEnts = filterWoodEnts(ImageVectorizer.vectorizeMaskLoops(eLoops, diffField, w, h, -1, {
+        ...opts,
+        refineEdges: false,
+        minAreaPx: Math.max(5, Math.round(roi.w * roi.h * 0.000045)),
+        minSpanMm: Math.max(0.45, (opts.minSpanMm || 0.9) * 0.55),
+        fillColor: '#fbbf24',
+        strokeColor: '#38bdf8',
+        layerGroup: 'Engraved Wood Design',
+        namePrefix: 'Engraved Motif',
+        heightMm: Number((opts.maxDepthMm * 0.72).toFixed(2)),
+        shape: 'dome',
+        mode: 'max',
+        adaptiveRadius: true,
+        rejectFullFrame: false,
+      }));
+      if (engEnts.length >= 2) return engEnts.slice(0, opts.maxContours);
+    }
+
+    // 3. 3D Bas-Relief Furniture Wood Carving Mode: Multi-Scale Gaussian-Smoothed White-Hat + Black-Hat
+    const planeR = Math.max(7, Math.round(Math.min(roi.w, roi.h) * 0.042));
+    const localPlane = ImageVectorizer.maskedBoxMean(smoothLuma, roiMask, w, h, planeR);
+
+    const minRoi = Math.min(roi.w, roi.h);
+    const rFine = Math.max(2, Math.min(4, Math.round(minRoi * 0.0085)));
+    const rMed = Math.max(5, Math.min(8, Math.round(minRoi * 0.017)));
+
+    const closedFine = ImageVectorizer.separableExtrema(
+      ImageVectorizer.separableExtrema(smoothLuma, w, h, rFine, true), w, h, rFine, false
+    );
+    const openedFine = ImageVectorizer.separableExtrema(
+      ImageVectorizer.separableExtrema(smoothLuma, w, h, rFine, false), w, h, rFine, true
+    );
+    const closedMed = ImageVectorizer.separableExtrema(
+      ImageVectorizer.separableExtrema(smoothLuma, w, h, rMed, true), w, h, rMed, false
+    );
+    const openedMed = ImageVectorizer.separableExtrema(
+      ImageVectorizer.separableExtrema(smoothLuma, w, h, rMed, false), w, h, rMed, true
+    );
+
+    const rawWh = new Float32Array(n);
+    const rawBh = new Float32Array(n);
+    for (let y = yMin; y <= yMax; y++) {
+      const row = y * w;
+      for (let x = xMin; x <= xMax; x++) {
+        const i = row + x;
+        if (!roiMask[i]) continue;
+        const whF = Math.max(0, smoothLuma[i] - openedFine[i]);
+        const whM = Math.max(0, smoothLuma[i] - openedMed[i]);
+        const posDiff = Math.max(0, smoothLuma[i] - localPlane[i]);
+
+        const bhF = Math.max(0, closedFine[i] - smoothLuma[i]);
+        const bhM = Math.max(0, closedMed[i] - smoothLuma[i]);
+        const negDiff = Math.max(0, localPlane[i] - smoothLuma[i]);
+
+        rawWh[i] = Math.min(255, ((whF * 0.62 + whM * 0.38) * 1.52 + posDiff * 0.22) * chromaMask[i]);
+        rawBh[i] = Math.min(255, ((bhF * 0.64 + bhM * 0.36) * 1.54 + negDiff * 0.28) * chromaMask[i]);
+      }
+    }
+
+    // Smooth square morphological box corners slightly into natural rounded organic contours
+    const raisedScore = ImageVectorizer.gaussianBlur3x3(rawWh, w, h);
+    const grooveScore = ImageVectorizer.gaussianBlur3x3(rawBh, w, h);
+
+    const rSamples = [], gSamples = [];
+    for (let y = yMin; y <= yMax; y++) {
+      const row = y * w;
+      for (let x = xMin; x <= xMax; x++) {
+        const i = row + x;
+        if (!roiMask[i] || (i & 3) !== 0) continue;
+        rSamples.push(raisedScore[i]);
+        gSamples.push(grooveScore[i]);
+      }
+    }
+
+    rSamples.sort((a, b) => a - b);
+    gSamples.sort((a, b) => a - b);
+    const rFloor = rSamples.length > 20 ? rSamples[Math.floor(rSamples.length * 0.56)] : 4;
+    const gFloor = gSamples.length > 20 ? gSamples[Math.floor(gSamples.length * 0.56)] : 4;
+    const rCap = rSamples.length > 20 ? Math.max(30, rSamples[Math.floor(rSamples.length * 0.90)]) : 92;
+    const gCap = gSamples.length > 20 ? Math.max(30, gSamples[Math.floor(gSamples.length * 0.90)]) : 92;
+
+    const cleanRaised = new Float32Array(n);
+    const cleanGroove = new Float32Array(n);
+    const rHist = new Uint32Array(256), gHist = new Uint32Array(256);
+    let rCnt = 0, gCnt = 0;
+
+    for (let y = yMin; y <= yMax; y++) {
+      const row = y * w;
+      for (let x = xMin; x <= xMax; x++) {
+        const i = row + x;
+        const rv = Math.min(255, Math.max(0, (raisedScore[i] - rFloor * 1.28) * 1.8));
+        const gv = Math.min(255, Math.max(0, (grooveScore[i] - gFloor * 1.28) * 1.8));
+        cleanRaised[i] = rv;
+        cleanGroove[i] = gv;
+        const rh = Math.min(255, Math.round(Math.min(rCap * 1.8, rv)));
+        const gh = Math.min(255, Math.round(Math.min(gCap * 1.8, gv)));
+        if (rh > 4) { rHist[rh]++; rCnt++; }
+        if (gh > 4) { gHist[gh]++; gCnt++; }
+      }
+    }
+
+    const rOtsu = rCnt > 40 ? ImageVectorizer.computeOtsuThreshold(rHist, rCnt) : 26;
+    const gOtsu = gCnt > 40 ? ImageVectorizer.computeOtsuThreshold(gHist, gCnt) : 26;
+    const detailAdj = (0.5 - opts.detailFactor) * 24;
+    const rTh = opts.threshold > 0 ? Math.max(10, opts.threshold * 145) : Math.max(14, Math.min(54, rOtsu * 0.62 + detailAdj));
+    const gTh = opts.threshold > 0 ? Math.max(10, opts.threshold * 145) : Math.max(14, Math.min(54, gOtsu * 0.62 + detailAdj));
+
+    const raisedMask = new Uint8Array(n);
+    const raisedScalar = new Float32Array(n);
+    const grooveMask = new Uint8Array(n);
+    const grooveScalar = new Float32Array(n);
+
+    for (let i = 0; i < n; i++) {
+      const isCreviceCut = cleanGroove[i] >= gTh * 0.72 && cleanGroove[i] > cleanRaised[i] * 0.88;
+      const rSolid = roiMask[i] && cleanRaised[i] >= rTh && !isCreviceCut;
+      raisedMask[i] = rSolid ? 1 : 0;
+      raisedScalar[i] = isCreviceCut ? 12 : -cleanRaised[i];
+
+      const gSolid = roiMask[i] && cleanGroove[i] >= gTh && cleanGroove[i] >= cleanRaised[i] * 0.94;
+      grooveMask[i] = gSolid ? 1 : 0;
+      grooveScalar[i] = -cleanGroove[i];
+    }
+
     const cleanR = ImageVectorizer.morphClose(raisedMask, w, h, 0);
     const rLoops = ImageVectorizer.marchSquares(cleanR, w, h, raisedScalar, -rTh);
     const raisedEnts = filterWoodEnts(ImageVectorizer.vectorizeMaskLoops(rLoops, cleanRaised, w, h, -1, {
       ...opts,
+      refineEdges: false,
       minAreaPx: minFeatureAreaPx,
       minSpanMm: minWoodSpanMm,
       maxContours: Math.floor(opts.maxContours * 0.65),
@@ -1266,10 +1364,24 @@ export class ImageVectorizer {
       rejectFullFrame: true,
     }));
 
-    const cleanG = ImageVectorizer.morphClose(grooveMask, w, h, 0);
+    // Heal 1px directional collinear continuity breaks inside carved panel frames (strictly outside raised petals!)
+    const bridgedG = new Uint8Array(grooveMask);
+    for (let y = yMin; y <= yMax; y++) {
+      const row = y * w;
+      for (let x = xMin; x <= xMax; x++) {
+        const i = row + x;
+        if (!bridgedG[i] && roiMask[i] && cleanRaised[i] < rTh * 0.65 && cleanGroove[i] >= gTh * 0.45) {
+          if ((grooveMask[i - 1] && grooveMask[i + 1]) || (grooveMask[i - w] && grooveMask[i + w])) {
+            bridgedG[i] = 1;
+          }
+        }
+      }
+    }
+    const cleanG = ImageVectorizer.morphClose(bridgedG, w, h, 0);
     const gLoops = ImageVectorizer.marchSquares(cleanG, w, h, grooveScalar, -gTh);
     const grooveEnts = filterWoodEnts(ImageVectorizer.vectorizeMaskLoops(gLoops, cleanGroove, w, h, -1, {
       ...opts,
+      refineEdges: false,
       minAreaPx: minFeatureAreaPx,
       minSpanMm: minWoodSpanMm,
       maxContours: Math.floor(opts.maxContours * 0.45),
@@ -1962,27 +2074,31 @@ export class ImageVectorizer {
    * Corner-Exact + Optimal Cubic Bezier Vector Fitter (returns Adobe Illustrator Anchor Points!).
    */
   static fitIllustratorCurve(rawLoop, rawField, w, h, refSign, opts) {
-    const n = rawLoop.length;
-    if (n < 4) return null;
+    const nRaw = rawLoop.length;
+    if (nRaw < 4) return null;
 
     const scaleRatio = opts.scaleRatio || 1;
     const doRefine = opts.refineEdges !== false;
 
-    // Step 1: Test exact circle before vertex discretization
-    const refinedWhole = doRefine ? ImageVectorizer.refineContourToField(rawLoop, true, rawField, w, h, refSign, scaleRatio) : rawLoop;
-    const circleAnchors = ImageVectorizer.detectExactCircle(refinedWhole);
+    // Step 1: Subpixel edge refinement first so staircase steps don't create false 45° corners!
+    const workLoop = doRefine ? ImageVectorizer.refineContourToField(rawLoop, true, rawField, w, h, refSign, scaleRatio) : rawLoop;
+    const circleAnchors = ImageVectorizer.detectExactCircle(workLoop);
     if (circleAnchors) return circleAnchors;
 
-    // Step 2: Cumulative arc length along contour
+    const n = workLoop.length;
+    // Step 2: Cumulative arc length along subpixel contour
     const s = new Float64Array(n + 1);
     for (let i = 0; i < n; i++) {
-      const a = rawLoop[i], b = rawLoop[(i + 1) % n];
+      const a = workLoop[i], b = workLoop[(i + 1) % n];
       s[i + 1] = s[i] + Math.hypot(b[0] - a[0], b[1] - a[1]);
     }
     const perimeter = s[n];
     if (perimeter < 4.0) return null;
 
-    const wChord = Math.max(1.8, Math.min(perimeter * 0.14, 1.0 * scaleRatio));
+    // Staircase-immune chord window (~4.5..7.5px on normal paths, proportional on tiny features)
+    const wChord = perimeter >= 22
+      ? Math.max(4.4, Math.min(perimeter * 0.10, 3.6 * scaleRatio))
+      : Math.max(2.0, perimeter * 0.14);
     const sampleArc = (uTarget) => {
       const u = ((uTarget % perimeter) + perimeter) % perimeter;
       let lo = 0, hi = n;
@@ -1990,18 +2106,17 @@ export class ImageVectorizer {
         const m = (lo + hi) >> 1;
         if (s[m] <= u) lo = m; else hi = m;
       }
-      const a = rawLoop[lo], b = rawLoop[(lo + 1) % n];
+      const a = workLoop[lo], b = workLoop[(lo + 1) % n];
       const seg = s[lo + 1] - s[lo] || 1;
       const t = (u - s[lo]) / seg;
       return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
     };
 
-    // Corner sensitivity mapped cleanly: higher corners -> catch shallower angles (~28 deg); lower -> sharper corners (~62 deg)
-    const minCornerRad = (1.15 - (opts.corners || 0.6) * 0.72); // ~0.46 to 1.08 rad
+    const minCornerRad = Math.max(0.42, 1.06 - (opts.corners || 0.6) * 0.60);
     const turns = new Float32Array(n);
     const cand = [];
     for (let i = 0; i < n; i++) {
-      const p = rawLoop[i];
+      const p = workLoop[i];
       const a = sampleArc(s[i] - wChord);
       const b = sampleArc(s[i] + wChord);
       const ux = p[0] - a[0], uy = p[1] - a[1];
@@ -2012,46 +2127,46 @@ export class ImageVectorizer {
       if (ang >= minCornerRad) cand.push(i);
     }
 
-    // Non-maximum suppression along arc length
     cand.sort((a, b) => turns[b] - turns[a] || a - b);
-    let cornerIdx = [];
+    const cornerIdx = [];
     for (const idx of cand) {
       let ok = true;
       for (const kept of cornerIdx) {
         const d = Math.abs(s[idx] - s[kept]);
-        if (Math.min(d, perimeter - d) < wChord * 0.7) { ok = false; break; }
+        if (Math.min(d, perimeter - d) < wChord * 0.72) { ok = false; break; }
       }
       if (ok) cornerIdx.push(idx);
     }
     cornerIdx.sort((a, b) => a - b);
 
-    // Zero corners (purely smooth closed loop, e.g. oval/petal) -> split cleanly at two antipodal extremes
+    // Zero corners -> fit smooth closed Cubic Bezier loop (e.g. smooth wave, petal, oval)
     if (cornerIdx.length === 0) {
       let pMin = 0;
       for (let i = 1; i < n; i++) {
-        if (refinedWhole[i][1] < refinedWhole[pMin][1] || (refinedWhole[i][1] === refinedWhole[pMin][1] && refinedWhole[i][0] < refinedWhole[pMin][0])) {
+        if (workLoop[i][1] < workLoop[pMin][1] || (workLoop[i][1] === workLoop[pMin][1] && workLoop[i][0] < workLoop[pMin][0])) {
           pMin = i;
         }
       }
       let pFar = pMin, maxD = -1;
       for (let i = 0; i < n; i++) {
-        const d = Math.hypot(refinedWhole[i][0] - refinedWhole[pMin][0], refinedWhole[i][1] - refinedWhole[pMin][1]);
+        const d = Math.hypot(workLoop[i][0] - workLoop[pMin][0], workLoop[i][1] - workLoop[pMin][1]);
         if (d > maxD) { maxD = d; pFar = i; }
       }
       const splitPair = pMin < pFar ? [pMin, pFar] : [pFar, pMin];
       if (splitPair[1] === splitPair[0]) return null;
 
       const smoothed = ImageVectorizer.taubinSmoothOpen(
-        refinedWhole.slice(splitPair[0]).concat(refinedWhole.slice(0, splitPair[0] + 1)),
-        2
+        workLoop.slice(splitPair[0]).concat(workLoop.slice(0, splitPair[0] + 1)),
+        3
       );
       const midInSmoothed = (splitPair[1] - splitPair[0]);
-      const errSq = Math.pow(Math.max(0.25, (1.1 - opts.detailFactor) * 1.4), 2);
+      const errSq = Math.pow(Math.max(0.32, (1.08 - opts.detailFactor) * 0.95 * scaleRatio), 2);
 
       const fitHalf = (subPts) => {
         const len = subPts.length;
-        const t1 = ImageVectorizer.normVec([subPts[Math.min(len - 1, 2)][0] - subPts[0][0], subPts[Math.min(len - 1, 2)][1] - subPts[0][1]]);
-        const t2 = ImageVectorizer.normVec([subPts[Math.max(0, len - 3)][0] - subPts[len - 1][0], subPts[Math.max(0, len - 3)][1] - subPts[len - 1][1]]);
+        const k = Math.min(len - 1, 3);
+        const t1 = ImageVectorizer.normVec([subPts[k][0] - subPts[0][0], subPts[k][1] - subPts[0][1]]);
+        const t2 = ImageVectorizer.normVec([subPts[len - 1 - k][0] - subPts[len - 1][0], subPts[len - 1 - k][1] - subPts[len - 1][1]]);
         return ImageVectorizer.fitCubicSpan(subPts, 0, len - 1, t1, t2, errSq);
       };
 
@@ -2062,25 +2177,33 @@ export class ImageVectorizer {
       );
     }
 
-    // Extract spans between crisp corners and refine edges + fit TLS lines / Cubic Beziers
+    // Extract spans between true corners
     const m = cornerIdx.length;
     const rawSpans = [];
     for (let j = 0; j < m; j++) {
       const a = cornerIdx[j];
       const b = cornerIdx[(j + 1) % m];
-      const spanPts = [rawLoop[a]];
+      const spanPts = [workLoop[a]];
       let idx = a;
       let guard = 0;
       do {
         idx = (idx + 1) % n;
-        spanPts.push(rawLoop[idx]);
+        spanPts.push(workLoop[idx]);
       } while (idx !== b && guard++ < n);
-      rawSpans.push(doRefine ? ImageVectorizer.refineContourToField(spanPts, false, rawField, w, h, refSign, scaleRatio) : spanPts);
+      rawSpans.push(spanPts);
     }
 
-    const lineTol = Math.max(0.35, (1.05 - opts.detailFactor) * 0.9 + 0.15);
-    const guardArc = Math.min(2.2, wChord);
-    const spanInfos = rawSpans.map((P) => {
+    const lineTol = Math.max(0.55, (1.08 - opts.detailFactor) * 0.85 + 0.35 * scaleRatio);
+    const guardArc = Math.min(2.2, wChord * 0.45);
+    const snapAxisLine = (tls, Ls) => {
+      if (!tls || Ls < 14) return tls;
+      const [dx, dy] = tls.d;
+      if (Math.abs(dy) < 0.025) return { c: tls.c, d: [dx >= 0 ? 1 : -1, 0], dev: tls.dev };
+      if (Math.abs(dx) < 0.025) return { c: tls.c, d: [0, dy >= 0 ? 1 : -1], dev: tls.dev };
+      return tls;
+    };
+
+    const classifySpan = (P) => {
       const q = P.length;
       const sl = new Float64Array(q);
       for (let i = 1; i < q; i++) sl[i] = sl[i - 1] + Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]);
@@ -2092,19 +2215,20 @@ export class ImageVectorizer {
       if (Ls < guardArc * 2.2 || mid.length < 3) {
         info.isLine = true;
         const d = Math.hypot(P[q - 1][0] - P[0][0], P[q - 1][1] - P[0][1]) || 1;
-        info.A = info.B = { c: P[0], d: [(P[q - 1][0] - P[0][0]) / d, (P[q - 1][1] - P[0][1]) / d] };
+        info.A = info.B = snapAxisLine({ c: P[0], d: [(P[q - 1][0] - P[0][0]) / d, (P[q - 1][1] - P[0][1]) / d], dev: 0 }, Ls);
         return info;
       }
 
       const tlsAll = ImageVectorizer.fitLineTLS(mid);
-      if (tlsAll && tlsAll.dev <= lineTol) {
+      const straightLim = Ls >= 16 ? Math.min(2.7, Math.max(lineTol * 1.45, Ls * 0.042)) : lineTol;
+      if (tlsAll && tlsAll.dev <= straightLim) {
         let maxAll = 0;
         for (const p of P) {
           maxAll = Math.max(maxAll, Math.abs(-(p[0] - tlsAll.c[0]) * tlsAll.d[1] + (p[1] - tlsAll.c[1]) * tlsAll.d[0]));
         }
-        if (maxAll <= lineTol * 1.65) {
+        if (maxAll <= straightLim * 1.45) {
           info.isLine = true;
-          info.A = info.B = tlsAll;
+          info.A = info.B = snapAxisLine(tlsAll, Ls);
           return info;
         }
       }
@@ -2112,20 +2236,50 @@ export class ImageVectorizer {
       const tanLen = Math.min(wChord * 2.4, Ls * 0.42);
       const startSeg = [], endSeg = [];
       for (let i = 0; i < q; i++) {
-        if (sl[i] >= guardArc * 0.5 && sl[i] <= guardArc * 0.5 + tanLen) startSeg.push(P[i]);
-        if (sl[i] <= Ls - guardArc * 0.5 && sl[i] >= Ls - guardArc * 0.5 - tanLen) endSeg.push(P[i]);
+        if (sl[i] >= guardArc * 0.4 && sl[i] <= guardArc * 0.4 + tanLen) startSeg.push(P[i]);
+        if (sl[i] <= Ls - guardArc * 0.4 && sl[i] >= Ls - guardArc * 0.4 - tanLen) endSeg.push(P[i]);
       }
       if (startSeg.length >= 3) info.A = ImageVectorizer.fitLineTLS(startSeg);
       if (endSeg.length >= 3) info.B = ImageVectorizer.fitLineTLS(endSeg);
       return info;
-    });
+    };
 
-    // Snap corners precisely to line-line intersections!
-    const dMaxSnap = Math.max(4.5, wChord * 2.5);
+    let spanInfos = rawSpans.map(classifySpan);
+
+    // Coalesce consecutive nearly-collinear straight spans into single crisp CAD lines
+    let merged = true;
+    while (merged && spanInfos.length > 3) {
+      merged = false;
+      for (let j = 0; j < spanInfos.length; j++) {
+        const nextJ = (j + 1) % spanInfos.length;
+        const s1 = spanInfos[j], s2 = spanInfos[nextJ];
+        if (!s1.isLine || !s2.isLine || !s1.A || !s2.A) continue;
+        const dot = s1.A.d[0] * s2.A.d[0] + s1.A.d[1] * s2.A.d[1];
+        if (dot < 0.94) continue;
+        const combinedP = s1.P.slice(0, -1).concat(s2.P);
+        const tlsComb = ImageVectorizer.fitLineTLS(combinedP);
+        if (tlsComb && tlsComb.dev <= lineTol * 1.45) {
+          const combInfo = classifySpan(combinedP);
+          combInfo.isLine = true;
+          combInfo.A = combInfo.B = snapAxisLine(tlsComb, combInfo.Ls);
+          if (nextJ === 0) {
+            spanInfos[0] = combInfo;
+            spanInfos.pop();
+          } else {
+            spanInfos.splice(j, 2, combInfo);
+          }
+          merged = true;
+          break;
+        }
+      }
+    }
+
+    const mFinal = spanInfos.length;
+    const dMaxSnap = Math.max(4.5, wChord * 2.2);
     const snappedCorners = [];
-    for (let j = 0; j < m; j++) {
-      const pc = rawSpans[j][0];
-      const prevInfo = spanInfos[(j + m - 1) % m];
+    for (let j = 0; j < mFinal; j++) {
+      const pc = spanInfos[j].P[0];
+      const prevInfo = spanInfos[(j + mFinal - 1) % mFinal];
       const nextInfo = spanInfos[j];
       let X = null;
       if (prevInfo.B && nextInfo.A) {
@@ -2135,13 +2289,13 @@ export class ImageVectorizer {
       snappedCorners.push(X || pc);
     }
 
-    const fitErrSq = Math.pow(Math.max(0.28, (1.05 - opts.detailFactor) * 1.45), 2);
+    const fitErrSq = Math.pow(Math.max(0.32, (1.08 - opts.detailFactor) * 0.95 * scaleRatio), 2);
     const segmentsList = [];
 
-    for (let j = 0; j < m; j++) {
+    for (let j = 0; j < mFinal; j++) {
       const info = spanInfos[j];
       const ca = snappedCorners[j];
-      const cb = snappedCorners[(j + 1) % m];
+      const cb = snappedCorners[(j + 1) % mFinal];
 
       if (info.isLine) {
         segmentsList.push({
@@ -2154,7 +2308,7 @@ export class ImageVectorizer {
       const P = info.P, q = P.length;
       const da = [ca[0] - P[0][0], ca[1] - P[0][1]];
       const db = [cb[0] - P[q - 1][0], cb[1] - P[q - 1][1]];
-      const blendSpan = Math.min(info.Ls * 0.45, wChord * 2.5);
+      const blendSpan = Math.min(info.Ls * 0.45, wChord * 2.2);
       const pinned = P.map((p, idx) => {
         const wa = blendSpan > 0 ? Math.max(0, 1 - info.sl[idx] / blendSpan) : 0;
         const wb = blendSpan > 0 ? Math.max(0, 1 - (info.Ls - info.sl[idx]) / blendSpan) : 0;
@@ -2163,7 +2317,7 @@ export class ImageVectorizer {
       pinned[0] = ca;
       pinned[q - 1] = cb;
 
-      const smPts = ImageVectorizer.taubinSmoothOpen(pinned, 2);
+      const smPts = ImageVectorizer.taubinSmoothOpen(pinned, 3);
       const kTan = Math.min(q - 1, 3);
       const tHat1 = ImageVectorizer.normVec([smPts[kTan][0] - smPts[0][0], smPts[kTan][1] - smPts[0][1]]);
       const tHat2 = ImageVectorizer.normVec([smPts[q - 1 - kTan][0] - smPts[q - 1][0], smPts[q - 1 - kTan][1] - smPts[q - 1][1]]);
@@ -2442,6 +2596,8 @@ export class ImageVectorizer {
     let wB = 0;
     let maxVariance = 0;
     let threshold = 128;
+    let bestM1 = totalMean;
+    let bestM2 = totalMean;
 
     for (let t = 0; t < 256; t++) {
       wB += histogram[t];
@@ -2457,12 +2613,16 @@ export class ImageVectorizer {
       if (betweenClassVariance > maxVariance) {
         maxVariance = betweenClassVariance;
         threshold = t;
+        bestM1 = mB;
+        bestM2 = mF;
       }
     }
 
     return {
       threshold,
       separability: Math.min(1.0, maxVariance / totalVariance),
+      m1: bestM1,
+      m2: bestM2,
     };
   }
 

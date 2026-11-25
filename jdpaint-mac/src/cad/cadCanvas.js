@@ -51,7 +51,8 @@ export class CadCanvas {
     this.polygonStarMode = false;
     this.reshapeBrushRadius = 6; // mm for Path Reshape Brush ('reshape')
     this.symmetryMode = 'none'; // 'none' | 'mirrorX' | 'mirrorY' | 'quad'
-    this.polylineSmartMode = 'capture'; // 'capture' (Detect & Grab Shape + fallback Edge) | 'magnetic' (Edge-Following) | 'manual'
+    this.polylineSmartMode = 'capture'; // 'capture' (Detect & Grab 1-by-1 Shape) | 'magnetic' (Edge-Following) | 'manual'
+    this.polylinePartScale = 'small'; // 'small' (one-by-one small parts) | 'medium' (larger panel regions)
     this._edgeGuide = null;
     this.detectedShapePreview = null;
     this.liveEdgePath = null;
@@ -339,14 +340,33 @@ export class CadCanvas {
   }
 
   /**
-   * Detect and accurately vectorize ANY shape/petal/motif sitting directly under cursor `(wx, wy)` on the picture.
+   * Detect & capture one discrete small shape/petal/motif at cursor `(wx, wy)` (one-by-one layer mode, never multi-area floods).
    */
   detectShapeAtWorld(wx, wy) {
     const pt = this.worldToGuide(wx, wy);
     if (!pt || !this._edgeGuide) return null;
     const { w, h, r, g, b, luma, grad } = this._edgeGuide;
+    const isSmall = this.polylinePartScale !== 'medium';
 
-    // If cursor lands directly on a sharp boundary edge pixel, nudge 1-3px toward the quieter interior side
+    // Sample local seed RGB around exact cursor before any nudge
+    let sR = 0, sG = 0, sB = 0, sL = 0, sCnt = 0;
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const xx = Math.max(0, Math.min(w - 1, pt.gx + dx));
+        const yy = Math.max(0, Math.min(h - 1, pt.gy + dy));
+        const i = yy * w + xx;
+        sR += r[i]; sG += g[i]; sB += b[i]; sL += luma[i]; sCnt++;
+      }
+    }
+    sR /= sCnt; sG /= sCnt; sB /= sCnt; sL /= sCnt;
+
+    // Priority check on textured wood carvings: if cursor rests right on an individual narrow carved motif/groove, extract JUST that single part!
+    if (isSmall) {
+      const carvedDirect = this._detectCarvedMotifAt(pt.gx, pt.gy, sR, sG, sB, true);
+      if (carvedDirect) return carvedDirect;
+    }
+
+    // Nudge cursor off 1px boundary gradient strictly toward quieter interior if Stage 1 flood is needed
     let sx = pt.gx, sy = pt.gy;
     if (grad[sy * w + sx] > 38) {
       let minG = grad[sy * w + sx];
@@ -360,10 +380,11 @@ export class CadCanvas {
         }
       }
       sx = nx; sy = ny;
+      sR = r[sy * w + sx]; sG = g[sy * w + sx]; sB = b[sy * w + sx]; sL = luma[sy * w + sx];
     }
 
-    // Measure local gradient & luma spread inside 52x52 neighborhood around seed
-    const statR = 26;
+    // Tight 25x25 local stats so adjacent distant contrasts don't inflate tolerance across whole door panels!
+    const statR = isSmall ? 12 : 20;
     const locGrads = [];
     let minLocL = 255, maxLocL = 0;
     for (let y = Math.max(1, sy - statR); y <= Math.min(h - 2, sy + statR); y += 2) {
@@ -375,30 +396,22 @@ export class CadCanvas {
       }
     }
     locGrads.sort((u, v) => u - v);
-    const gradP85 = locGrads.length > 5 ? locGrads[Math.floor(locGrads.length * 0.85)] : 32;
-    const edgeBarrier = Math.max(15, Math.min(54, gradP85 * 0.56));
-    const lTol = Math.max(14, Math.min(44, (maxLocL - minLocL) * 0.45));
-    const colTol = Math.max(24, Math.min(62, lTol * 1.45));
+    const gradP80 = locGrads.length > 5 ? locGrads[Math.floor(locGrads.length * 0.80)] : 24;
+    const edgeBarrier = Math.max(10, Math.min(isSmall ? 26 : 40, gradP80 * (isSmall ? 0.42 : 0.50)));
+    const lTol = Math.max(7, Math.min(isSmall ? 20 : 32, (maxLocL - minLocL) * 0.38));
+    const colTol = Math.max(12, Math.min(isSmall ? 30 : 48, lTol * 1.40));
+    const maxStepCol = isSmall ? 14 : 20;
 
-    // Average 3x3 seed color
-    let sR = 0, sG = 0, sB = 0, sL = 0, sCnt = 0;
-    for (let dy = -1; dy <= 1; dy++) {
-      for (let dx = -1; dx <= 1; dx++) {
-        const xx = Math.max(0, Math.min(w - 1, sx + dx));
-        const yy = Math.max(0, Math.min(h - 1, sy + dy));
-        const i = yy * w + xx;
-        sR += r[i]; sG += g[i]; sB += b[i]; sL += luma[i]; sCnt++;
-      }
-    }
-    sR /= sCnt; sG /= sCnt; sB /= sCnt; sL /= sCnt;
-
-    // Edge-barrier bounded 4-connected BFS region grow around seed (4-conn stops diagonal leaks across thin grooves)
-    const maxR = Math.round(Math.max(w, h) * 0.45);
+    // Strict bounded 4-connected BFS single-part region grow (proportional to image size!)
+    const maxR = isSmall ? Math.max(46, Math.round(Math.max(w, h) * 0.34)) : Math.round(Math.max(w, h) * 0.48);
     const bx0 = Math.max(0, sx - maxR), bx1 = Math.min(w - 1, sx + maxR);
     const by0 = Math.max(0, sy - maxR), by1 = Math.min(h - 1, sy + maxR);
     const bw = bx1 - bx0 + 1, bh = by1 - by0 + 1;
     const visited = new Uint8Array(bw * bh);
-    const queue = new Int32Array(Math.min(36000, bw * bh));
+    const maxPixels = isSmall
+      ? Math.min(26000, Math.floor(w * h * 0.145))
+      : Math.min(48000, Math.floor(w * h * 0.28));
+    const queue = new Int32Array(Math.min(maxPixels + 4, bw * bh));
     let qH = 0, qT = 0;
 
     const startLoc = (sy - by0) * bw + (sx - bx0);
@@ -406,7 +419,7 @@ export class CadCanvas {
     queue[qT++] = startLoc;
 
     let minX = sx, maxX = sx, minY = sy, maxY = sy;
-    const maxPixels = Math.min(34000, Math.floor(w * h * 0.38));
+    let hitWindowClip = 0;
     const dirs = [[-1, 0], [1, 0], [0, -1], [0, 1]];
 
     while (qH < qT && qT < maxPixels) {
@@ -417,6 +430,9 @@ export class CadCanvas {
       const gCur = gy * w + gx;
       if (gx < minX) minX = gx; if (gx > maxX) maxX = gx;
       if (gy < minY) minY = gy; if (gy > maxY) maxY = gy;
+      if ((bx0 > 0 && gx === bx0) || (bx1 < w - 1 && gx === bx1) || (by0 > 0 && gy === by0) || (by1 < h - 1 && gy === by1)) {
+        hitWindowClip++;
+      }
 
       for (let dIdx = 0; dIdx < 4; dIdx++) {
         const nx = lx + dirs[dIdx][0], ny = ly + dirs[dIdx][1];
@@ -425,11 +441,11 @@ export class CadCanvas {
         if (visited[nLoc]) continue;
         const ngX = bx0 + nx, ngY = by0 + ny;
         const gNb = ngY * w + ngX;
-        if (grad[gNb] > Math.max(edgeBarrier * 1.45, 36)) continue;
+        if (grad[gNb] > Math.max(edgeBarrier * 1.35, 28)) continue;
         if (grad[gNb] > edgeBarrier && Math.abs(luma[gNb] - sL) > lTol * 0.35) continue;
         if (Math.abs(luma[gNb] - sL) > lTol) continue;
         const stepCol = Math.max(Math.abs(r[gNb] - r[gCur]), Math.abs(g[gNb] - g[gCur]), Math.abs(b[gNb] - b[gCur]));
-        if (stepCol > 22) continue;
+        if (stepCol > maxStepCol) continue;
         const seedCol = Math.hypot(r[gNb] - sR, g[gNb] - sG, b[gNb] - sB);
         if (seedCol > colTol) continue;
         visited[nLoc] = 1;
@@ -438,13 +454,19 @@ export class CadCanvas {
     }
 
     const touchedEdges = (minX <= 1 ? 1 : 0) + (maxX >= w - 2 ? 1 : 0) + (minY <= 1 ? 1 : 0) + (maxY >= h - 2 ? 1 : 0);
-    const stage1Invalid = qT < 14 || qT >= maxPixels || (touchedEdges >= 3 && qT > w * h * 0.22) || ((maxX - minX) >= w * 0.82 && (maxY - minY) >= h * 0.82);
+    const maxFrac = isSmall ? 0.62 : 0.80;
+    const stage1Invalid = qT < 10
+      || qT >= maxPixels
+      || hitWindowClip > 0
+      || (touchedEdges >= 2 && qT > w * h * 0.05)
+      || (maxX - minX) >= w * maxFrac
+      || (maxY - minY) >= h * maxFrac;
 
     if (stage1Invalid) {
-      return this._detectCarvedMotifAt(pt.gx, pt.gy, sR, sG, sB);
+      return this._detectCarvedMotifAt(pt.gx, pt.gy, sR, sG, sB, false);
     }
 
-    // Build compact subgrid around Stage 1 region component
+    // Build compact subgrid around Stage 1 single part
     const pad = 2;
     const gx0 = Math.max(0, minX - pad), gx1 = Math.min(w - 1, maxX + pad);
     const gy0 = Math.max(0, minY - pad), gy1 = Math.min(h - 1, maxY + pad);
@@ -466,16 +488,17 @@ export class CadCanvas {
       }
     }
 
-    return this._vectorizeGuideMask(subMask, subScalar, subField, gx0, gy0, sw, sh, ImageVectorizer.rgbToHex(sR, sG, sB), qT);
+    return this._vectorizeGuideMask(subMask, subScalar, subField, gx0, gy0, sw, sh, ImageVectorizer.rgbToHex(sR, sG, sB), qT, 0.0, sL > 128 ? -1 : 1);
   }
 
   /**
-   * Stage 2 local Morphological White-Hat / Black-Hat carving detector for shaded 3D petals, leaves & molding bars.
+   * Stage 2 local Morphological White-Hat / Black-Hat carving detector (isolates ONE petal, leaf or molding bar at a time).
    */
-  _detectCarvedMotifAt(cx, cy, sR, sG, sB) {
+  _detectCarvedMotifAt(cx, cy, sR, sG, sB, strictOnly = false) {
     if (!this._edgeGuide) return null;
     const { w, h, luma } = this._edgeGuide;
-    const winR = 64;
+    const isSmall = this.polylinePartScale !== 'medium';
+    const winR = isSmall ? 36 : 60;
     const wx0 = Math.max(0, cx - winR), wx1 = Math.min(w - 1, cx + winR);
     const wy0 = Math.max(0, cy - winR), wy1 = Math.min(h - 1, cy + winR);
     const ww = wx1 - wx0 + 1, wh = wy1 - wy0 + 1;
@@ -488,14 +511,15 @@ export class CadCanvas {
       for (let x = 0; x < ww; x++) winL[dstRow + x] = luma[srcRow + x];
     }
 
-    const morphR = Math.max(6, Math.min(11, Math.round(Math.min(w, h) * 0.022)));
+    const morphR = isSmall ? 5 : Math.max(6, Math.min(9, Math.round(Math.min(w, h) * 0.018)));
     const closedL = ImageVectorizer.separableExtrema(winL, ww, wh, morphR, true);
     const openedL = ImageVectorizer.separableExtrema(winL, ww, wh, morphR, false);
 
     const lx0 = cx - wx0, ly0 = cy - wy0;
     let bestWh = 0, bestBh = 0, bestLx = lx0, bestLy = ly0;
-    for (let dy = -2; dy <= 2; dy++) {
-      for (let dx = -2; dx <= 2; dx++) {
+    const probeR = strictOnly ? 1 : 2;
+    for (let dy = -probeR; dy <= probeR; dy++) {
+      for (let dx = -probeR; dx <= probeR; dx++) {
         const xx = Math.max(1, Math.min(ww - 2, lx0 + dx));
         const yy = Math.max(1, Math.min(wh - 2, ly0 + dy));
         const idx = yy * ww + xx;
@@ -507,11 +531,19 @@ export class CadCanvas {
       }
     }
 
-    const useRaised = bestWh >= 6 && bestWh >= bestBh * 0.85;
+    const minPeak = strictOnly ? 9 : 6;
+    const useRaised = bestWh >= minPeak && bestWh >= bestBh * 0.85;
     const peak = useRaised ? bestWh : bestBh;
-    if (peak < 6) return null;
+    if (peak < minPeak) return null;
 
-    const th = Math.max(4.5, Math.min(peak * 0.34, 20));
+    // Require clear contrast at exact cursor if triggered in priority mode so flat uniform shapes still fall back to Stage 1
+    if (strictOnly) {
+      const cIdx = ly0 * ww + lx0;
+      const cScore = useRaised ? Math.max(0, winL[cIdx] - openedL[cIdx]) : Math.max(0, closedL[cIdx] - winL[cIdx]);
+      if (cScore < peak * 0.42) return null;
+    }
+
+    const th = Math.max(5.5, Math.min(peak * 0.36, 22));
     const wn = ww * wh;
     const mask = new Uint8Array(wn);
     const scalar = new Float32Array(wn);
@@ -522,12 +554,12 @@ export class CadCanvas {
       const bhVal = Math.max(0, closedL[i] - winL[i]);
       const sc = useRaised ? whVal : bhVal;
       scoreArr[i] = sc;
-      const cut = useRaised && bhVal > peak * 0.45 && bhVal > whVal * 0.90;
+      const cut = useRaised && bhVal > peak * 0.36 && bhVal > whVal * 0.82;
       mask[i] = (!cut && sc >= th) ? 1 : 0;
       scalar[i] = cut ? 12 : -sc;
     }
 
-    // 4-connected component from seed inside local morphological carving mask
+    // 4-connected single-motif extract from seed inside local morphological map
     const visited = new Uint8Array(wn);
     const queue = new Int32Array(wn);
     let qH = 0, qT = 0;
@@ -537,8 +569,9 @@ export class CadCanvas {
     queue[qT++] = seedLoc;
     let minX = bestLx, maxX = bestLx, minY = bestLy, maxY = bestLy;
     const dirs = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+    const maxMotifPx = isSmall ? 2800 : 8500;
 
-    while (qH < qT) {
+    while (qH < qT && qT < maxMotifPx) {
       const u = queue[qH++];
       const ux = u % ww, uy = (u - ux) / ww;
       if (ux < minX) minX = ux; if (ux > maxX) maxX = ux;
@@ -554,7 +587,7 @@ export class CadCanvas {
       }
     }
 
-    if (qT < 10) return null;
+    if (qT < 10 || (strictOnly && qT >= maxMotifPx * 0.85)) return null;
     const pad = 2;
     const sx0 = Math.max(0, minX - pad), sx1 = Math.min(ww - 1, maxX + pad);
     const sy0 = Math.max(0, minY - pad), sy1 = Math.min(wh - 1, maxY + pad);
@@ -585,10 +618,11 @@ export class CadCanvas {
       ImageVectorizer.rgbToHex(sR, sG, sB),
       qT,
       -th,
+      -1,
     );
   }
 
-  _vectorizeGuideMask(subMask, subScalar, subField, gx0, gy0, sw, sh, fillColor, areaPx, isoLevel = 0.0) {
+  _vectorizeGuideMask(subMask, subScalar, subField, gx0, gy0, sw, sh, fillColor, areaPx, isoLevel = 0.0, refSign = -1) {
     if (!this._edgeGuide || !this.refImageBounds) return null;
     const { w, h } = this._edgeGuide;
     const cleanedMask = ImageVectorizer.morphClose(subMask, sw, sh, 0);
@@ -604,9 +638,9 @@ export class CadCanvas {
       h: sh * syMm,
     };
 
-    const ents = ImageVectorizer.vectorizeMaskLoops(loops, subField, sw, sh, -1, {
-      detailFactor: 0.72,
-      corners: 0.65,
+    const ents = ImageVectorizer.vectorizeMaskLoops(loops, subField, sw, sh, refSign, {
+      detailFactor: 0.78,
+      corners: 0.68,
       refineEdges: false,
       minAreaPx: 8,
       minSpanMm: 0.5,
@@ -617,14 +651,14 @@ export class CadCanvas {
       fillColor,
       strokeColor: '#22d3ee',
       layerGroup: 'Smart Polyline',
-      namePrefix: 'Captured Shape',
+      namePrefix: 'Captured Part',
       heightMm: 5.0,
       shape: 'dome',
       adaptiveRadius: true,
     });
     if (!ents || ents.length === 0) return null;
     const top = ents[0];
-    return {
+    const shape = {
       points: top.points,
       holes: top.holes || [],
       isClosed: true,
@@ -633,6 +667,34 @@ export class CadCanvas {
       relief: top.relief,
       areaPx,
     };
+    const matchEnt = this.findMatchingCapturedEntity(shape);
+    if (matchEnt) shape._existingEnt = matchEnt;
+    return shape;
+  }
+
+  findMatchingCapturedEntity(shape) {
+    if (!shape || !shape.points || shape.points.length < 3 || this.entities.length === 0) return null;
+    const boxOf = (pts) => {
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (const p of pts) {
+        if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+      }
+      return { minX, maxX, minY, maxY, cx: (minX + maxX) * 0.5, cy: (minY + maxY) * 0.5, w: maxX - minX, h: maxY - minY };
+    };
+    const sb = boxOf(shape.points);
+    for (let i = this.entities.length - 1; i >= 0; i--) {
+      const ent = this.entities[i];
+      if (!ent || ent.visible === false || !ent.points || ent.points.length < 3) continue;
+      const eb = this.getEntityBounds(ent);
+      if (!eb) continue;
+      const ew = eb.maxX - eb.minX, eh = eb.maxY - eb.minY;
+      const ecx = (eb.minX + eb.maxX) * 0.5, ecy = (eb.minY + eb.maxY) * 0.5;
+      if (Math.hypot(sb.cx - ecx, sb.cy - ecy) <= 2.2 && Math.abs(sb.w - ew) <= 2.5 && Math.abs(sb.h - eh) <= 2.5) {
+        return ent;
+      }
+    }
+    return null;
   }
 
   /**
@@ -2164,7 +2226,7 @@ export class CadCanvas {
       const sy = e.clientY - rect.top;
       const world = this.screenToWorld(sx, sy);
 
-      if (this.activeTool === 'node' && this.selectedEntity && !this.selectedEntity.locked) {
+      if ((this.activeTool === 'node' || (this.activeTool === 'polyline' && !this.currentDraft)) && this.selectedEntity && !this.selectedEntity.locked) {
         const hitNode = this.findNodeTarget(this.selectedEntity, world.x, world.y);
         if (hitNode) {
           this.toggleSelectedNodeCorner(hitNode);
@@ -2222,7 +2284,7 @@ export class CadCanvas {
           this.cancelCurrentDraft();
         }
       } else if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (this.activeTool === 'node' && this.selectedEntity && this.selectedNodeIndex !== -1) {
+        if ((this.activeTool === 'node' || (this.activeTool === 'polyline' && !this.currentDraft)) && this.selectedEntity && this.selectedNodeIndex !== -1) {
           if (!this.selectedEntity.locked) this.deleteSelectedNode();
           return;
         }
@@ -2485,6 +2547,51 @@ export class CadCanvas {
         }
       }
       if (!this.currentDraft) {
+        // Priority 1: Direct click/drag edit on selected shape's Bezier handle, anchor node, or curve edge!
+        if (this.selectedEntity && !this.selectedEntity.locked) {
+          const bezHandle = this.findBezierHandleAt(this.selectedEntity, world.x, world.y);
+          if (bezHandle) {
+            this.saveState();
+            this.activeBezierHandle = bezHandle;
+            this.selectedNodeIndex = bezHandle.nodeIdx;
+            this.selectedHoleIndex = bezHandle.holeIdx;
+            this.isDragging = true;
+            this.dragStart = { ...world };
+            this.requestRender();
+            return;
+          }
+          const nt = this.findNodeTarget(this.selectedEntity, world.x, world.y);
+          if (nt) {
+            if (e.button === 2) {
+              this.selectedNodeIndex = nt.nodeIdx;
+              this.selectedHoleIndex = nt.holeIdx;
+              this.activeBezierHandle = null;
+              this.deleteSelectedNode();
+              return;
+            }
+            this.saveState();
+            this.selectedNodeIndex = nt.nodeIdx;
+            this.selectedHoleIndex = nt.holeIdx;
+            this.activeBezierHandle = null;
+            this.isDragging = true;
+            this.dragStart = { ...world };
+            this.requestRender();
+            return;
+          }
+          if (this.selectedEntity.type === 'curve' || this.selectedEntity.type === 'polyline') {
+            const proj = CadCanvas.projectPointOntoCurve(this.selectedEntity, world);
+            if (proj && proj.dist <= 6 / this.scale) {
+              const ins = this.insertNodeOnEdge(this.selectedEntity, world.x, world.y);
+              if (ins !== -1) {
+                this.activeBezierHandle = null;
+                this.isDragging = true;
+                this.dragStart = { ...world };
+                return;
+              }
+            }
+          }
+        }
+
         const ep = this.findOpenEndpointAt(world.x, world.y);
         if (ep) {
           const idx = this.entities.indexOf(ep.ent);
@@ -2511,14 +2618,41 @@ export class CadCanvas {
           return;
         }
 
-        // Capture Whole Detected Shape if in 'capture' mode (or Alt/Right-Click) when hovering over a recognized motif!
+        // Priority 2: Click on an already-captured shape outline or same footprint -> select it for direct reshaping!
+        const hitEdgeEnt = this.findClosestCurveEntity(world.x, world.y, 5.5 / this.scale);
+        if (hitEdgeEnt && hitEdgeEnt !== this.selectedEntity && !e.altKey) {
+          this.selectedEntity = hitEdgeEnt;
+          this.selectedNodeIndex = -1;
+          this.selectedHoleIndex = -1;
+          this.activeBezierHandle = null;
+          this.detectedShapePreview = null;
+          this.requestRender();
+          return;
+        }
+
+        // Priority 3: Capture ONE discrete small shape if not duplicating an existing entity
         if ((this.polylineSmartMode === 'capture' || e.altKey || e.button === 2) && !e.shiftKey) {
           const shape = this.detectedShapePreview || this.detectShapeAtWorld(world.x, world.y);
           if (shape) {
+            if (shape._existingEnt && !e.altKey) {
+              this.selectedEntity = shape._existingEnt;
+              this.detectedShapePreview = null;
+              this.requestRender();
+              return;
+            }
             this.detectedShapePreview = shape;
             this.commitDetectedShapePreview();
             return;
           }
+        }
+
+        // Fallback: If user clicked directly inside an existing captured shape (and no uncaptured inner part detected), select it!
+        const existingInside = this.findEntityAt(world.x, world.y);
+        if (existingInside && e.button === 0 && !e.shiftKey && this.polylineSmartMode === 'capture') {
+          this.selectedEntity = existingInside;
+          this.detectedShapePreview = null;
+          this.requestRender();
+          return;
         }
 
         const startSnap = (this.polylineSmartMode !== 'manual' && !e.shiftKey && this._edgeGuide)
@@ -2695,8 +2829,8 @@ export class CadCanvas {
       return;
     }
 
-    // Bezier Handle or Anchor Node Dragging
-    if (this.activeTool === 'node' && this.isDragging && this.selectedEntity) {
+    // Bezier Handle or Anchor Node Dragging (in both Node Edit AND Smart Polyline mode!)
+    if ((this.activeTool === 'node' || (this.activeTool === 'polyline' && !this.currentDraft)) && this.isDragging && this.selectedEntity) {
       if (this.activeBezierHandle) {
         this.moveBezierHandle(this.selectedEntity, this.activeBezierHandle, world.x, world.y, e.altKey);
         this.requestRender();
@@ -2858,7 +2992,7 @@ export class CadCanvas {
     if (this.activeTool === 'eraser' || this.activeTool === 'knife' || this.activeTool === 'freehand') {
       this.canvas.style.cursor = 'crosshair';
       if (this.activeTool === 'knife' || this.activeTool === 'eraser') nextHovered = this.findEntityAt(wx, wy);
-    } else if (this.activeTool === 'node') {
+    } else if (this.activeTool === 'node' || (this.activeTool === 'polyline' && !this.currentDraft)) {
       if (this.selectedEntity && (this.findBezierHandleAt(this.selectedEntity, wx, wy) || this.findNodeTarget(this.selectedEntity, wx, wy))) {
         this.canvas.style.cursor = 'pointer';
         nextHovered = this.selectedEntity;
@@ -3881,6 +4015,7 @@ export class CadCanvas {
     // Smart Polyline Live Hover Shape Detection Preview
     if (this.activeTool === 'polyline' && !this.currentDraft && this.detectedShapePreview) {
       const sh = this.detectedShapePreview;
+      const isExisting = !!sh._existingEnt;
       ctx.save();
       const mapX = (x) => x * this.scale + this.panX;
       const mapY = (y) => y * this.scale + this.panY;
@@ -3889,18 +4024,20 @@ export class CadCanvas {
       if (sh.holes && sh.holes.length > 0) {
         for (const hole of sh.holes) CadCanvas.traceSmoothCanvasPath(ctx, hole, true, mapX, mapY);
       }
-      ctx.fillStyle = 'rgba(34, 211, 238, 0.24)';
+      ctx.fillStyle = isExisting ? 'rgba(52, 211, 153, 0.18)' : 'rgba(34, 211, 238, 0.24)';
       ctx.fill('evenodd');
-      ctx.strokeStyle = '#22d3ee';
+      ctx.strokeStyle = isExisting ? '#34d399' : '#22d3ee';
       ctx.lineWidth = 2.2;
       ctx.setLineDash([6, 4]);
       ctx.stroke();
       ctx.setLineDash([]);
       ctx.restore();
-      const modeHint = this.polylineSmartMode === 'capture'
-        ? '✨ Shape Detected — Click to Capture!'
-        : '✨ Shape Detected — Alt/R-Click to Grab, or Click Edge to Trace';
-      this.drawHudPill(ctx, (this.currentMousePos.sx || 0) + 14, (this.currentMousePos.sy || 0) - 14, modeHint, '#22d3ee');
+      const modeHint = isExisting
+        ? '✏️ Click to Select & Reshape (Drag Nodes/Curves)'
+        : (this.polylineSmartMode === 'capture'
+          ? '✨ Small Part Detected — Click to Capture 1-by-1!'
+          : '✨ Part Detected — Alt/R-Click to Grab, or Trace Edge');
+      this.drawHudPill(ctx, (this.currentMousePos.sx || 0) + 14, (this.currentMousePos.sy || 0) - 14, modeHint, isExisting ? '#34d399' : '#22d3ee');
     }
 
     // Render Active Draft
@@ -4510,7 +4647,7 @@ export class CadCanvas {
       const p2 = this.worldToScreen(ent.x2, ent.y2);
       ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
 
-      if (this.activeTool === 'node' && isSelected) {
+      if ((this.activeTool === 'node' || (this.activeTool === 'polyline' && !this.currentDraft)) && isSelected) {
         this.drawNodeHandle(ctx, p1.x, p1.y, this.hoveredHoleIndex === -1 && 0 === this.hoveredNodeIndex, this.selectedHoleIndex === -1 && 0 === this.selectedNodeIndex, true);
         this.drawNodeHandle(ctx, p2.x, p2.y, this.hoveredHoleIndex === -1 && 1 === this.hoveredNodeIndex, this.selectedHoleIndex === -1 && 1 === this.selectedNodeIndex, true);
       }
@@ -4553,7 +4690,7 @@ export class CadCanvas {
         if (ent.isClosed) fillClosed(ent);
         ctx.stroke();
 
-        if (this.activeTool === 'node' && isSelected) {
+        if ((this.activeTool === 'node' || (this.activeTool === 'polyline' && !this.currentDraft)) && isSelected) {
           this.drawCurveNodeHandles(ctx, ent);
         }
       } else if (ent.points.length === 1) {
@@ -4574,7 +4711,7 @@ export class CadCanvas {
         if (ent.isClosed) fillClosed(ent);
         ctx.stroke();
 
-        if (this.activeTool === 'node' && isSelected) {
+        if ((this.activeTool === 'node' || (this.activeTool === 'polyline' && !this.currentDraft)) && isSelected) {
           this.drawCurveNodeHandles(ctx, ent);
         }
       } else if (ent.points.length === 1) {

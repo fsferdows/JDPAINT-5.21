@@ -101,16 +101,18 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    // Case 1.5: Smart Polyline Tool active -> Show Instant Design Detection & Tracing Sub-Modes!
+    // Case 1.5: Smart Polyline Tool active -> Show Instant 1-by-1 Design Detection, Reshape & Tracing Sub-Modes!
     if (cadCanvas.activeTool === 'polyline' && !cadCanvas.currentDraft) {
       cadFloatingBar.style.display = 'flex';
       const sm = cadCanvas.polylineSmartMode || 'capture';
+      const pScale = cadCanvas.polylinePartScale || 'small';
       const hasPic = !!cadCanvas._edgeGuide;
       cadFloatingBar.innerHTML = `
-        <span style="color:#22d3ee;font-weight:bold;">Smart Polyline${hasPic ? '' : ' (Load Picture for Edge/Shape Detect)'}:</span>
-        <button class="cad-float-btn${sm === 'capture' ? ' primary' : ''}" id="fl-poly-capture" title="Hover over any design shape on picture & Left-Click to capture whole shape cleanly">✨ Detect &amp; Grab Shape</button>
+        <span style="color:#22d3ee;font-weight:bold;">Smart Polyline${hasPic ? '' : ' (Load Picture for Shape Detect)'}:</span>
+        <button class="cad-float-btn${sm === 'capture' ? ' primary' : ''}" id="fl-poly-capture" title="Hover over any small petal/part & Left-Click to capture 1-by-1; Click shape/nodes to reshape">✨ Detect &amp; Grab Part</button>
         <button class="cad-float-btn${sm === 'magnetic' ? ' primary' : ''}" id="fl-poly-magnetic" title="Click points along outline — curve automatically hugs photo edges!">🧲 Edge Follower</button>
         <button class="cad-float-btn${sm === 'manual' ? ' primary' : ''}" id="fl-poly-manual" title="Classic straight point-to-point CAD polyline">📏 Straight Line</button>
+        <button class="cad-float-btn${pScale === 'small' ? ' primary' : ''}" id="fl-poly-size" title="Toggle between Tight 1-by-1 Part Capture and Medium Panel Capture">${pScale === 'small' ? '🔍 Part: Tight 1-by-1' : '⬛ Part: Medium'}</button>
       `;
       const setPolyMode = (mode) => {
         cadCanvas.polylineSmartMode = mode;
@@ -122,6 +124,12 @@ document.addEventListener('DOMContentLoaded', () => {
       document.getElementById('fl-poly-capture')?.addEventListener('click', () => setPolyMode('capture'));
       document.getElementById('fl-poly-magnetic')?.addEventListener('click', () => setPolyMode('magnetic'));
       document.getElementById('fl-poly-manual')?.addEventListener('click', () => setPolyMode('manual'));
+      document.getElementById('fl-poly-size')?.addEventListener('click', () => {
+        cadCanvas.polylinePartScale = cadCanvas.polylinePartScale === 'small' ? 'medium' : 'small';
+        cadCanvas.detectedShapePreview = null;
+        cadCanvas.requestRender();
+        updateFloatingCadBar();
+      });
       return;
     }
 
