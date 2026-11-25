@@ -249,6 +249,7 @@
         <span class="tb-sep"></span>
         <!-- Curve Editing Helpers -->
         <button class="tb-btn" id="btn-to-curve" title="Convert selected Rectangle/Circle/Line into editable 2D node curve">➰ → Curve</button>
+        <button class="tb-btn" id="btn-extend-path" title="Continue/Add new End Points from selected layer endpoint (or split point & draw with Pen)">➕ Extend / Add Point</button>
         <button class="tb-btn" id="btn-join-paths" title="Join/Weld selected cut or Pen curves into one closed outline (J)">🔗 Join</button>
         <button class="tb-btn" id="btn-fillet-corners" title="Round / Fillet sharp corners on selected Rect or Polyline (3mm)">◠ Fillet</button>
         <button class="tb-btn" id="btn-simplify-curve" title="Reduce extra nodes on traced curves for easier manual reshaping">⌖ Simplify</button>
@@ -564,10 +565,13 @@
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:4px;">
               <button class="win-push-btn" id="layer-btn-node-edit" style="padding:3px;">☩ Edit Nodes</button>
               <button class="win-push-btn" id="layer-btn-toggle-corner" style="padding:3px;" title="Switch active Bezier anchor between Sharp Corner and Smooth Curve (or double-click node)">◈ Corner/Smooth</button>
+              <button class="win-push-btn" id="layer-btn-break-node" style="padding:3px;" title="Open closed curve at selected node into Start (S) & End (E), or split open path into two">✂️ Split at Point</button>
+              <button class="win-push-btn" id="layer-btn-extend-end" style="padding:3px;" title="Start drawing/adding End Points directly from active Start or End point with Pen">➕ Add End Point</button>
+              <button class="win-push-btn" id="layer-btn-reverse-path" style="padding:3px;" title="Flip Start Point (S) and End Point (E) direction">⇄ Flip Start↔End</button>
               <button class="win-push-btn" id="layer-btn-close-path" style="padding:3px;">⤸ Close Path</button>
               <button class="win-push-btn" id="layer-btn-smooth" style="padding:3px;">〰 Smooth</button>
               <button class="win-push-btn" id="layer-btn-to-curve" style="padding:3px;">➰ To Curve</button>
-              <button class="win-push-btn" id="layer-btn-break-holes" style="padding:3px;" title="Release compound inner holes into separate selectable layers">✂️ Release Holes</button>
+              <button class="win-push-btn" id="layer-btn-break-holes" style="padding:3px;grid-column:span 2;" title="Release compound inner holes into separate selectable layers">✂️ Release Holes</button>
             </div>
             <button class="win-push-btn primary" id="layer-btn-apply-3d" style="width:100%;margin-top:5px;">⚡ Apply Layer to 3D</button>
           </fieldset>

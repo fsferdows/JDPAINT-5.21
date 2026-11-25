@@ -887,85 +887,377 @@ export class ImageVectorizer {
   }
 
   /**
-   * Preset D: Specialized Carved Wood Design / Intricate Relief Contour Extraction.
+   * Automatically isolate the furniture/panel body from exterior walls, studio margins, floors, bricks, plants & corner logos.
+   */
+  static detectFurnitureROI(rArr, gArr, bArr, lumaRaw, w, h) {
+    const n = w * h;
+    const L = new Float32Array(n);
+    const A = new Float32Array(n);
+    const B = new Float32Array(n);
+
+    // Sample interior central zone [28..72% W, 18..78% H] to learn panel surface tone
+    const cx0 = Math.floor(w * 0.28), cx1 = Math.ceil(w * 0.72);
+    const cy0 = Math.floor(h * 0.18), cy1 = Math.ceil(h * 0.78);
+    const aVals = [], bVals = [];
+    for (let i = 0; i < n; i++) {
+      const [lv, av, bv] = ImageVectorizer.rgbToLab(rArr[i], gArr[i], bArr[i]);
+      L[i] = lv; A[i] = av; B[i] = bv;
+      const x = i % w, y = (i - x) / w;
+      if (x >= cx0 && x < cx1 && y >= cy0 && y < cy1 && (i & 1) === 0) {
+        aVals.push(av); bVals.push(bv);
+      }
+    }
+    aVals.sort((u, v) => u - v);
+    bVals.sort((u, v) => u - v);
+    const aMed = aVals[Math.floor(aVals.length * 0.5)] || 0;
+    const bMed = bVals[Math.floor(bVals.length * 0.5)] || 0;
+
+    const lVals = [];
+    for (let y = cy0; y < cy1; y += 2) {
+      for (let x = cx0; x < cx1; x += 2) {
+        const i = y * w + x;
+        if (Math.hypot(A[i] - aMed, B[i] - bMed) <= 22) lVals.push(L[i]);
+      }
+    }
+    lVals.sort((u, v) => u - v);
+    const lMed = lVals.length > 0 ? lVals[Math.floor(lVals.length * 0.5)] : 50;
+
+    // Classify pixels consistent with panel material & deep carving shadow undercuts
+    const panelMask = new Uint8Array(n);
+    const chromaDiff = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const dc = Math.hypot(A[i] - aMed, B[i] - bMed);
+      chromaDiff[i] = dc;
+      const dl = Math.abs(L[i] - lMed);
+      const tolC = L[i] < 28 ? 34 : 20;
+      if (dc <= tolC && dl <= 48) panelMask[i] = 1;
+    }
+
+    // Smooth column profile across middle vertical band [15..85% H] and walk outward from center
+    const colFrac = new Float64Array(w);
+    const yStart = Math.floor(h * 0.15), yEnd = Math.ceil(h * 0.85);
+    const ySpan = Math.max(1, yEnd - yStart);
+    for (let x = 0; x < w; x++) {
+      let c = 0;
+      for (let y = yStart; y < yEnd; y++) if (panelMask[y * w + x]) c++;
+      colFrac[x] = c / ySpan;
+    }
+    const smoothCol = new Float64Array(w);
+    for (let x = 0; x < w; x++) {
+      let s = 0, cnt = 0;
+      for (let dx = -3; dx <= 3; dx++) {
+        const xx = x + dx;
+        if (xx >= 0 && xx < w) { s += colFrac[xx]; cnt++; }
+      }
+      smoothCol[x] = s / cnt;
+    }
+    const midX = Math.floor(w * 0.5);
+    let rx0 = midX, rx1 = midX;
+    while (rx0 > 0 && smoothCol[rx0 - 1] >= 0.35) rx0--;
+    while (rx1 < w - 1 && smoothCol[rx1 + 1] >= 0.35) rx1++;
+
+    // Fallback if center band is mostly dark carving: check widest contiguous band >= 0.32
+    if (rx1 - rx0 < w * 0.28) {
+      rx0 = 0; rx1 = w - 1;
+      for (let x = 0; x < midX; x++) { if (smoothCol[x] >= 0.30) { rx0 = x; break; } }
+      for (let x = w - 1; x > midX; x--) { if (smoothCol[x] >= 0.30) { rx1 = x; break; } }
+    }
+
+    // Compute row profile strictly within [rx0..rx1] and walk outward from center Y
+    const rowFrac = new Float64Array(h);
+    const xSpan = Math.max(1, rx1 - rx0 + 1);
+    for (let y = 0; y < h; y++) {
+      let c = 0;
+      const row = y * w;
+      for (let x = rx0; x <= rx1; x++) if (panelMask[row + x]) c++;
+      rowFrac[y] = c / xSpan;
+    }
+    const smoothRow = new Float64Array(h);
+    for (let y = 0; y < h; y++) {
+      let s = 0, cnt = 0;
+      for (let dy = -3; dy <= 3; dy++) {
+        const yy = y + dy;
+        if (yy >= 0 && yy < h) { s += rowFrac[yy]; cnt++; }
+      }
+      smoothRow[y] = s / cnt;
+    }
+    const midY = Math.floor(h * 0.5);
+    let ry0 = midY, ry1 = midY;
+    while (ry0 > 0 && smoothRow[ry0 - 1] >= 0.35) ry0--;
+    while (ry1 < h - 1 && smoothRow[ry1 + 1] >= 0.35) ry1++;
+
+    if (ry1 - ry0 < h * 0.28) {
+      ry0 = 0; ry1 = h - 1;
+      for (let y = 0; y < midY; y++) { if (smoothRow[y] >= 0.30) { ry0 = y; break; } }
+      for (let y = h - 1; y > midY; y--) { if (smoothRow[y] >= 0.30) { ry1 = y; break; } }
+    }
+
+    // Inset ONLY on sides that had detected exterior walls/margins so outer door frame edge doesn't fire
+    const hasLeftBg = rx0 > Math.max(4, w * 0.03);
+    const hasRightBg = rx1 < w - Math.max(5, w * 0.03);
+    const hasTopBg = ry0 > Math.max(4, h * 0.03);
+    const hasBottomBg = ry1 < h - Math.max(5, h * 0.03);
+    const edgeGuardX = Math.max(6, Math.round(w * 0.025));
+    const edgeGuardY = Math.max(6, Math.round(h * 0.025));
+    const insetX = Math.max(5, Math.round((rx1 - rx0) * 0.028));
+    const insetY = Math.max(5, Math.round((ry1 - ry0) * 0.028));
+
+    const ix0 = hasLeftBg ? Math.min(rx1 - 10, rx0 + insetX) : edgeGuardX;
+    const ix1 = hasRightBg ? Math.max(ix0 + 10, rx1 - insetX) : w - 1 - edgeGuardX;
+    const iy0 = hasTopBg ? Math.min(ry1 - 10, ry0 + insetY) : edgeGuardY;
+    const iy1 = hasBottomBg ? Math.max(iy0 + 10, ry1 - insetY) : h - 1 - edgeGuardY;
+
+    return {
+      x0: ix0, y0: iy0, x1: ix1, y1: iy1,
+      w: ix1 - ix0 + 1, h: iy1 - iy0 + 1,
+      hasExternalBg: hasLeftBg || hasRightBg || hasTopBg || hasBottomBg,
+      lMed,
+      chromaMed: Math.hypot(aMed, bMed),
+      L, chromaDiff, panelMask,
+    };
+  }
+
+  /**
+   * Separable masked normalized box average (only averages pixels inside mask[i] === 1).
+   */
+  static maskedBoxMean(src, mask, w, h, radius) {
+    const n = w * h;
+    const valH = new Float32Array(n);
+    const cntH = new Float32Array(n);
+    const prefV = new Float64Array(w + 1);
+    const prefC = new Int32Array(w + 1);
+
+    for (let y = 0; y < h; y++) {
+      const row = y * w;
+      prefV[0] = 0; prefC[0] = 0;
+      for (let x = 0; x < w; x++) {
+        const idx = row + x;
+        const m = mask[idx];
+        prefV[x + 1] = prefV[x] + (m ? src[idx] : 0);
+        prefC[x + 1] = prefC[x] + m;
+      }
+      for (let x = 0; x < w; x++) {
+        const l = Math.max(0, x - radius);
+        const r = Math.min(w - 1, x + radius);
+        valH[row + x] = prefV[r + 1] - prefV[l];
+        cntH[row + x] = prefC[r + 1] - prefC[l];
+      }
+    }
+
+    const out = new Float32Array(n);
+    const colV = new Float64Array(h + 1);
+    const colC = new Float64Array(h + 1);
+    for (let x = 0; x < w; x++) {
+      colV[0] = 0; colC[0] = 0;
+      for (let y = 0; y < h; y++) {
+        const idx = y * w + x;
+        colV[y + 1] = colV[y] + valH[idx];
+        colC[y + 1] = colC[y] + cntH[idx];
+      }
+      for (let y = 0; y < h; y++) {
+        const t = Math.max(0, y - radius);
+        const b = Math.min(h - 1, y + radius);
+        const c = colC[b + 1] - colC[t];
+        out[y * w + x] = c > 0 ? (colV[b + 1] - colV[t]) / c : src[y * w + x];
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Preset D: Furniture Design & Wood Carving Isolator (ROI-Masked, Grain-Suppressed, Non-Overlapping).
    */
   static traceWoodReliefLayers(rArr, gArr, bArr, lumaRaw, denoisedLuma, otsu, w, h, opts) {
     const n = w * h;
-    // Remove lighting glare across wood planks & combine luminance + chroma separation + edge magnitude
-    const filt = ImageVectorizer.guidedFilterRGB(rArr, gArr, bArr, denoisedLuma, w, h, 2, 160);
-    let illumLuma = denoisedLuma;
-    if (opts.localLighting) {
-      const illumR = Math.max(12, Math.round(Math.min(w, h) * 0.12));
-      illumLuma = ImageVectorizer.correctLocalLighting(denoisedLuma, w, h, illumR);
+    // 1. Automatically locate ONLY the furniture panel / carved door surface (drops room walls, plants, bricks, rugs, corner logos)
+    const roi = ImageVectorizer.detectFurnitureROI(rArr, gArr, bArr, lumaRaw, w, h);
+
+    // Build interior ROI weight mask & suppress non-wood color/banner watermark overlays (keeps natural warm wood highlights!)
+    const roiMask = new Uint8Array(n);
+    const chromaMask = new Float32Array(n);
+    const watermarkTol = roi.chromaMed > 14 ? 16 : 22;
+    for (let y = roi.y0; y <= roi.y1; y++) {
+      const row = y * w;
+      for (let x = roi.x0; x <= roi.x1; x++) {
+        const i = row + x;
+        const dc = roi.chromaDiff[i];
+        if (dc > watermarkTol && (roi.L[i] > roi.lMed + 10 || dc > 24)) {
+          chromaMask[i] = dc > watermarkTol + 4 ? 0 : Math.max(0, 1.0 - (dc - watermarkTol) / 4.0);
+          roiMask[i] = chromaMask[i] > 0.25 ? 1 : 0;
+        } else {
+          roiMask[i] = 1;
+          chromaMask[i] = 1.0;
+        }
+      }
     }
 
-    // Border chroma reference
-    let bR = 0, bG = 0, bB = 0, bCnt = 0;
-    for (let x = 0; x < w; x++) {
-      bR += filt.r[x] + filt.r[(h - 1) * w + x];
-      bG += filt.g[x] + filt.g[(h - 1) * w + x];
-      bB += filt.b[x] + filt.b[(h - 1) * w + x];
-      bCnt += 2;
-    }
-    bR /= bCnt; bG /= bCnt; bB /= bCnt;
+    // 2. Mild edge-preserving smooth preserves fine louvers & flower stems while quieting wood-grain speckle
+    const smoothLuma = ImageVectorizer.guidedFilter(denoisedLuma, w, h, 1, 110);
+    // 3. Estimate local uncarved wood background surface strictly inside ROI (immune to camera lighting gradients)
+    const planeR = Math.max(6, Math.round(Math.min(roi.w, roi.h) * 0.036));
+    const localPlane = ImageVectorizer.maskedBoxMean(smoothLuma, roiMask, w, h, planeR);
 
-    // Sobel gradient & foreground saliency field
-    const featureScore = new Float32Array(n);
-    const borderMean = ImageVectorizer.computeBorderMean(illumLuma, w, h);
-    const flip = opts.invert ? (borderMean <= 128) : (borderMean > 128);
+    // 4. Bidirectional Carving Departure + Edge Gradient (merges raised highlights & deep grooves of each petal!)
+    const rawEnergy = new Float32Array(n);
+    const innerPad = 4;
+    const xMin = Math.max(1, roi.x0 + innerPad), xMax = Math.min(w - 2, roi.x1 - innerPad);
+    const yMin = Math.max(1, roi.y0 + innerPad), yMax = Math.min(h - 2, roi.y1 - innerPad);
 
-    for (let y = 1; y < h - 1; y++) {
-      for (let x = 1; x < w - 1; x++) {
-        const i = y * w + x;
-        const gx = -illumLuma[i - w - 1] + illumLuma[i - w + 1] - 2 * illumLuma[i - 1] + 2 * illumLuma[i + 1] - illumLuma[i + w - 1] + illumLuma[i + w + 1];
-        const gy = -illumLuma[i - w - 1] - 2 * illumLuma[i - w] - illumLuma[i - w + 1] + illumLuma[i + w - 1] + 2 * illumLuma[i + w] + illumLuma[i + w + 1];
+    const roiSamples = [];
+    for (let y = yMin; y <= yMax; y++) {
+      const row = y * w;
+      for (let x = xMin; x <= xMax; x++) {
+        const i = row + x;
+        const gx = -smoothLuma[i - w - 1] + smoothLuma[i - w + 1] - 2 * smoothLuma[i - 1] + 2 * smoothLuma[i + 1] - smoothLuma[i + w - 1] + smoothLuma[i + w + 1];
+        const gy = -smoothLuma[i - w - 1] - 2 * smoothLuma[i - w] - smoothLuma[i - w + 1] + smoothLuma[i + w - 1] + 2 * smoothLuma[i + w] + smoothLuma[i + w + 1];
         const grad = Math.hypot(gx, gy) * 0.25;
-        const lDiff = flip ? Math.max(0, 132 - illumLuma[i]) : Math.max(0, illumLuma[i] - 124);
-        const cDiff = Math.hypot(filt.r[i] - bR, filt.g[i] - bG, filt.b[i] - bB) * 0.45;
-        featureScore[i] = Math.min(255, Math.max(lDiff * 1.15, cDiff, grad * 0.9));
+        const reliefDiff = Math.abs(smoothLuma[i] - localPlane[i]);
+        const score = Math.min(255, (reliefDiff * 1.55 + grad * 0.72) * chromaMask[i]);
+        rawEnergy[i] = score;
+        if ((i & 3) === 0) roiSamples.push(score);
       }
     }
 
-    const smoothedScore = ImageVectorizer.guidedFilter(featureScore, w, h, 2, 120);
-    // Use clean 2-3 layered depth extraction OR crisp binary based on toneLevels
-    const levels = Math.min(5, Math.max(2, Math.round(opts.toneLevels || 3)));
-    const allEntities = [];
-    const perLevel = Math.max(15, Math.floor(opts.maxContours / levels));
-    const woodPalette = ['#d97706', '#f59e0b', '#fbbf24', '#fef08a', '#38bdf8'];
+    // 5. Estimate quiet uncarved wood grain floor (P45) & cap P88 outlier highlights so louvers & subtle stems survive Otsu
+    roiSamples.sort((a, b) => a - b);
+    const grainFloor = roiSamples.length > 20 ? roiSamples[Math.floor(roiSamples.length * 0.45)] : 8;
+    const p88Cap = roiSamples.length > 20 ? Math.max(36, roiSamples[Math.floor(roiSamples.length * 0.88)]) : 100;
+    const p85Energy = roiSamples.length > 20 ? roiSamples[Math.floor(roiSamples.length * 0.85)] : 60;
 
-    for (let lv = 0; lv < levels; lv++) {
-      const th = opts.threshold > 0
-        ? (opts.threshold * 180) + lv * 28
-        : Math.max(22, (72 - opts.detailFactor * 42) + lv * 34);
-      const scalar = new Float32Array(n);
-      const mask = new Uint8Array(n);
-      for (let i = 0; i < n; i++) {
-        scalar[i] = -smoothedScore[i];
-        mask[i] = smoothedScore[i] >= th ? 1 : 0;
+    const cleanEnergy = new Float32Array(n);
+    const energyHist = new Uint32Array(256);
+    let fgSum = 0;
+    for (let y = yMin; y <= yMax; y++) {
+      const row = y * w;
+      for (let x = xMin; x <= xMax; x++) {
+        const i = row + x;
+        const clipped = Math.min(p88Cap, rawEnergy[i]);
+        const v = Math.min(255, Math.max(0, (rawEnergy[i] - grainFloor * 0.75) * 1.70));
+        cleanEnergy[i] = v;
+        const hv = Math.min(255, Math.max(0, Math.round((clipped - grainFloor * 0.75) * 1.70)));
+        if (hv > 3) {
+          energyHist[hv]++;
+          fgSum++;
+        }
       }
-      const cleaned = ImageVectorizer.morphClose(mask, w, h, 1);
-      const rawLoops = ImageVectorizer.marchSquares(cleaned, w, h, scalar, -th);
-      const zMm = Number((((lv + 1) / levels) * opts.maxDepthMm).toFixed(2));
+    }
 
-      const ents = ImageVectorizer.vectorizeMaskLoops(rawLoops, smoothedScore, w, h, -1, {
+    const smoothedScore = ImageVectorizer.guidedFilter(cleanEnergy, w, h, 1, 65);
+    const roiOtsu = fgSum > 40 ? ImageVectorizer.computeOtsuThreshold(energyHist, fgSum) : 26;
+
+    // 6. Calibrated Threshold capturing recessed moldings, horizontal slats AND fine floral petals without grain noise
+    const detailAdj = (0.5 - opts.detailFactor) * 26;
+    const primaryTh = opts.threshold > 0
+      ? Math.max(10, opts.threshold * 165)
+      : Math.max(12, Math.min(54, roiOtsu * 0.56 + detailAdj));
+
+    const sx = opts.bounds.w / w;
+    const sy = opts.bounds.h / h;
+    const roiMaxSpanW = roi.w * sx * 0.88;
+    const roiMaxSpanH = roi.h * sy * 0.88;
+    const roiEdgeLeftMm = opts.bounds.x + (roi.x0 + 6) * sx;
+    const roiEdgeRightMm = opts.bounds.x + (roi.x1 - 6) * sx;
+    const minFeatureAreaPx = Math.max(opts.minAreaPx || 10, Math.round(roi.w * roi.h * 0.00018));
+
+    const scalar1 = new Float32Array(n);
+    const mask1 = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      scalar1[i] = -smoothedScore[i];
+      mask1[i] = roiMask[i] && smoothedScore[i] >= primaryTh ? 1 : 0;
+    }
+    const cleaned1 = ImageVectorizer.morphClose(mask1, w, h, opts.detailFactor < 0.40 ? 1 : 0);
+    const rawLoops1 = ImageVectorizer.marchSquares(cleaned1, w, h, scalar1, -primaryTh);
+
+    const tracedRaw = ImageVectorizer.vectorizeMaskLoops(rawLoops1, smoothedScore, w, h, -1, {
+      ...opts,
+      minAreaPx: minFeatureAreaPx,
+      maxContours: opts.maxContours,
+      fillColor: '#f59e0b',
+      strokeColor: '#38bdf8',
+      layerGroup: 'Furniture Carving',
+      namePrefix: 'Carved Motif',
+      toneLevel: 1,
+      toneTotal: 1,
+      heightMm: Number((opts.maxDepthMm * 0.72).toFixed(2)),
+      shape: 'dome',
+      mode: 'max',
+      adaptiveRadius: true,
+      rejectFullFrame: true,
+    });
+
+    // Unnest huge enclosing panel borders into independent foreground motifs & strip outer door-jamb edge slivers
+    const woodEnts = [];
+    for (const ent of tracedRaw) {
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (const p of ent.points) {
+        if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+      }
+      const ew = maxX - minX, eh = maxY - minY;
+      const isOuterJambSliver =
+        (minX <= roiEdgeLeftMm || maxX >= roiEdgeRightMm) &&
+        ew < roi.w * sx * 0.09 &&
+        eh > roi.h * sy * 0.25;
+      if (isOuterJambSliver) continue;
+      const isHugeOuterSlab = (ew > roiMaxSpanW && eh > roiMaxSpanH);
+      const isLargePanelContainer = (ent.holes && ent.holes.length >= 3) && (ew > roi.w * sx * 0.35 || eh > roi.h * sy * 0.25);
+
+      if (isHugeOuterSlab || isLargePanelContainer) {
+        if (!isHugeOuterSlab) {
+          // Keep panel molding frame clean, promoting interior motifs independently!
+          const panelFrame = { ...ent, holes: [] };
+          woodEnts.push(panelFrame);
+        }
+        if (ent.holes && ent.holes.length > 0) {
+          ent.holes.forEach((holePts, hIdx) => {
+            woodEnts.push({
+              ...ent,
+              points: holePts,
+              holes: [],
+              fillColor: '#fbbf24',
+              strokeColor: '#38bdf8',
+              layerGroup: 'Carved Flower & Motif',
+              name: `Carved Detail #${woodEnts.length + 1}`,
+              relief: { ...(ent.relief || {}), heightMm: Number((opts.maxDepthMm * 0.85).toFixed(2)) },
+            });
+          });
+        }
+      } else {
+        woodEnts.push(ent);
+      }
+    }
+
+    // Optional peak detail accent tier ONLY if user explicitly requests high Colors/Levels >= 8
+    const levels = Math.round(opts.toneLevels || 3);
+    if (levels >= 8 && p85Energy > primaryTh * 1.4) {
+      const peakTh = Math.min(200, primaryTh + Math.max(24, (p85Energy - primaryTh) * 0.75));
+      const scalar2 = new Float32Array(n);
+      const mask2 = new Uint8Array(n);
+      for (let i = 0; i < n; i++) {
+        scalar2[i] = -smoothedScore[i];
+        mask2[i] = roiMask[i] && smoothedScore[i] >= peakTh ? 1 : 0;
+      }
+      const cleaned2 = ImageVectorizer.morphClose(mask2, w, h, 0);
+      const rawLoops2 = ImageVectorizer.marchSquares(cleaned2, w, h, scalar2, -peakTh);
+      const peaks = ImageVectorizer.vectorizeMaskLoops(rawLoops2, smoothedScore, w, h, -1, {
         ...opts,
-        maxContours: perLevel,
-        fillColor: woodPalette[lv % woodPalette.length],
-        strokeColor: '#38bdf8',
-        layerGroup: `Wood Relief L${lv + 1}/${levels}`,
-        namePrefix: `Carving L${lv + 1} (${zMm}mm)`,
-        toneLevel: lv + 1,
-        toneTotal: levels,
-        heightMm: zMm,
-        shape: lv === 0 ? 'ogee' : 'dome',
+        maxContours: Math.max(15, Math.floor(opts.maxContours * 0.35)),
+        fillColor: '#fde047',
+        strokeColor: '#fbbf24',
+        layerGroup: 'Carving Crown Accents',
+        namePrefix: 'Carving Crown',
+        toneLevel: 2,
+        toneTotal: 2,
+        heightMm: Number((opts.maxDepthMm * 0.95).toFixed(2)),
+        shape: 'dome',
         mode: 'max',
         adaptiveRadius: true,
         rejectFullFrame: true,
       });
-      allEntities.push(...ents);
+      woodEnts.push(...peaks);
     }
 
-    return allEntities.slice(0, opts.maxContours);
+    return woodEnts.slice(0, opts.maxContours);
   }
 
   /**

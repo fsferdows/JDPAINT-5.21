@@ -835,6 +835,39 @@ document.addEventListener('DOMContentLoaded', () => {
       else alert('Selected layer has no compound inner holes to release.');
     });
   }
+  const btnLayerBreakNode = document.getElementById('layer-btn-break-node');
+  if (btnLayerBreakNode) {
+    btnLayerBreakNode.addEventListener('click', () => {
+      if (cadCanvas.breakAtSelectedNode()) {
+        renderLayerList();
+        statusMode.textContent = 'Split path cleanly into editable Start (S) & End (E) points! Click ➕ Add End Point or drag with Pen (B).';
+      } else {
+        statusMode.textContent = 'Select a layer (or pick an inner node in Node Edit mode) to split into Start & End points.';
+      }
+    });
+  }
+  function triggerExtendEndpoint() {
+    if (cadCanvas.startDrawingFromSelectedEndpoint('pen')) {
+      selectTool('pen');
+      statusMode.textContent = 'Continuing from Endpoint — Click anywhere to add End Points (Click Start point S to close, or Enter / R-Click to finish)!';
+    } else {
+      selectTool('pen');
+      statusMode.textContent = 'Click any open Start (S) / End (E) point with Pen (B) to continue drawing from it!';
+    }
+  }
+  const btnLayerExtendEnd = document.getElementById('layer-btn-extend-end');
+  if (btnLayerExtendEnd) btnLayerExtendEnd.addEventListener('click', triggerExtendEndpoint);
+  const btnExtendPathBar = document.getElementById('btn-extend-path');
+  if (btnExtendPathBar) btnExtendPathBar.addEventListener('click', triggerExtendEndpoint);
+
+  const btnLayerReversePath = document.getElementById('layer-btn-reverse-path');
+  if (btnLayerReversePath) {
+    btnLayerReversePath.addEventListener('click', () => {
+      if (cadCanvas.reverseSelectedPath()) {
+        statusMode.textContent = 'Flipped Start Point (S) ↔ End Point (E). Now you can extend from the opposite side!';
+      }
+    });
+  }
 
   const btnShowAllLayers = document.getElementById('btn-layers-show-all');
   if (btnShowAllLayers) {
