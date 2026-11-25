@@ -1,0 +1,9 @@
+{
+  "name": "jdpaint-workspace",
+  "version": "5.21.0",
+  "private": true,
+  "scripts": {
+    "build": "cd jdpaint-mac && npm install && npm run build",
+    "dev": "cd jdpaint-mac && npm run dev"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "buildCommand": "cd jdpaint-mac && npm install && npm run build",
+  "outputDirectory": "jdpaint-mac/dist",
+  "framework": null
+}
