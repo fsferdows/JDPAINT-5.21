@@ -1,5 +1,6 @@
 // 3D WebGL Viewport using Three.js for JDPaint Mac
 import * as THREE from 'three';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 
 export class Viewport3D {
   constructor(containerElement, reliefEngine) {
@@ -76,6 +77,16 @@ export class Viewport3D {
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.12;
     this.container.appendChild(this.renderer.domElement);
+
+    // Meshy-grade Studio IBL reflections via PMREM RoomEnvironment so metallic & glossy PBR materials catch real highlights!
+    try {
+      const pmrem = new THREE.PMREMGenerator(this.renderer);
+      this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+      this.scene.environmentIntensity = 0.85;
+      pmrem.dispose();
+    } catch (_err) {
+      // Headless fallback safely leaves scene.environment unset
+    }
 
     // 3-Point Studio Raking Lighting with 2048px soft shadows so every 3D petal/groove reads crisply!
     const hemiLight = new THREE.HemisphereLight(0xf8fafc, 0x3a2a1d, 0.64);
@@ -640,10 +651,21 @@ export class Viewport3D {
     this.assetMesh.castShadow = true;
     this.assetMesh.receiveShadow = true;
 
-    // Lift asset cleanly above grid floor (Z >= 0) so both Front & Back rotate without slicing grid
-    const minZ = geom.boundingBox ? geom.boundingBox.min.z : 0;
+    // Lift asset cleanly above grid floor (Z >= 0) and auto-frame camera around asset center like Meshy studio
+    const bb = geom.boundingBox;
+    const minZ = bb ? bb.min.z : 0;
     if (minZ < 0) this.assetMesh.position.z = -minZ + 0.5;
     this.scene.add(this.assetMesh);
+
+    if (bb) {
+      const cx = (bb.min.x + bb.max.x) * 0.5;
+      const cy = (bb.min.y + bb.max.y) * 0.5;
+      const cz = (bb.min.z + bb.max.z) * 0.5 + this.assetMesh.position.z;
+      const maxSpan = Math.max(bb.max.x - bb.min.x, bb.max.y - bb.min.y, bb.max.z - bb.min.z, 24);
+      this.target.set(cx, cy, cz);
+      this.spherical.radius = Math.max(70, Math.min(260, maxSpan * 1.38));
+      this.updateCameraPosition();
+    }
 
     if (this.mesh) this.mesh.visible = false;
     if (this.baseSlab) this.baseSlab.visible = false;
@@ -680,9 +702,10 @@ export class Viewport3D {
 
     if (mode === 'solid') {
       return new THREE.MeshStandardMaterial({
-        color: 0xd1d5db,
-        roughness: Math.max(0.15, Math.min(0.95, adj.roughness)),
-        metalness: 0.04,
+        color: 0xe2ddd5,
+        roughness: Math.max(0.18, Math.min(0.92, adj.roughness)),
+        metalness: 0.05,
+        envMapIntensity: 0.72,
         wireframe: this.wireframe,
         side: THREE.DoubleSide,
       });

@@ -335,14 +335,33 @@ export class Asset3DEngine {
         const cSpan = Math.max(38, Math.abs(rOtsu.m2 - rOtsu.m1) * 0.78);
         const embossRaised = invert || !darkDesign;
 
+        const strokeMask = new Uint8Array(total);
+        const bgMask = new Uint8Array(total);
+        const tLinArr = new Float32Array(total);
         for (let i = 0; i < total; i++) {
           if (!fgMask[i]) continue;
           const dVal = darkDesign ? Math.max(0, bgPlane[i] - cleanL[i]) : Math.max(0, cleanL[i] - bgPlane[i]);
           const tLin = Math.max(0, Math.min(1, (dVal - cSpan * 0.14) / (cSpan * 0.72)));
-          const tSmooth = tLin * tLin * (3.0 - 2.0 * tLin);
+          tLinArr[i] = tLin;
+          if (tLin >= 0.48) strokeMask[i] = 1;
+          else bgMask[i] = 1;
+        }
+
+        // Euclidean Signed Distance Field (SDF) beveling eliminates staircase jaggies on curves & diagonal typography!
+        const distIn = VectorPuffEngine.computeInteriorDistanceRect(strokeMask, resX, resY);
+        const distOut = VectorPuffEngine.computeInteriorDistanceRect(bgMask, resX, resY);
+        const bevelPx = Math.max(1.8, Math.min(3.6, minDim * 0.015));
+
+        for (let i = 0; i < total; i++) {
+          if (!fgMask[i]) continue;
+          const sdfGeom = strokeMask[i] ? Math.max(0, distIn[i] - 0.5) : -Math.max(0, distOut[i] - 0.5);
+          const subpxOffset = tLinArr[i] - 0.5;
+          const sdf = Math.abs(sdfGeom) <= 1.25 ? (sdfGeom * 0.55 + subpxOffset * 0.9) : sdfGeom;
+          const uBev = Math.max(0, Math.min(1, 0.5 + sdf / bevelPx));
+          const tBevel = uBev * uBev * (3.0 - 2.0 * uBev);
           const zVal = embossRaised
-            ? (0.24 + tSmooth * 0.72)
-            : (0.74 - tSmooth * 0.60);
+            ? (0.24 + tBevel * 0.72)
+            : (0.74 - tBevel * 0.60);
           sculptSignal[i] = zVal;
           depth[i] = zVal;
         }
@@ -438,24 +457,32 @@ export class Asset3DEngine {
         }
       }
 
-      // Foreground-only bilateral denoise so organic rim never smears toward zero
-      for (let y = 1; y < resY - 1; y++) {
-        const row = y * resX;
-        for (let x = 1; x < resX - 1; x++) {
-          const i = row + x;
-          if (!fgMask[i]) continue;
-          let wSum = 2.0;
-          let vSum = combinedDepth[i] * 2.0;
-          const nbs = [i - 1, i + 1, i - resX, i + resX];
-          for (const ni of nbs) {
-            if (!fgMask[ni]) continue;
-            const d = Math.abs(combinedDepth[ni] - combinedDepth[i]);
-            const w = d < 0.14 ? 1.0 : 0.25;
-            vSum += combinedDepth[ni] * w;
-            wSum += w;
+      // Multi-pass Jacobi Poisson harmonic volume integration + edge-preserving surface fairing inside foreground
+      const jacobiBuf = new Float32Array(combinedDepth);
+      const jacobiNext = new Float32Array(combinedDepth);
+      for (let jPass = 0; jPass < 10; jPass++) {
+        for (let y = 1; y < resY - 1; y++) {
+          const row = y * resX;
+          for (let x = 1; x < resX - 1; x++) {
+            const i = row + x;
+            if (!fgMask[i]) continue;
+            let s = 0, w = 0;
+            const nbs = [i - 1, i + 1, i - resX, i + resX];
+            for (const ni of nbs) {
+              if (!fgMask[ni]) continue;
+              const diff = Math.abs(jacobiBuf[ni] - jacobiBuf[i]);
+              const wt = diff < 0.16 ? 1.0 : 0.28;
+              s += jacobiBuf[ni] * wt;
+              w += wt;
+            }
+            const nbrAvg = w > 0 ? s / w : combinedDepth[i];
+            jacobiNext[i] = Math.max(0.08, Math.min(1.0, combinedDepth[i] * 0.34 + nbrAvg * 0.66));
           }
-          depth[i] = Math.max(0.08, Math.min(1.0, vSum / wSum));
         }
+        jacobiBuf.set(jacobiNext);
+      }
+      for (let i = 0; i < total; i++) {
+        depth[i] = fgMask[i] ? Math.max(0.08, Math.min(1.0, jacobiBuf[i])) : 0;
       }
     }
 
@@ -930,6 +957,48 @@ export class Asset3DEngine {
         gridX.set(nextX);
         gridY.set(nextY);
       }
+    }
+
+    // Level-set isocontour vertex alignment: slides interior steep wall vertices along height contours so
+    // diagonal letters, circles, and curved carvings keep clean diagonal edges without pixel sawtooths!
+    const isoMaxShift = 0.36;
+    for (let pass = 0; pass < 2; pass++) {
+      const nextIsoX = new Float32Array(gridX);
+      const nextIsoY = new Float32Array(gridY);
+      for (let iy = 1; iy < H - 1; iy++) {
+        const row = iy * W;
+        for (let ix = 1; ix < W - 1; ix++) {
+          const vi = row + ix;
+          if (!activeVert[vi] || isBoundaryVert[vi]) continue;
+          const zc = depth[vi];
+          let minZ = zc, maxZ = zc;
+          const nbs = [vi - 1, vi + 1, vi - W, vi + W, vi - W - 1, vi - W + 1, vi + W - 1, vi + W + 1];
+          for (const ni of nbs) {
+            if (!activeVert[ni]) continue;
+            const zn = depth[ni];
+            if (zn < minZ) minZ = zn;
+            if (zn > maxZ) maxZ = zn;
+          }
+          if (maxZ - minZ < 0.12) continue;
+          let sx = 0, sy = 0, sw = 0;
+          for (const ni of nbs) {
+            if (!activeVert[ni] || isBoundaryVert[ni]) continue;
+            const dz = (depth[ni] - zc) * 9.0;
+            const wt = Math.exp(-dz * dz);
+            sx += gridX[ni] * wt;
+            sy += gridY[ni] * wt;
+            sw += wt;
+          }
+          if (sw > 0.25) {
+            const tx = gridX[vi] + 0.55 * (sx / sw - gridX[vi]);
+            const ty = gridY[vi] + 0.55 * (sy / sw - gridY[vi]);
+            nextIsoX[vi] = Math.max(ix - isoMaxShift, Math.min(ix + isoMaxShift, tx));
+            nextIsoY[vi] = Math.max(iy - isoMaxShift, Math.min(iy + isoMaxShift, ty));
+          }
+        }
+      }
+      gridX.set(nextIsoX);
+      gridY.set(nextIsoY);
     }
 
     const frontMap = new Int32Array(W * H).fill(-1);
