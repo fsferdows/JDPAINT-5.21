@@ -28,11 +28,11 @@ export class Asset3DEngine {
     const ih = imgElement.naturalHeight || imgElement.height || 1;
     const imgAspect = iw / Math.max(1, ih);
 
-    // Choose adaptive rectangular grid (resX x resY) matching source aspect so elongated doors/plaques don't waste 50% width!
+    // Choose adaptive rectangular grid (resX x resY) matching source aspect & lifting High/Ultra detail resolution
     let resX = baseRes;
     let resY = baseRes;
-    if (Math.abs(imgAspect - 1.0) >= 0.05) {
-      const areaBudget = baseRes * baseRes * 1.45;
+    if (baseRes >= 128 || Math.abs(imgAspect - 1.0) >= 0.05) {
+      const areaBudget = baseRes * baseRes * (baseRes >= 144 ? 1.65 : 1.45);
       resX = Math.max(84, Math.min(360, Math.round(Math.sqrt(areaBudget * imgAspect))));
       resY = Math.max(84, Math.min(360, Math.round(Math.sqrt(areaBudget / imgAspect))));
     }
@@ -230,8 +230,8 @@ export class Asset3DEngine {
     const sculptSignal = new Float32Array(total);
 
     if (isPlanarPanel) {
-      // Planar Wood / Architectural Bas-Relief Pipeline (Grain-free, Watermark-inpainted, Coplanar Frame Stiles/Rails!)
-      const smL = ImageVectorizer.guidedFilter(luma255, resX, resY, 2, 160);
+      // Planar Wood / Architectural / 2-Tone Engraved Bas-Relief Pipeline
+      const smL = ImageVectorizer.guidedFilter(luma255, resX, resY, 1, 55);
       const validMask = new Uint8Array(total);
       const wmRaw = new Uint8Array(total);
       const hasRoiChroma = roi && roi.chromaMed >= 10;
@@ -242,12 +242,12 @@ export class Asset3DEngine {
         for (let x = 0; x < resX; x++) {
           const i = row + x;
           if (!fgMask[i]) continue;
-          if (hasRoiChroma) {
+          if (hasRoiChroma && roi.L[i] > roi.lMed + 5) {
             const dc = roi.chromaDiff[i];
             const rgbSat = Math.max(rArr[i], gArr[i], bArr[i]) - Math.min(rArr[i], gArr[i], bArr[i]);
             const isNeutralOverlay = roi.chromaMed > 14 && roi.L[i] > 76 && rgbSat < 32;
-            const isFringeOverlay = roi.chromaMed > 14 && roi.L[i] > roi.lMed + 8 && dc > 9 && rgbSat < 48;
-            if (isNeutralOverlay || isFringeOverlay || (dc > wmTol && (roi.L[i] > roi.lMed + 5 || dc > 20))) {
+            const isFringeOverlay = roi.chromaMed > 14 && dc > 9 && rgbSat < 48;
+            if (isNeutralOverlay || isFringeOverlay || dc > wmTol) {
               wmRaw[i] = 1;
               continue;
             }
@@ -305,38 +305,84 @@ export class Asset3DEngine {
         }
       }
       const toneSpan = Math.max(36, p92 - p10);
+      const rOtsu = vCnt > 50 ? ImageVectorizer.computeOtsuStats(vHist, vCnt) : { separability: 0, threshold: 128, m1: 100, m2: 120 };
 
-      const minR = Math.max(2, Math.min(5, Math.round(minDim * 0.015)));
-      const medR = Math.max(5, Math.min(16, Math.round(minDim * 0.055)));
-      const planeR = Math.max(18, Math.round(minDim * 0.24));
+      if (rOtsu.separability >= 0.72 && Math.abs(rOtsu.m2 - rOtsu.m1) >= 44) {
+        // 2-Tone Laser/CNC Engraved Plaque or Solid Sign Logo (e.g. brand marks, typography, stamps):
+        // Fit plane strictly across background pixels so board remains 100% flat without puffy letter halos!
+        const bVals = [];
+        for (let y = minFgY; y <= maxFgY; y++) {
+          const nearY = (y - minFgY) < Math.max(3, Math.round(fgBoxH * 0.04)) || (maxFgY - y) < Math.max(3, Math.round(fgBoxH * 0.04));
+          for (let x = minFgX; x <= maxFgX; x++) {
+            const nearX = (x - minFgX) < Math.max(3, Math.round(fgBoxW * 0.04)) || (maxFgX - x) < Math.max(3, Math.round(fgBoxW * 0.04));
+            if ((nearY || nearX) && validMask[y * resX + x]) bVals.push(cleanL[y * resX + x]);
+          }
+        }
+        bVals.sort((u, v) => u - v);
+        const borderMed = bVals.length > 0 ? bVals[Math.floor(bVals.length * 0.5)] : rOtsu.m2;
+        const darkDesign = borderMed >= rOtsu.threshold;
 
-      const openedS = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, minR, false), resX, resY, minR, true);
-      const closedS = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, minR, true), resX, resY, minR, false);
-      const openedM = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, medR, false), resX, resY, medR, true);
-      const closedM = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, medR, true), resX, resY, medR, false);
-      const broadPlane = ImageVectorizer.maskedBoxMean(cleanL, fgMask, resX, resY, planeR);
+        const bgSeed = new Uint8Array(total);
+        let bgCnt = 0;
+        for (let i = 0; i < total; i++) {
+          if (validMask[i] && (darkDesign ? cleanL[i] >= rOtsu.threshold - 8 : cleanL[i] <= rOtsu.threshold + 8)) {
+            bgSeed[i] = 1;
+            bgCnt++;
+          }
+        }
+        const planeR2 = Math.max(10, Math.round(minDim * 0.09));
+        const bgPlane = bgCnt > 20 ? ImageVectorizer.maskedBoxMean(cleanL, bgSeed, resX, resY, planeR2) : new Float32Array(total).fill(borderMed);
+        const cSpan = Math.max(38, Math.abs(rOtsu.m2 - rOtsu.m1) * 0.78);
+        const embossRaised = invert || !darkDesign;
 
-      const pol = invert ? -1 : 1;
-      for (let i = 0; i < total; i++) {
-        if (!fgMask[i]) continue;
-        // 56% illumination-balanced solid macro elevation + 44% crisp multi-scale detail
-        const deLightedL = cleanL[i] - (broadPlane[i] - (p10 + toneSpan * 0.45)) * 0.32;
-        let macroElev = (deLightedL - p10) / toneSpan;
-        if (invert) macroElev = 1.0 - macroElev;
-        macroElev = Math.max(0.05, Math.min(1.0, macroElev));
+        for (let i = 0; i < total; i++) {
+          if (!fgMask[i]) continue;
+          const dVal = darkDesign ? Math.max(0, bgPlane[i] - cleanL[i]) : Math.max(0, cleanL[i] - bgPlane[i]);
+          const tLin = Math.max(0, Math.min(1, (dVal - cSpan * 0.14) / (cSpan * 0.72)));
+          const tSmooth = tLin * tLin * (3.0 - 2.0 * tLin);
+          const zVal = embossRaised
+            ? (0.24 + tSmooth * 0.72)
+            : (0.74 - tSmooth * 0.60);
+          sculptSignal[i] = zVal;
+          depth[i] = zVal;
+        }
+        const crispEdge = ImageVectorizer.guidedFilter(depth, resX, resY, 1, 0.004);
+        for (let i = 0; i < total; i++) {
+          depth[i] = fgMask[i] ? Math.max(0.10, Math.min(0.98, crispEdge[i])) : 0;
+        }
+      } else {
+        const minR = Math.max(2, Math.min(5, Math.round(minDim * 0.015)));
+        const medR = Math.max(5, Math.min(16, Math.round(minDim * 0.055)));
+        const planeR = Math.max(18, Math.round(minDim * 0.24));
 
-        const wh = (Math.max(0, cleanL[i] - openedS[i]) * 0.35 + Math.max(0, cleanL[i] - openedM[i]) * 0.65) / 72.0;
-        const bh = (Math.max(0, closedS[i] - cleanL[i]) * 0.35 + Math.max(0, closedM[i] - cleanL[i]) * 0.65) / 72.0;
-        const microDelta = (wh * 1.15 - bh * 0.90) * pol;
-        const zVal = Math.max(0.10, Math.min(1.0, macroElev * 0.66 + 0.16 + microDelta * 0.38));
-        sculptSignal[i] = zVal;
-        depth[i] = zVal;
-      }
+        const openedS = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, minR, false), resX, resY, minR, true);
+        const closedS = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, minR, true), resX, resY, minR, false);
+        const openedM = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, medR, false), resX, resY, medR, true);
+        const closedM = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, medR, true), resX, resY, medR, false);
+        const broadPlane = ImageVectorizer.maskedBoxMean(cleanL, fgMask, resX, resY, planeR);
 
-      // Smooth fine wood grain ripples while keeping carved petals, fluted columns & recessed panel steps razor crisp
-      const smoothPlanar = ImageVectorizer.guidedFilter(depth, resX, resY, 2, 0.012);
-      for (let i = 0; i < total; i++) {
-        depth[i] = fgMask[i] ? Math.max(0.10, Math.min(1.0, smoothPlanar[i])) : 0;
+        const pol = invert ? -1 : 1;
+        for (let i = 0; i < total; i++) {
+          if (!fgMask[i]) continue;
+          // 56% illumination-balanced solid macro elevation + 44% crisp multi-scale detail
+          const deLightedL = cleanL[i] - (broadPlane[i] - (p10 + toneSpan * 0.45)) * 0.32;
+          let macroElev = (deLightedL - p10) / toneSpan;
+          if (invert) macroElev = 1.0 - macroElev;
+          macroElev = Math.max(0.05, Math.min(1.0, macroElev));
+
+          const wh = (Math.max(0, cleanL[i] - openedS[i]) * 0.35 + Math.max(0, cleanL[i] - openedM[i]) * 0.65) / 72.0;
+          const bh = (Math.max(0, closedS[i] - cleanL[i]) * 0.35 + Math.max(0, closedM[i] - cleanL[i]) * 0.65) / 72.0;
+          const microDelta = (wh * 1.15 - bh * 0.90) * pol;
+          const zVal = Math.max(0.10, Math.min(1.0, macroElev * 0.66 + 0.16 + microDelta * 0.38));
+          sculptSignal[i] = zVal;
+          depth[i] = zVal;
+        }
+
+        // Smooth fine wood grain ripples while keeping carved petals, fluted columns & recessed panel steps razor crisp
+        const smoothPlanar = ImageVectorizer.guidedFilter(depth, resX, resY, 2, 0.012);
+        for (let i = 0; i < total; i++) {
+          depth[i] = fgMask[i] ? Math.max(0.10, Math.min(1.0, smoothPlanar[i])) : 0;
+        }
       }
     } else {
       // Organic 3D Cutout Depth Extraction (Smooth Harmonic Volume + Denoised Multi-Scale Surface Detail)
