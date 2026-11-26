@@ -1,5 +1,6 @@
 // Main Application Controller for JDPaint 5.21 (Mac Edition)
 import { CadCanvas } from './cad/cadCanvas.js';
+import { CadKernelBridge } from './cad/cadKernelBridge.js';
 import { ImageVectorizer } from './cad/imageVectorizer.js';
 import { VectorPuffEngine } from './cad/vectorPuffEngine.js';
 import { ReliefEngine } from './relief/reliefEngine.js';
@@ -25,6 +26,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   let activeToolpathSegments = [];
   let loadedImageElement = null;
+  let lastBrepStepBytes = null;
 
   // Base Picture 3D Heightmap Layer state
   let basePhotoBuffer = null;
@@ -774,6 +776,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (viewport3D.assetMesh) {
       viewport3D.clearAssetMesh();
+      lastBrepStepBytes = null;
       const btnBackRel = document.getElementById('btn-back-relief');
       if (btnBackRel) btnBackRel.style.display = 'none';
     }
@@ -1179,6 +1182,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setTimeout(() => {
       if (viewport3D.assetMesh) {
         viewport3D.clearAssetMesh();
+        lastBrepStepBytes = null;
         const btnBackRel = document.getElementById('btn-back-relief');
         if (btnBackRel) btnBackRel.style.display = 'none';
       }
@@ -1299,6 +1303,8 @@ document.addEventListener('DOMContentLoaded', () => {
         meshStats = meshData.stats;
       }
 
+      updateProgress(5, 100, `Complete: ${meshStats.faces.toLocaleString()} triangles ready!`);
+      lastBrepStepBytes = null;
       const btnBackRel = document.getElementById('btn-back-relief');
       if (btnBackRel) btnBackRel.style.display = 'inline-block';
       const assetTabBtn = document.getElementById('tab-btn-asset');
@@ -1938,6 +1944,112 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   ['menu-file-export-dxf', 'btn-export-dxf-tab'].forEach((id) => {
     document.getElementById(id)?.addEventListener('click', exportDXF);
+  });
+
+  // ============================================================
+  // OpenCascade Parametric CAD Bridge (build123d + agentcad .STEP)
+  // ============================================================
+  const cadKernelStatusEl = document.getElementById('cad-kernel-status');
+  async function refreshCadKernelStatus({ passive = false } = {}) {
+    const info = await CadKernelBridge.checkHealth(1200, { passive });
+    if (!cadKernelStatusEl) return info;
+    if (info.ok) {
+      cadKernelStatusEl.textContent = `Connected: build123d ${info.build123d_version} + agentcad ${info.agentcad_version}`;
+      cadKernelStatusEl.style.color = '#15803d';
+    } else {
+      cadKernelStatusEl.textContent = 'Offline (Browser Mode — run Start JDPaint.command for .STEP B-Rep)';
+      cadKernelStatusEl.style.color = '#64748b';
+    }
+    return info;
+  }
+  if (cadKernelStatusEl) {
+    cadKernelStatusEl.style.cursor = 'pointer';
+    cadKernelStatusEl.title = 'Click to probe local OpenCascade CAD Bridge (127.0.0.1:5174)';
+    cadKernelStatusEl.addEventListener('click', () => refreshCadKernelStatus({ passive: false }));
+  }
+  refreshCadKernelStatus({ passive: true });
+
+  async function buildBRepFromVectors() {
+    if (cadCanvas.entities.length === 0) {
+      alert('Draw or Auto-Trace 2D vector shapes first before converting to OpenCascade B-Rep CAD.');
+      return;
+    }
+    const health = await refreshCadKernelStatus({ passive: false });
+    if (!health.ok) {
+      alert('Local OpenCascade CAD Bridge (127.0.0.1:5174) is offline. Launch via "Start JDPaint.command" or run cad-kernel/cad_bridge_server.py.');
+      return;
+    }
+    statusMode.textContent = 'Building watertight OpenCascade B-Rep Solid & ISO STEP from 2D CAD vectors...';
+    try {
+      const res = await CadKernelBridge.buildFromVectors(cadCanvas.entities, {
+        workpieceWidth: reliefEngine.width || 100,
+        workpieceHeight: reliefEngine.height || 100,
+        baseThicknessMm: Math.max(2, parseFloat(document.getElementById('asset-thickness')?.value || '6') || 6),
+        extrudeHeightMm: parseFloat(document.getElementById('puff-height')?.value || '5') || 5,
+        filletRadiusMm: 0.4,
+      });
+      lastBrepStepBytes = res.stepBytes;
+      await viewport3D.loadExternalGLBBuffer(res.glbBuffer);
+      const btnBackRel = document.getElementById('btn-back-relief');
+      if (btnBackRel) btnBackRel.style.display = 'inline-block';
+      if (panel3D.style.display === 'none') setViewMode('split');
+      statusMode.textContent = `OpenCascade B-Rep Ready! Volume=${res.metrics.volume_mm3}mm³, Valid=${res.metrics.is_valid}, Features=${res.featuresBuilt}. Export .STEP / .STL / .GLB!`;
+    } catch (err) {
+      console.error('OpenCascade 2D->BRep failed:', err);
+      statusMode.textContent = `OpenCascade CAD build error: ${err.message || err}`;
+      alert(`OpenCascade CAD build error: ${err.message || err}`);
+    }
+  }
+
+  async function buildParametricBRepPreset() {
+    const health = await refreshCadKernelStatus({ passive: false });
+    if (!health.ok) {
+      alert('Local OpenCascade CAD Bridge (127.0.0.1:5174) is offline. Launch via "Start JDPaint.command" or run cad-kernel/cad_bridge_server.py.');
+      return;
+    }
+    const preset = document.getElementById('brep-preset-select')?.value || 'bracket';
+    const w = parseFloat(document.getElementById('brep-param-w')?.value || '80') || 80;
+    const h = parseFloat(document.getElementById('brep-param-h')?.value || '65') || 65;
+    const t = parseFloat(document.getElementById('brep-param-t')?.value || '6') || 6;
+    statusMode.textContent = `Compiling parametric build123d ${preset.toUpperCase()} B-Rep solid...`;
+    try {
+      const params = preset === 'flange'
+        ? { outerDia: w, height: t, hubHeight: Math.max(6, h * 0.25) }
+        : preset === 'enclosure'
+          ? { width: w, depth: h, height: Math.max(18, t * 4), wall: Math.max(2, Math.min(6, t * 0.5)) }
+          : { width: w, height: h, thickness: t };
+      const res = await CadKernelBridge.buildParametricPreset(preset, params);
+      lastBrepStepBytes = res.stepBytes;
+      await viewport3D.loadExternalGLBBuffer(res.glbBuffer);
+      const btnBackRel = document.getElementById('btn-back-relief');
+      if (btnBackRel) btnBackRel.style.display = 'inline-block';
+      if (panel3D.style.display === 'none') setViewMode('split');
+      statusMode.textContent = `Parametric ${preset} B-Rep Ready! Vol=${res.metrics.volume_mm3}mm³, Faces=${res.metrics.brep_faces}, Valid=${res.metrics.is_valid}. Export .STEP anytime!`;
+    } catch (err) {
+      console.error('Parametric CAD preset failed:', err);
+      statusMode.textContent = `Parametric B-Rep build failed: ${err.message || err}`;
+      alert(`Parametric B-Rep build failed: ${err.message || err}`);
+    }
+  }
+
+  async function exportSTEP() {
+    if (!lastBrepStepBytes || lastBrepStepBytes.length === 0) {
+      if (cadCanvas.entities.length > 0) {
+        await buildBRepFromVectors();
+      } else {
+        await buildParametricBRepPreset();
+      }
+      if (!lastBrepStepBytes || lastBrepStepBytes.length === 0) return;
+    }
+    const blob = new Blob([lastBrepStepBytes], { type: 'application/step' });
+    StlExporter.downloadBlob('jdpaint-cad-solid.step', blob);
+    statusMode.textContent = `Exported Industrial ISO 10303 .STEP Solid (${(blob.size / 1024).toFixed(1)} KB).`;
+  }
+
+  document.getElementById('btn-brep-vectors')?.addEventListener('click', buildBRepFromVectors);
+  document.getElementById('btn-brep-preset')?.addEventListener('click', buildParametricBRepPreset);
+  ['menu-file-export-step', 'btn-asset-export-step'].forEach((id) => {
+    document.getElementById(id)?.addEventListener('click', exportSTEP);
   });
 
   // Project Save / New

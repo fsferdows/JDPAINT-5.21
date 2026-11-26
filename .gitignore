@@ -1,6 +1,10 @@
 # Dependencies
 node_modules/
 **/node_modules/
+cad-kernel/.venv/
+**/__pycache__/
+*.pyc
+.cad_tmp/
 
 # Production build outputs
 dist/
@@ -29,3 +33,6 @@ Thumbs.db
 .env
 .env.local
 .env.*.local
+
+# agentcad runtime session logs
+.agentcad/

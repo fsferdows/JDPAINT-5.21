@@ -49,6 +49,7 @@
           <button id="menu-file-export-obj"><span class="icon">📦</span>Export Wavefront OBJ Model...</button>
           <button id="menu-file-export-svg"><span class="icon">🎨</span>Export 2D Vectors (SVG)...</button>
           <button id="menu-file-export-dxf"><span class="icon">📐</span>Export 2D CAD (AutoCAD DXF)...</button>
+          <button id="menu-file-export-step"><span class="icon">🔩</span>Export OpenCascade B-Rep (.STEP)...</button>
           <hr>
           <button id="menu-file-exit">Exit(<u>X</u>)<span class="accel">Alt+F4</span></button>
         </div>
@@ -930,7 +931,34 @@
             <button class="win-push-btn primary" id="btn-asset-export-glb">🌐 Export Binary .GLB (PBR Texture)</button>
             <button class="win-push-btn" id="btn-asset-export-stl">🧊 Export Watertight 3D .STL</button>
             <button class="win-push-btn" id="btn-asset-export-obj">📦 Export Textured 3D .OBJ</button>
+            <button class="win-push-btn" id="btn-asset-export-step">🔩 Export Industrial .STEP (OpenCascade)</button>
           </div>
+
+          <fieldset class="win-group" style="margin-top:6px;">
+            <legend>Parametric CAD Kernel (build123d + OpenCascade)</legend>
+            <div id="cad-kernel-status" style="font-size:10px;color:#475569;margin-bottom:4px;">Checking local OpenCascade B-Rep bridge...</div>
+            <div class="row">
+              <label>B-Rep Part:</label>
+              <select id="brep-preset-select" class="win-input">
+                <option value="bracket" selected>CNC Gusseted L-Bracket</option>
+                <option value="flange">Rotary Bearing Flange</option>
+                <option value="enclosure">PCB Controller Enclosure</option>
+                <option value="door_panel">Raised-Panel Door B-Rep</option>
+              </select>
+            </div>
+            <div class="row">
+              <label>W / H / T (mm):</label>
+              <div style="display:flex;gap:3px;flex:1;">
+                <input type="number" id="brep-param-w" value="80" min="20" max="400" class="win-input" style="width:46px;" title="Width / Outer Dia (mm)">
+                <input type="number" id="brep-param-h" value="65" min="20" max="400" class="win-input" style="width:46px;" title="Height (mm)">
+                <input type="number" id="brep-param-t" value="6" min="2" max="60" class="win-input" style="width:40px;" title="Wall / Plate Thickness (mm)">
+              </div>
+            </div>
+            <div style="display:flex;gap:4px;margin-top:5px;">
+              <button class="win-push-btn" id="btn-brep-preset" style="flex:1;">🔩 Parametric Part</button>
+              <button class="win-push-btn" id="btn-brep-vectors" style="flex:1;">📐 2D Vectors → B-Rep</button>
+            </div>
+          </fieldset>
         </div>
 
         <!-- Tab 3: Statistics & NC Output -->
