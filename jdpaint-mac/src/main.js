@@ -3,6 +3,7 @@ import { CadCanvas } from './cad/cadCanvas.js';
 import { ImageVectorizer } from './cad/imageVectorizer.js';
 import { VectorPuffEngine } from './cad/vectorPuffEngine.js';
 import { ReliefEngine } from './relief/reliefEngine.js';
+import { Asset3DEngine } from './relief/asset3DEngine.js';
 import { Viewport3D } from './viewport/viewport3D.js';
 import { CamEngine } from './cam/camEngine.js';
 import { GcodeExporter } from './export/gcodeExporter.js';
@@ -771,6 +772,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!quiet && cadCanvas.currentDraft) {
       cadCanvas.finishCurrentDraft();
     }
+    if (viewport3D.assetMesh) {
+      viewport3D.clearAssetMesh();
+      const btnBackRel = document.getElementById('btn-back-relief');
+      if (btnBackRel) btnBackRel.style.display = 'none';
+    }
     const clipBase = chkClipBaseTo2d ? chkClipBaseTo2d.checked : true;
     const count = VectorPuffEngine.rebuildFromLayers(cadCanvas.entities, reliefEngine, {
       baseBuffer: basePhotoBuffer,
@@ -1143,6 +1149,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
     statusMode.textContent = 'Computing High-Accuracy 3D Relief (Bilateral Denoising & Edge Sharpening)...';
     setTimeout(() => {
+      if (viewport3D.assetMesh) {
+        viewport3D.clearAssetMesh();
+        const btnBackRel = document.getElementById('btn-back-relief');
+        if (btnBackRel) btnBackRel.style.display = 'none';
+      }
       reliefEngine.loadImageHighAccuracy(loadedImageElement, {
         style,
         edgeStrength,
@@ -1162,6 +1173,73 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-pic-to-relief').addEventListener('click', convertPicTo3DRelief);
   document.getElementById('btn-side-convert-pic').addEventListener('click', convertPicTo3DRelief);
   document.getElementById('menu-file-convert-3d').addEventListener('click', convertPicTo3DRelief);
+
+  // ============================================================
+  // VOLUMETRIC IMAGE-TO-3D ASSET STUDIO (Meshy Workflow + PBR)
+  // ============================================================
+  function readAssetMaterialAdjustment() {
+    const r = (parseInt(document.getElementById('asset-roughness')?.value || '55', 10)) / 100;
+    const m = (parseInt(document.getElementById('asset-metalness')?.value || '8', 10)) / 100;
+    const c = (parseInt(document.getElementById('asset-contrast')?.value || '100', 10)) / 100;
+    const i = (parseInt(document.getElementById('asset-intensity')?.value || '100', 10)) / 100;
+    return { roughness: r, metalness: m, contrast: c, intensity: i };
+  }
+
+  async function generateVolumetric3DAsset() {
+    if (!loadedImageElement) {
+      alert('Please load a picture first using "🖼️ Load Picture...".');
+      return;
+    }
+
+    const assetMode = document.getElementById('asset-mode-select')?.value || 'double-sided';
+    const resolution = parseInt(document.getElementById('asset-res-select')?.value || '144', 10) || 144;
+    const thicknessMm = Math.max(2, parseFloat(document.getElementById('asset-thickness')?.value || '22') || 22);
+    const removeBg = document.getElementById('asset-remove-bg')?.checked ?? true;
+    const delight = document.getElementById('asset-delight')?.checked ?? true;
+    const invert = document.getElementById('relief-invert-check')?.checked || false;
+
+    statusMode.textContent = `Step 1/3: Isolating subject silhouette & synthesizing PBR maps (${resolution}×${resolution})...`;
+    await new Promise((r) => setTimeout(r, 0));
+
+    const analysis = Asset3DEngine.analyzeImage(loadedImageElement, {
+      resolution,
+      removeBg,
+      delight,
+      invert,
+      edgeStrength: parseFloat(document.getElementById('relief-edge-strength')?.value || '0.35') || 0.35,
+    });
+
+    statusMode.textContent = `Step 2/3: Reconstructing closed ${assetMode.toUpperCase()} volumetric 3D mesh...`;
+    await new Promise((r) => setTimeout(r, 0));
+
+    const meshData = Asset3DEngine.buildAssetMeshData(analysis, {
+      assetMode,
+      widthMm: reliefEngine.width || 100,
+      heightMm: reliefEngine.height || 100,
+      thicknessMm,
+    });
+
+    statusMode.textContent = 'Step 3/3: Uploading PBR Base Color, Normal, Roughness & Metallic maps to WebGL...';
+    await new Promise((r) => setTimeout(r, 0));
+
+    viewport3D.setMaterialAdjustment(readAssetMaterialAdjustment());
+    viewport3D.setAssetMesh(meshData, analysis.maps);
+
+    const btnBackRel = document.getElementById('btn-back-relief');
+    if (btnBackRel) btnBackRel.style.display = 'inline-block';
+    const assetTabBtn = document.getElementById('tab-btn-asset');
+    if (assetTabBtn) assetTabBtn.click();
+    if (panel3D.style.display === 'none') setViewMode('split');
+
+    viewport3D.target.set((reliefEngine.width || 100) * 0.5, (reliefEngine.height || 100) * 0.5, 0);
+    viewport3D.updateCameraPosition();
+
+    const { faces, vertices } = meshData.stats;
+    statusMode.textContent = `3D Asset ready (${assetMode}) — ${faces.toLocaleString()} triangles, ${vertices.toLocaleString()} vertices! Export .GLB / .STL / .OBJ anytime.`;
+  }
+
+  document.getElementById('btn-img-to-asset')?.addEventListener('click', generateVolumetric3DAsset);
+  document.getElementById('btn-generate-asset')?.addEventListener('click', generateVolumetric3DAsset);
 
   // ============================================================
   // Transform Tools (Mirror, Rotate, Offset)
@@ -1489,6 +1567,65 @@ document.addEventListener('DOMContentLoaded', () => {
     viewport3D.resetCamera();
   });
 
+  // Meshy-style 3D Studio HUD Controls (Shading Mode, PBR Channels, Turntable, Stats, & Material Adjustment)
+  const stat3dTopo = document.getElementById('stat-3d-topo');
+  const stat3dFaces = document.getElementById('stat-3d-faces');
+  const stat3dVerts = document.getElementById('stat-3d-verts');
+  viewport3D.onStatsChange = (stats) => {
+    if (stat3dTopo) stat3dTopo.textContent = stats.topology || 'Triangle';
+    if (stat3dFaces) stat3dFaces.textContent = (stats.faces || 0).toLocaleString();
+    if (stat3dVerts) stat3dVerts.textContent = (stats.vertices || 0).toLocaleString();
+  };
+  viewport3D._emitStats();
+
+  document.querySelectorAll('#three-studio-hud [data-shade]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('#three-studio-hud [data-shade]').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      viewport3D.setShadingMode(btn.dataset.shade);
+    });
+  });
+
+  document.querySelectorAll('#three-studio-hud [data-channel]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('#three-studio-hud [data-channel]').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      viewport3D.setPbrChannel(btn.dataset.channel);
+    });
+  });
+
+  const btnTurntable3d = document.getElementById('btn-turntable-3d');
+  if (btnTurntable3d) {
+    btnTurntable3d.addEventListener('click', () => {
+      btnTurntable3d.classList.toggle('active');
+      viewport3D.setTurntable(btnTurntable3d.classList.contains('active'));
+    });
+  }
+
+  const btnBackRelief = document.getElementById('btn-back-relief');
+  if (btnBackRelief) {
+    btnBackRelief.addEventListener('click', () => {
+      viewport3D.clearAssetMesh();
+      btnBackRelief.style.display = 'none';
+      statusMode.textContent = 'Switched back to 2.5D CNC Relief Slab view.';
+    });
+  }
+
+  const bindAssetSlider = (sliderId, lblId, key) => {
+    const el = document.getElementById(sliderId);
+    const lbl = document.getElementById(lblId);
+    if (!el) return;
+    el.addEventListener('input', () => {
+      const val = parseInt(el.value, 10) / 100;
+      if (lbl) lbl.textContent = val.toFixed(2);
+      viewport3D.setMaterialAdjustment({ [key]: val });
+    });
+  };
+  bindAssetSlider('asset-roughness', 'lbl-asset-rough', 'roughness');
+  bindAssetSlider('asset-metalness', 'lbl-asset-metal', 'metalness');
+  bindAssetSlider('asset-contrast', 'lbl-asset-contrast', 'contrast');
+  bindAssetSlider('asset-intensity', 'lbl-asset-intensity', 'intensity');
+
   // ============================================================
   // CNC CAM Toolpath Calculations
   // ============================================================
@@ -1622,31 +1759,65 @@ document.addEventListener('DOMContentLoaded', () => {
     dialogGcode.close();
   });
 
-  // 3D STL & OBJ Export
+  // 3D Asset & Relief Exports (.GLB PBR, Binary .STL, Wavefront .OBJ)
+  async function exportGLB() {
+    statusMode.textContent = 'Exporting Binary glTF 2.0 (.glb) 3D Asset with PBR Textures...';
+    const meshData = (viewport3D.assetMesh && viewport3D.assetData)
+      ? viewport3D.assetData
+      : StlExporter.reliefToMeshData(reliefEngine);
+
+    let pngBytes = null;
+    const baseCanvas = viewport3D.getBaseColorPngCanvas();
+    if (baseCanvas && typeof baseCanvas.toBlob === 'function') {
+      const pngBlob = await new Promise((resolve) => baseCanvas.toBlob(resolve, 'image/png'));
+      if (pngBlob) pngBytes = new Uint8Array(await pngBlob.arrayBuffer());
+    }
+
+    const adj = readAssetMaterialAdjustment();
+    const glbBlob = StlExporter.exportToGLB(meshData, {
+      baseColorPngBytes: pngBytes,
+      roughness: adj.roughness,
+      metalness: adj.metalness,
+      name: 'JDPaint3DAsset',
+    });
+    StlExporter.downloadBlob('jdpaint-3d-asset.glb', glbBlob);
+    statusMode.textContent = `Exported Binary .GLB (${(glbBlob.size / 1024).toFixed(1)} KB, Blender/Unity/QuickLook ready).`;
+  }
+
   function exportSTL() {
-    statusMode.textContent = 'Exporting 3D Binary STL Mesh...';
+    statusMode.textContent = 'Exporting Watertight 3D Binary STL Mesh...';
     setTimeout(() => {
-      const blob = StlExporter.exportReliefToBinarySTL(reliefEngine);
-      StlExporter.downloadBlob('jdpaint-relief.stl', blob);
-      statusMode.textContent = 'STL file exported successfully (ready for 3D printing/CAM).';
+      const isAsset = !!(viewport3D.assetMesh && viewport3D.assetData);
+      const blob = isAsset
+        ? StlExporter.exportIndexedMeshToBinarySTL(viewport3D.assetData)
+        : StlExporter.exportReliefToBinarySTL(reliefEngine);
+      StlExporter.downloadBlob(isAsset ? 'jdpaint-3d-asset.stl' : 'jdpaint-relief.stl', blob);
+      statusMode.textContent = `STL file exported (${isAsset ? 'Volumetric 3D Asset' : 'Relief Slab'}, ready for 3D printing/CAM).`;
     }, 20);
   }
 
   function exportOBJ() {
     statusMode.textContent = 'Exporting Wavefront OBJ model...';
     setTimeout(() => {
-      const text = StlExporter.exportToOBJ(reliefEngine);
+      const isAsset = !!(viewport3D.assetMesh && viewport3D.assetData);
+      const text = isAsset
+        ? StlExporter.exportIndexedMeshToOBJ(viewport3D.assetData)
+        : StlExporter.exportToOBJ(reliefEngine);
       const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-      StlExporter.downloadBlob('jdpaint-relief.obj', blob);
-      statusMode.textContent = 'OBJ model exported successfully.';
+      StlExporter.downloadBlob(isAsset ? 'jdpaint-3d-asset.obj' : 'jdpaint-relief.obj', blob);
+      statusMode.textContent = `OBJ model exported (${isAsset ? 'with UVs & Normals' : 'Relief Surface'}).`;
     }, 20);
   }
 
-  ['menu-file-export-stl', 'btn-export-stl-tab'].forEach((id) => {
+  ['menu-file-export-glb', 'btn-export-glb-tab', 'btn-asset-export-glb'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('click', exportGLB);
+  });
+  ['menu-file-export-stl', 'btn-export-stl-tab', 'btn-asset-export-stl'].forEach((id) => {
     const el = document.getElementById(id);
     if (el) el.addEventListener('click', exportSTL);
   });
-  ['menu-file-export-obj', 'btn-export-obj-tab'].forEach((id) => {
+  ['menu-file-export-obj', 'btn-export-obj-tab', 'btn-asset-export-obj'].forEach((id) => {
     const el = document.getElementById(id);
     if (el) el.addEventListener('click', exportOBJ);
   });

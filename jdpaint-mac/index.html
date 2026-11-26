@@ -43,6 +43,7 @@
           <button id="menu-file-convert-3d"><span class="icon">🏔️</span>Convert Picture to High-Accuracy 3D Relief...</button>
           <hr>
           <button id="menu-file-export-gcode"><span class="icon">⚙️</span>Export CNC G-Code (.nc / .eng)<span class="accel">F9</span></button>
+          <button id="menu-file-export-glb"><span class="icon">🌐</span>Export 3D Asset (Binary GLB PBR)...</button>
           <button id="menu-file-export-stl"><span class="icon">🧊</span>Export 3D STL Mesh...</button>
           <button id="menu-file-export-obj"><span class="icon">📦</span>Export Wavefront OBJ Model...</button>
           <button id="menu-file-export-svg"><span class="icon">🎨</span>Export 2D Vectors (SVG)...</button>
@@ -246,6 +247,7 @@
         <button class="tb-btn btn-highlight" id="btn-rebuild-3d" title="Rebuild full 3D Relief from all visible 2D layers">🔄 Canvas → 3D</button>
         <button class="tb-btn" id="btn-extract-2d" title="Extract editable 2D vector contour layers from current 3D Relief">📐 3D → 2D</button>
         <button class="tb-btn btn-highlight" id="btn-one-click-auto" title="One-Click: Trace picture into 2D layers AND generate 3D relief!">✨ 1-Click (2D+3D)</button>
+        <button class="tb-btn btn-highlight-green" id="btn-img-to-asset" title="Image to Volumetric 3D Asset (Meshy Studio: Double-Sided / Inflated / Lathe + PBR + GLB Export)">🧊 Img → 3D Asset</button>
         <button class="tb-btn" id="btn-pic-to-relief" title="Convert loaded picture directly into High-Accuracy 3D heightmap">Pic → 3D</button>
         <span class="tb-sep"></span>
         <!-- Curve Editing Helpers -->
@@ -425,7 +427,28 @@
               <button class="vp-mini-btn" id="btn-recenter-3d" title="Reset Camera View">Reset View</button>
             </div>
           </div>
-          <div class="canvas-mount" id="three-canvas-wrapper">
+          <div class="canvas-mount" id="three-canvas-wrapper" style="position:relative;">
+            <!-- Meshy-style 3D Asset Statistics & Studio Shading HUD -->
+            <div class="three-stats-hud" id="hud-mesh-stats">
+              <span class="k">Topology</span><span class="v" id="stat-3d-topo">Triangle</span>
+              <span class="k">Faces</span><span class="v" id="stat-3d-faces">293,378</span>
+              <span class="k">Vertices</span><span class="v" id="stat-3d-verts">147,456</span>
+            </div>
+            <div class="three-studio-hud" id="three-studio-hud">
+              <button class="studio-pill-btn active" data-shade="standard" title="Standard PBR Photoreal Texture">Standard</button>
+              <button class="studio-pill-btn" data-shade="solid" title="Solid Clay Mode (Inspect Pure Geometry)">Solid</button>
+              <button class="studio-pill-btn" data-shade="unlit" title="Unlit Base Albedo Mode">Unlit</button>
+              <button class="studio-pill-btn" data-shade="lit" title="Dramatic Lit PBR Maps Mode">Lit</button>
+              <span class="studio-pill-sep"></span>
+              <button class="studio-pill-btn active" data-channel="pbr" title="Full Combined PBR Material">PBR</button>
+              <button class="studio-pill-btn" data-channel="baseColor" title="Inspect Base Color Map">Base</button>
+              <button class="studio-pill-btn" data-channel="normal" title="Inspect Tangent Normal Map">Normal</button>
+              <button class="studio-pill-btn" data-channel="roughness" title="Inspect Roughness Map">Rough</button>
+              <button class="studio-pill-btn" data-channel="metallic" title="Inspect Metallic Map">Metal</button>
+              <span class="studio-pill-sep"></span>
+              <button class="studio-pill-btn" id="btn-turntable-3d" title="Auto-Rotate 3D Asset Turntable">⟳ Spin</button>
+              <button class="studio-pill-btn accent" id="btn-back-relief" style="display:none;" title="Switch back to CNC 2.5D Relief Slab">◀ Relief</button>
+            </div>
             <!-- Three.js renderer mounts here -->
           </div>
         </div>
@@ -436,6 +459,7 @@
         <!-- Panel Tabs -->
         <div class="inspector-tabs">
           <button class="insp-tab active" data-tab="tab-layers" id="tab-btn-layers">Layers (<span id="layer-count-badge">0</span>)</button>
+          <button class="insp-tab" data-tab="tab-asset" id="tab-btn-asset">3D Asset</button>
           <button class="insp-tab" data-tab="tab-relief">3D Relief</button>
           <button class="insp-tab" data-tab="tab-cam">Machining</button>
           <button class="insp-tab" data-tab="tab-stats">NC Output</button>
@@ -810,6 +834,76 @@
           </div>
         </div>
 
+        <!-- Tab 1B: Volumetric 3D Asset Studio (Meshy-Style Image-to-3D Engine) -->
+        <div class="insp-tab-content" id="tab-asset">
+          <fieldset class="win-group">
+            <legend>Image-to-3D Asset Engine (Meshy Workflow)</legend>
+            <div class="row">
+              <label>3D Asset Mode:</label>
+              <select id="asset-mode-select" class="win-input">
+                <option value="double-sided" selected>Double-Sided 3D Asset</option>
+                <option value="inflated">Inflated Volumetric 3D</option>
+                <option value="lathe">360° Revolved Lathe 3D</option>
+                <option value="relief">CNC Bas-Relief Slab</option>
+              </select>
+            </div>
+            <div class="row">
+              <label>Mesh Topology Res:</label>
+              <select id="asset-res-select" class="win-input">
+                <option value="96">Standard (~18K faces)</option>
+                <option value="144" selected>High Detail (~41K faces)</option>
+                <option value="192">Ultra Detail (~73K faces)</option>
+              </select>
+            </div>
+            <div class="row">
+              <label>Thickness (Depth):</label>
+              <div class="unit-box">
+                <input type="number" id="asset-thickness" value="22" step="2" min="2" max="80">
+                <span>mm</span>
+              </div>
+            </div>
+            <div class="row">
+              <label>Cut Background Mask:</label>
+              <input type="checkbox" id="asset-remove-bg" checked>
+            </div>
+            <div class="row">
+              <label>De-Light &amp; PBR Maps:</label>
+              <input type="checkbox" id="asset-delight" checked>
+            </div>
+            <button class="win-push-btn primary" id="btn-generate-asset" style="width:100%;margin-top:6px;">🚀 Generate 3D Asset from Picture</button>
+          </fieldset>
+
+          <fieldset class="win-group">
+            <legend>Material Adjustment (Live PBR)</legend>
+            <div class="row">
+              <label>Roughness:</label>
+              <input type="range" id="asset-roughness" min="8" max="100" value="55" style="width:96px;">
+              <span id="lbl-asset-rough" style="width:30px;text-align:right;">0.55</span>
+            </div>
+            <div class="row">
+              <label>Metalness:</label>
+              <input type="range" id="asset-metalness" min="0" max="100" value="8" style="width:96px;">
+              <span id="lbl-asset-metal" style="width:30px;text-align:right;">0.08</span>
+            </div>
+            <div class="row">
+              <label>Normal Strength:</label>
+              <input type="range" id="asset-contrast" min="20" max="200" value="100" style="width:96px;">
+              <span id="lbl-asset-contrast" style="width:30px;text-align:right;">1.00</span>
+            </div>
+            <div class="row">
+              <label>Color Intensity:</label>
+              <input type="range" id="asset-intensity" min="50" max="150" value="100" style="width:96px;">
+              <span id="lbl-asset-intensity" style="width:30px;text-align:right;">1.00</span>
+            </div>
+          </fieldset>
+
+          <div class="action-btn-block">
+            <button class="win-push-btn primary" id="btn-asset-export-glb">🌐 Export Binary .GLB (PBR Texture)</button>
+            <button class="win-push-btn" id="btn-asset-export-stl">🧊 Export Watertight 3D .STL</button>
+            <button class="win-push-btn" id="btn-asset-export-obj">📦 Export Textured 3D .OBJ</button>
+          </div>
+        </div>
+
         <!-- Tab 3: Statistics & NC Output -->
         <div class="insp-tab-content" id="tab-stats">
           <fieldset class="win-group">
@@ -824,6 +918,7 @@
 
           <div class="action-btn-block">
             <button class="win-push-btn primary" id="btn-export-nc-tab">💾 Generate CNC G-Code File...</button>
+            <button class="win-push-btn primary" id="btn-export-glb-tab">🌐 Export 3D Asset (Binary GLB)...</button>
             <button class="win-push-btn" id="btn-export-stl-tab">🧊 Export 3D Binary STL...</button>
             <button class="win-push-btn" id="btn-export-obj-tab">📦 Export 3D Wavefront OBJ...</button>
             <button class="win-push-btn" id="btn-export-dxf-tab">📐 Export 2D CAD (DXF)...</button>

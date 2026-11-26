@@ -11,6 +11,10 @@ export class Viewport3D {
     this.renderer = null;
     this.mesh = null;
     this.baseSlab = null;
+    this.assetMesh = null;
+    this.assetData = null;
+    this.assetMaps = null;
+    this._assetTextures = {};
     this.gridHelper = null;
     this.axesHelper = null;
     this.geometry = null;
@@ -23,8 +27,13 @@ export class Viewport3D {
     this._simSegments = [];
 
     this.currentMaterialType = 'wood';
+    this.shadingMode = 'standard'; // 'standard' | 'solid' | 'unlit' | 'lit'
+    this.pbrChannel = 'pbr'; // 'pbr' | 'baseColor' | 'roughness' | 'metallic' | 'normal'
+    this.materialAdjust = { roughness: 0.55, metalness: 0.08, contrast: 1.0, intensity: 1.0 };
     this.wireframe = false;
     this.showToolpaths = true;
+    this.turntable = false;
+    this.onStatsChange = null;
 
     // Sculpting brush state
     this.activeSculptMode = null; // 'raise', 'lower', 'smooth', 'flatten' or null
@@ -557,9 +566,205 @@ export class Viewport3D {
 
   setWireframe(enabled) {
     this.wireframe = enabled;
-    if (this.mesh) {
+    if (this.mesh && this.mesh.material) {
       this.mesh.material.wireframe = enabled;
     }
+    if (this.assetMesh && this.assetMesh.material) {
+      this.assetMesh.material.wireframe = enabled;
+    }
+  }
+
+  _buildCanvasTextureFromRgba(rgba, size, isSRGB = false) {
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    const img = ctx.createImageData(size, size);
+    img.data.set(rgba);
+    ctx.putImageData(img, 0, 0);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = isSRGB ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.needsUpdate = true;
+    tex._sourceCanvas = canvas;
+    return tex;
+  }
+
+  _disposeAssetTextures() {
+    for (const k of Object.keys(this._assetTextures)) {
+      if (this._assetTextures[k] && typeof this._assetTextures[k].dispose === 'function') {
+        this._assetTextures[k].dispose();
+      }
+    }
+    this._assetTextures = {};
+  }
+
+  setAssetMesh(meshData, pbrMaps = null) {
+    if (!meshData || !meshData.positions) return;
+    this.assetData = meshData;
+    this.assetMaps = pbrMaps;
+    this._disposeAssetTextures();
+
+    if (this.assetMesh) {
+      this.scene.remove(this.assetMesh);
+      this.assetMesh.geometry.dispose();
+      this.assetMesh.material.dispose();
+      this.assetMesh = null;
+    }
+
+    if (pbrMaps && pbrMaps.size) {
+      this._assetTextures.baseColor = this._buildCanvasTextureFromRgba(pbrMaps.baseColor, pbrMaps.size, true);
+      this._assetTextures.normal = this._buildCanvasTextureFromRgba(pbrMaps.normal, pbrMaps.size, false);
+      this._assetTextures.roughness = this._buildCanvasTextureFromRgba(pbrMaps.roughness, pbrMaps.size, false);
+      this._assetTextures.metallic = this._buildCanvasTextureFromRgba(pbrMaps.metallic, pbrMaps.size, false);
+    }
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(meshData.positions, 3));
+    geom.setAttribute('normal', new THREE.BufferAttribute(meshData.normals, 3));
+    geom.setAttribute('uv', new THREE.BufferAttribute(meshData.uvs, 2));
+    geom.setIndex(new THREE.BufferAttribute(meshData.indices, 1));
+    geom.computeBoundingBox();
+
+    const mat = this._createAssetMaterial();
+    this.assetMesh = new THREE.Mesh(geom, mat);
+    this.assetMesh.castShadow = true;
+    this.assetMesh.receiveShadow = true;
+
+    // Lift asset cleanly above grid floor (Z >= 0) so both Front & Back rotate without slicing grid
+    const minZ = geom.boundingBox ? geom.boundingBox.min.z : 0;
+    if (minZ < 0) this.assetMesh.position.z = -minZ + 0.5;
+    this.scene.add(this.assetMesh);
+
+    if (this.mesh) this.mesh.visible = false;
+    if (this.baseSlab) this.baseSlab.visible = false;
+    this._emitStats();
+  }
+
+  clearAssetMesh() {
+    if (this.assetMesh) {
+      this.scene.remove(this.assetMesh);
+      this.assetMesh.geometry.dispose();
+      this.assetMesh.material.dispose();
+      this.assetMesh = null;
+    }
+    this.assetData = null;
+    this.assetMaps = null;
+    this._disposeAssetTextures();
+    if (this.mesh) this.mesh.visible = true;
+    if (this.baseSlab) this.baseSlab.visible = true;
+    this._emitStats();
+  }
+
+  _createAssetMaterial() {
+    const mode = this.shadingMode || 'standard';
+    const chan = this.pbrChannel || 'pbr';
+    const adj = this.materialAdjust || { roughness: 0.55, metalness: 0.08, contrast: 1.0, intensity: 1.0 };
+
+    if (chan !== 'pbr' && this._assetTextures[chan]) {
+      return new THREE.MeshBasicMaterial({
+        map: this._assetTextures[chan],
+        wireframe: this.wireframe,
+        side: THREE.DoubleSide,
+      });
+    }
+
+    if (mode === 'solid') {
+      return new THREE.MeshStandardMaterial({
+        color: 0xd1d5db,
+        roughness: Math.max(0.15, Math.min(0.95, adj.roughness)),
+        metalness: 0.04,
+        wireframe: this.wireframe,
+        side: THREE.DoubleSide,
+      });
+    }
+
+    if (mode === 'unlit') {
+      return new THREE.MeshBasicMaterial({
+        map: this._assetTextures.baseColor || null,
+        color: this._assetTextures.baseColor ? 0xffffff : 0xd6a472,
+        wireframe: this.wireframe,
+        side: THREE.DoubleSide,
+      });
+    }
+
+    const boost = Math.max(0.4, Math.min(1.6, adj.intensity || 1.0));
+    const mat = new THREE.MeshStandardMaterial({
+      map: this._assetTextures.baseColor || null,
+      normalMap: this._assetTextures.normal || null,
+      normalScale: new THREE.Vector2(0.85 * (adj.contrast || 1.0), 0.85 * (adj.contrast || 1.0)),
+      roughnessMap: mode === 'lit' ? this._assetTextures.roughness || null : null,
+      metalnessMap: mode === 'lit' ? this._assetTextures.metallic || null : null,
+      color: new THREE.Color(boost, boost, boost),
+      roughness: Math.max(0.08, Math.min(1.0, adj.roughness)),
+      metalness: Math.max(0.0, Math.min(1.0, adj.metalness)),
+      wireframe: this.wireframe,
+      side: THREE.DoubleSide,
+    });
+    return mat;
+  }
+
+  _refreshAssetMaterial() {
+    if (!this.assetMesh) return;
+    this.assetMesh.material.dispose();
+    this.assetMesh.material = this._createAssetMaterial();
+  }
+
+  setShadingMode(mode) {
+    this.shadingMode = mode || 'standard';
+    if (this.assetMesh) {
+      this._refreshAssetMaterial();
+    } else if (this.mesh) {
+      if (mode === 'solid') {
+        this.mesh.material.dispose();
+        this.mesh.material = new THREE.MeshStandardMaterial({
+          color: 0xd1d5db,
+          roughness: this.materialAdjust.roughness,
+          metalness: 0.04,
+          wireframe: this.wireframe,
+        });
+      } else if (mode === 'unlit') {
+        this.mesh.material.dispose();
+        this.mesh.material = new THREE.MeshBasicMaterial({
+          map: this.getProceduralTexture(this.currentMaterialType),
+          vertexColors: true,
+          wireframe: this.wireframe,
+        });
+      } else {
+        this.setMaterial(this.currentMaterialType);
+      }
+    }
+  }
+
+  setPbrChannel(channel) {
+    this.pbrChannel = channel || 'pbr';
+    this._refreshAssetMaterial();
+  }
+
+  setMaterialAdjustment(partial) {
+    this.materialAdjust = { ...this.materialAdjust, ...partial };
+    this._refreshAssetMaterial();
+  }
+
+  setTurntable(enabled) {
+    this.turntable = !!enabled;
+  }
+
+  getBaseColorPngCanvas() {
+    return this._assetTextures.baseColor?._sourceCanvas || null;
+  }
+
+  _emitStats() {
+    if (typeof this.onStatsChange !== 'function') return;
+    if (this.assetMesh && this.assetData?.stats) {
+      this.onStatsChange({ mode: 'asset', ...this.assetData.stats });
+      return;
+    }
+    const res = this.relief.resolution || 256;
+    const faces = (res - 1) * (res - 1) * 2;
+    const vertices = res * res;
+    this.onStatsChange({ mode: 'relief', topology: 'Triangle', faces, vertices });
   }
 
   renderToolpaths(toolpathSegments) {
@@ -661,6 +866,10 @@ export class Viewport3D {
 
   animate() {
     requestAnimationFrame(() => this.animate());
+    if (this.turntable && !this.isRotating) {
+      this.spherical.theta += 0.008;
+      this.updateCameraPosition();
+    }
     this.renderer.render(this.scene, this.camera);
   }
 }

@@ -207,6 +207,269 @@ export class StlExporter {
     return lines.join('\n');
   }
 
+  /**
+   * Export an arbitrary indexed 3D AssetBuffer ({ positions, indices }) directly to watertight Binary STL.
+   */
+  static exportIndexedMeshToBinarySTL(meshData) {
+    const pos = meshData.positions;
+    const idx = meshData.indices;
+    const numTriangles = Math.floor(idx.length / 3);
+    const buffer = new ArrayBuffer(84 + numTriangles * 50);
+    const view = new DataView(buffer);
+    const headerStr = 'JDPaint 3D Asset Studio Binary STL Export';
+    for (let i = 0; i < 80; i++) view.setUint8(i, i < headerStr.length ? headerStr.charCodeAt(i) : 0);
+    view.setUint32(80, numTriangles, true);
+
+    let offset = 84;
+    for (let t = 0; t < numTriangles; t++) {
+      const i0 = idx[t * 3] * 3;
+      const i1 = idx[t * 3 + 1] * 3;
+      const i2 = idx[t * 3 + 2] * 3;
+      offset = StlExporter.writeTriangle(
+        view,
+        offset,
+        pos[i0], pos[i0 + 1], pos[i0 + 2],
+        pos[i1], pos[i1 + 1], pos[i1 + 2],
+        pos[i2], pos[i2 + 1], pos[i2 + 2]
+      );
+    }
+    return new Blob([buffer], { type: 'application/octet-stream' });
+  }
+
+  /**
+   * Export an indexed 3D AssetBuffer ({ positions, normals, uvs, indices }) cleanly to Wavefront OBJ.
+   */
+  static exportIndexedMeshToOBJ(meshData) {
+    const pos = meshData.positions;
+    const norms = meshData.normals;
+    const uvs = meshData.uvs;
+    const idx = meshData.indices;
+    const vCount = pos.length / 3;
+    const lines = ['# JDPaint 3D Asset Studio Wavefront OBJ Exporter'];
+
+    for (let i = 0; i < vCount; i++) {
+      const k = i * 3;
+      lines.push(`v ${pos[k].toFixed(3)} ${pos[k + 1].toFixed(3)} ${pos[k + 2].toFixed(3)}`);
+    }
+    if (uvs) {
+      for (let i = 0; i < vCount; i++) {
+        const k = i * 2;
+        lines.push(`vt ${uvs[k].toFixed(4)} ${uvs[k + 1].toFixed(4)}`);
+      }
+    }
+    if (norms) {
+      for (let i = 0; i < vCount; i++) {
+        const k = i * 3;
+        lines.push(`vn ${norms[k].toFixed(4)} ${norms[k + 1].toFixed(4)} ${norms[k + 2].toFixed(4)}`);
+      }
+    }
+    const hasBoth = !!(uvs && norms);
+    for (let t = 0; t < idx.length; t += 3) {
+      const a = idx[t] + 1;
+      const b = idx[t + 1] + 1;
+      const c = idx[t + 2] + 1;
+      lines.push(hasBoth ? `f ${a}/${a}/${a} ${b}/${b}/${b} ${c}/${c}/${c}` : `f ${a} ${b} ${c}`);
+    }
+    return lines.join('\n');
+  }
+
+  /**
+   * Convert a regular ReliefEngine heightmap into indexed MeshData so Relief slabs also export to .GLB.
+   */
+  static reliefToMeshData(reliefEngine) {
+    const res = reliefEngine.resolution;
+    const w = reliefEngine.width;
+    const h = reliefEngine.height;
+    const dx = w / (res - 1);
+    const dy = h / (res - 1);
+    const vCount = res * res;
+    const pos = new Float32Array(vCount * 3);
+    const norms = new Float32Array(vCount * 3);
+    const uvs = new Float32Array(vCount * 2);
+    const indices = new Uint32Array((res - 1) * (res - 1) * 6);
+
+    for (let iy = 0; iy < res; iy++) {
+      for (let ix = 0; ix < res; ix++) {
+        const vi = iy * res + ix;
+        const x = ix * dx;
+        const cadY = iy * dy;
+        pos[vi * 3] = x;
+        pos[vi * 3 + 1] = h - cadY;
+        pos[vi * 3 + 2] = reliefEngine.getZAt(x, cadY);
+        uvs[vi * 2] = ix / (res - 1);
+        uvs[vi * 2 + 1] = 1.0 - iy / (res - 1);
+      }
+    }
+
+    let p = 0;
+    for (let iy = 0; iy < res - 1; iy++) {
+      for (let ix = 0; ix < res - 1; ix++) {
+        const v00 = iy * res + ix;
+        const v10 = v00 + 1;
+        const v01 = v00 + res;
+        const v11 = v01 + 1;
+        indices[p++] = v00; indices[p++] = v01; indices[p++] = v10;
+        indices[p++] = v10; indices[p++] = v01; indices[p++] = v11;
+      }
+    }
+
+    for (let i = 0; i < indices.length; i += 3) {
+      const i0 = indices[i] * 3, i1 = indices[i + 1] * 3, i2 = indices[i + 2] * 3;
+      const ax = pos[i1] - pos[i0], ay = pos[i1 + 1] - pos[i0 + 1], az = pos[i1 + 2] - pos[i0 + 2];
+      const bx = pos[i2] - pos[i0], by = pos[i2 + 1] - pos[i0 + 1], bz = pos[i2 + 2] - pos[i0 + 2];
+      const nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
+      norms[i0] += nx; norms[i0 + 1] += ny; norms[i0 + 2] += nz;
+      norms[i1] += nx; norms[i1 + 1] += ny; norms[i1 + 2] += nz;
+      norms[i2] += nx; norms[i2 + 1] += ny; norms[i2 + 2] += nz;
+    }
+    for (let i = 0; i < vCount; i++) {
+      const k = i * 3;
+      const l = Math.hypot(norms[k], norms[k + 1], norms[k + 2]) || 1;
+      norms[k] /= l; norms[k + 1] /= l; norms[k + 2] /= l;
+    }
+    return { positions: pos, normals: norms, uvs, indices };
+  }
+
+  /**
+   * Export 3D mesh (from ReliefEngine OR Asset3DEngine) + Base Color PNG texture into Binary glTF 2.0 (.glb).
+   */
+  static exportToGLB(meshData, options = {}) {
+    const {
+      baseColorPngBytes = null,
+      roughness = 0.55,
+      metalness = 0.08,
+      name = 'JDPaint3DAsset',
+    } = options;
+
+    const pos = meshData.positions;
+    const norms = meshData.normals;
+    const vCount = pos.length / 3;
+    const rawUvs = meshData.uvs;
+    const uvs = new Float32Array(rawUvs.length);
+    for (let i = 0; i < vCount; i++) {
+      uvs[i * 2] = rawUvs[i * 2];
+      uvs[i * 2 + 1] = 1.0 - rawUvs[i * 2 + 1]; // glTF 2.0 UV (0,0) is top-left of PNG
+    }
+    const idx = meshData.indices;
+
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (let i = 0; i < vCount; i++) {
+      const k = i * 3;
+      const x = pos[k], y = pos[k + 1], z = pos[k + 2];
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+
+    const pad4 = (n) => (n + 3) & ~3;
+    const chunks = [];
+    let byteCursor = 0;
+    const bufferViews = [];
+    const appendView = (typedOrBytes, target) => {
+      const u8 = typedOrBytes instanceof Uint8Array
+        ? typedOrBytes
+        : new Uint8Array(typedOrBytes.buffer, typedOrBytes.byteOffset, typedOrBytes.byteLength);
+      const bv = { buffer: 0, byteOffset: byteCursor, byteLength: u8.byteLength };
+      if (target) bv.target = target;
+      const bvIdx = bufferViews.length;
+      bufferViews.push(bv);
+      chunks.push(u8);
+      byteCursor += u8.byteLength;
+      const rem = (4 - (byteCursor & 3)) & 3;
+      if (rem > 0) {
+        chunks.push(new Uint8Array(rem));
+        byteCursor += rem;
+      }
+      return bvIdx;
+    };
+
+    const bvPos = appendView(pos, 34962);
+    const bvNorm = appendView(norms, 34962);
+    const bvUv = appendView(uvs, 34962);
+    const bvIdx = appendView(idx, 34963);
+
+    const materialDef = {
+      name: `${name}_Mat`,
+      pbrMetallicRoughness: {
+        metallicFactor: metalness,
+        roughnessFactor: roughness,
+      },
+      doubleSided: true,
+    };
+
+    const images = [];
+    const textures = [];
+    const samplers = [];
+    if (baseColorPngBytes && baseColorPngBytes.byteLength > 0) {
+      const bvTex = appendView(baseColorPngBytes, 0);
+      samplers.push({ magFilter: 9729, minFilter: 9987, wrapS: 33071, wrapT: 33071 });
+      images.push({ bufferView: bvTex, mimeType: 'image/png' });
+      textures.push({ sampler: 0, source: 0 });
+      materialDef.pbrMetallicRoughness.baseColorTexture = { index: 0 };
+    } else {
+      materialDef.pbrMetallicRoughness.baseColorFactor = [0.85, 0.72, 0.56, 1.0];
+    }
+
+    const gltf = {
+      asset: { version: '2.0', generator: 'JDPaint 3D Asset Studio' },
+      scene: 0,
+      scenes: [{ nodes: [0] }],
+      nodes: [{ mesh: 0, name }],
+      meshes: [{
+        name,
+        primitives: [{
+          attributes: { POSITION: 0, NORMAL: 1, TEXCOORD_0: 2 },
+          indices: 3,
+          material: 0,
+        }],
+      }],
+      materials: [materialDef],
+      accessors: [
+        { bufferView: bvPos, componentType: 5126, count: vCount, type: 'VEC3', min: [minX, minY, minZ], max: [maxX, maxY, maxZ] },
+        { bufferView: bvNorm, componentType: 5126, count: vCount, type: 'VEC3' },
+        { bufferView: bvUv, componentType: 5126, count: vCount, type: 'VEC2' },
+        { bufferView: bvIdx, componentType: 5125, count: idx.length, type: 'SCALAR' },
+      ],
+      bufferViews,
+      buffers: [{ byteLength: byteCursor }],
+    };
+    if (images.length > 0) {
+      gltf.samplers = samplers;
+      gltf.images = images;
+      gltf.textures = textures;
+    }
+
+    const jsonRaw = new TextEncoder().encode(JSON.stringify(gltf));
+    const jsonPaddedLen = pad4(jsonRaw.byteLength);
+    const totalLen = 12 + 8 + jsonPaddedLen + 8 + byteCursor;
+    const out = new Uint8Array(totalLen);
+    const dv = new DataView(out.buffer);
+
+    // GLB Header: magic "glTF" (0x46546C67), version 2, total length
+    dv.setUint32(0, 0x46546C67, true);
+    dv.setUint32(4, 2, true);
+    dv.setUint32(8, totalLen, true);
+
+    // Chunk 0: JSON
+    dv.setUint32(12, jsonPaddedLen, true);
+    dv.setUint32(16, 0x4E4F534A, true);
+    out.set(jsonRaw, 20);
+    for (let p = 20 + jsonRaw.byteLength; p < 20 + jsonPaddedLen; p++) out[p] = 0x20;
+
+    // Chunk 1: BIN
+    const binHeaderPos = 20 + jsonPaddedLen;
+    dv.setUint32(binHeaderPos, byteCursor, true);
+    dv.setUint32(binHeaderPos + 4, 0x004E4942, true);
+    let writePtr = binHeaderPos + 8;
+    for (const ch of chunks) {
+      out.set(ch, writePtr);
+      writePtr += ch.byteLength;
+    }
+
+    return new Blob([out], { type: 'model/gltf-binary' });
+  }
+
   static downloadBlob(filename, blob) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
