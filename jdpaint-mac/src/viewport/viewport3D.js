@@ -38,7 +38,7 @@ export class Viewport3D {
     this.isRotating = false;
     this.isPanning = false;
     this.prevMouse = { x: 0, y: 0 };
-    this.spherical = { radius: 180, theta: Math.PI / 4, phi: Math.PI / 3 };
+    this.spherical = { radius: 175, theta: Math.PI / 5, phi: Math.PI / 4.0 };
     this.target = new THREE.Vector3(50, 50, 0);
 
     this.init();
@@ -65,22 +65,25 @@ export class Viewport3D {
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.08;
+    this.renderer.toneMappingExposure = 1.12;
     this.container.appendChild(this.renderer.domElement);
 
-    // 3-Point Studio Raking Lighting to sculpt crisp CNC relief highlights & cavities
-    const hemiLight = new THREE.HemisphereLight(0xf1f5f9, 0x291c12, 0.58);
+    // 3-Point Studio Raking Lighting with 2048px soft shadows so every 3D petal/groove reads crisply!
+    const hemiLight = new THREE.HemisphereLight(0xf8fafc, 0x3a2a1d, 0.64);
     this.scene.add(hemiLight);
 
-    const dirLight1 = new THREE.DirectionalLight(0xfff5e4, 1.55);
+    const dirLight1 = new THREE.DirectionalLight(0xfff7ea, 1.82);
     dirLight1.position.set(140, -90, 125);
     dirLight1.castShadow = true;
-    dirLight1.shadow.bias = -0.0005;
+    dirLight1.shadow.mapSize.width = 2048;
+    dirLight1.shadow.mapSize.height = 2048;
+    dirLight1.shadow.bias = -0.00025;
+    dirLight1.shadow.normalBias = 0.035;
     this.scene.add(dirLight1);
     this.dirLight1 = dirLight1;
 
-    const dirLight2 = new THREE.DirectionalLight(0x93c5fd, 0.55);
-    dirLight2.position.set(-110, 150, 110);
+    const dirLight2 = new THREE.DirectionalLight(0xbfdbfe, 0.66);
+    dirLight2.position.set(-110, 150, 115);
     this.scene.add(dirLight2);
 
     const rimLight = new THREE.DirectionalLight(0xffffff, 0.35);
@@ -320,7 +323,7 @@ export class Viewport3D {
     const w = this.relief.width || 100;
     const h = this.relief.height || 100;
     this.target.set(w / 2, h / 2, (this.relief.maxDepth || 8) * 0.25);
-    this.spherical = { radius: Math.max(120, Math.max(w, h) * 1.65), theta: Math.PI / 6, phi: Math.PI / 3.1 };
+    this.spherical = { radius: Math.max(120, Math.max(w, h) * 1.62), theta: Math.PI / 5, phi: Math.PI / 4.0 };
     this.updateCameraPosition();
   }
 
@@ -396,13 +399,13 @@ export class Viewport3D {
           colors[pIdx * 3 + 1] = tmpColor.g;
           colors[pIdx * 3 + 2] = tmpColor.b;
         } else {
-          // Micro cavity Ambient Occlusion + ridge highlight so engraved grooves look sculptural!
+          // Soft cavity AO + gentle crest lift so sculpted 3D carvings stand out clearly without crushed blacks!
           let avgNbr = normZ;
           if (ix > 0 && ix < res - 1 && iy > 0 && iy < res - 1) {
             avgNbr = (data[idx - 1] + data[idx + 1] + data[idx - res] + data[idx + res]) * 0.25;
           }
           const cavity = Math.max(0, avgNbr - normZ);
-          const shade = Math.max(0.68, Math.min(1.08, 0.88 + normZ * 0.16 - cavity * 2.2));
+          const shade = Math.max(0.84, Math.min(1.10, 0.94 + normZ * 0.14 - cavity * 0.85));
           colors[pIdx * 3] = shade;
           colors[pIdx * 3 + 1] = shade;
           colors[pIdx * 3 + 2] = shade;
@@ -418,11 +421,11 @@ export class Viewport3D {
   }
 
   getBaseTint(type) {
-    if (type === 'wood') return 0x9c5a2d;
-    if (type === 'oak') return 0xd4a36a;
+    if (type === 'wood') return 0xd6a472;
+    if (type === 'oak') return 0xe8c496;
     if (type === 'jade') return 0x269b61;
     if (type === 'brass') return 0xdfb945;
-    if (type === 'stone') return 0x475569;
+    if (type === 'stone') return 0x64748b;
     return 0x64748b;
   }
 
@@ -446,18 +449,19 @@ export class Viewport3D {
         let r = 210, g = 210, b = 210;
 
         if (type === 'wood' || type === 'oak') {
-          const grainFreq = type === 'wood' ? 18 : 14;
-          const wave = Math.sin(v * Math.PI * 2 * grainFreq + Math.sin(u * Math.PI * 4) * 1.4 + Math.cos(u * Math.PI * 10) * 0.35);
-          const fine = Math.sin(v * Math.PI * 64 + u * 8) * 0.12;
-          const t = 0.5 + 0.38 * wave + fine;
+          // Subtle satin grain so real 3D carved geometry & shadows always read clearly without zebra striping!
+          const grainFreq = type === 'wood' ? 12 : 10;
+          const wave = Math.sin(v * Math.PI * 2 * grainFreq + Math.sin(u * Math.PI * 4) * 1.1) * 0.45;
+          const fine = Math.sin(v * Math.PI * 24 + u * 5) * 0.08;
+          const t = 0.5 + 0.25 * wave + fine;
           if (type === 'wood') {
-            r = Math.round(115 + t * 95);
-            g = Math.round(62 + t * 55);
-            b = Math.round(30 + t * 28);
+            r = Math.round(176 + t * 34);
+            g = Math.round(122 + t * 26);
+            b = Math.round(78 + t * 18);
           } else {
-            r = Math.round(170 + t * 70);
-            g = Math.round(126 + t * 58);
-            b = Math.round(74 + t * 38);
+            r = Math.round(202 + t * 28);
+            g = Math.round(168 + t * 24);
+            b = Math.round(122 + t * 18);
           }
         } else if (type === 'jade') {
           const swirl = Math.sin(u * 9 + Math.cos(v * 7) * 2) * Math.cos(v * 6 - u * 4);

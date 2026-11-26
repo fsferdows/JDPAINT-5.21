@@ -447,6 +447,62 @@ export class ImageVectorizer {
   }
 
   /**
+   * Step-by-step asynchronous trace for responsive browser UI with live phase updates.
+   * Stages: 1=Prepare ROI, 2=Separate Relief/Color Channels, 3=Extract Contours & Holes,
+   * 4=Fit CAD Lines & Smooth Beziers, 5=Finalize Layered Entities.
+   */
+  static async traceImageToVectorsAsync(img, widthMm = 100, heightMm = 100, options = {}, onProgress = null) {
+    const yieldFrame = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const report = async (step, total, label) => {
+      if (typeof onProgress === 'function') onProgress({ step, total, label });
+      await yieldFrame();
+    };
+
+    await report(1, 5, 'Step 1/5: Preparing high-res buffer & isolating furniture design ROI...');
+    const iw = img.naturalWidth || img.width || 1;
+    const ih = img.naturalHeight || img.height || 1;
+    const maxDimension = (typeof options === 'object' && options.maxDimension) || 960;
+
+    let scaleW = maxDimension;
+    let scaleH = Math.round((ih / iw) * maxDimension);
+    if (scaleH > maxDimension) {
+      scaleH = maxDimension;
+      scaleW = Math.round((iw / ih) * maxDimension);
+    }
+    scaleW = Math.max(120, Math.min(1024, scaleW));
+    scaleH = Math.max(120, Math.min(1024, scaleH));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = scaleW;
+    canvas.height = scaleH;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.imageSmoothingQuality = 'high';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, scaleW, scaleH);
+    ctx.drawImage(img, 0, 0, scaleW, scaleH);
+
+    const pixels = ctx.getImageData(0, 0, scaleW, scaleH).data;
+    const bounds = ImageVectorizer.getImageFitBounds(img, widthMm, heightMm);
+
+    await report(2, 5, 'Step 2/5: Denoising wood grain & separating raised/recessed channels...');
+    const vectors = ImageVectorizer.traceFromImageData(pixels, scaleW, scaleH, bounds, options);
+
+    await report(3, 5, 'Step 3/5: Nesting holes & pruning background noise...');
+    await report(4, 5, 'Step 4/5: Fitting smooth Cubic Beziers & straight CAD frames...');
+
+    // Sort clean architectural layout order: larger borders/grooves before interior sculpted petals
+    const sorted = [...vectors].sort((a, b) => {
+      const la = a.toneLevel || 1;
+      const lb = b.toneLevel || 1;
+      if (la !== lb) return la - lb;
+      return (b.points?.length || 0) - (a.points?.length || 0);
+    });
+
+    await report(5, 5, `Step 5/5: Finalized ${sorted.length} customizable vector layer(s)!`);
+    return sorted;
+  }
+
+  /**
    * Pure-JS Illustrator Image Trace from raw RGBA buffer (runs seamlessly in browser AND Node.js tests!).
    */
   static traceFromImageData(pixels, scaleW, scaleH, bounds, options = {}) {
@@ -527,9 +583,9 @@ export class ImageVectorizer {
     const scaleRatio = Math.max(1.0, Math.min(2.4, Math.max(scaleW, scaleH) / 420.0));
     const pxPerMm = Math.max(scaleW / Math.max(1, bounds.w), scaleH / Math.max(1, bounds.h));
 
-    // Smooth edge-preserving Guided Denoise
-    const filterRadius = Math.max(1, Math.round((1.15 - detailFactor) * 3.5));
-    const denoisedLuma = ImageVectorizer.guidedFilter(lumaRaw, scaleW, scaleH, filterRadius, effectiveMode === 'bw-logo' ? 85 : 185);
+    // Smooth edge-preserving Guided Denoise (radius=1 at normal/high detail to keep tight petals crisp!)
+    const filterRadius = detailFactor >= 0.45 ? 1 : 2;
+    const denoisedLuma = ImageVectorizer.guidedFilter(lumaRaw, scaleW, scaleH, filterRadius, effectiveMode === 'bw-logo' ? 85 : 145);
 
     const commonFitOpts = {
       detailFactor,
@@ -992,15 +1048,15 @@ export class ImageVectorizer {
       for (let y = h - 1; y > midY; y--) { if (smoothRow[y] >= 0.30) { ry1 = y; break; } }
     }
 
-    // Inset ONLY on sides that had detected exterior walls/margins so outer door frame edge doesn't fire
+    // Inset minimally ONLY on sides that had detected exterior walls/margins so outer door rails stay intact!
     const hasLeftBg = rx0 > Math.max(4, w * 0.03);
     const hasRightBg = rx1 < w - Math.max(5, w * 0.03);
     const hasTopBg = ry0 > Math.max(4, h * 0.03);
     const hasBottomBg = ry1 < h - Math.max(5, h * 0.03);
-    const edgeGuardX = Math.max(6, Math.round(w * 0.025));
-    const edgeGuardY = Math.max(6, Math.round(h * 0.025));
-    const insetX = Math.max(7, Math.round((rx1 - rx0) * 0.045));
-    const insetY = Math.max(7, Math.round((ry1 - ry0) * 0.042));
+    const edgeGuardX = Math.max(4, Math.round(w * 0.010));
+    const edgeGuardY = Math.max(4, Math.round(h * 0.010));
+    const insetX = Math.max(4, Math.round((rx1 - rx0) * 0.014));
+    const insetY = Math.max(4, Math.round((ry1 - ry0) * 0.014));
 
     const ix0 = hasLeftBg ? Math.min(rx1 - 10, rx0 + insetX) : edgeGuardX;
     const ix1 = hasRightBg ? Math.max(ix0 + 10, rx1 - insetX) : w - 1 - edgeGuardX;
@@ -1111,10 +1167,11 @@ export class ImageVectorizer {
     const n = w * h;
     const roi = ImageVectorizer.detectFurnitureROI(rArr, gArr, bArr, lumaRaw, w, h);
 
-    // 1. Suppress exterior background & non-wood colorful/neutral overlay watermarks
-    const roiMask = new Uint8Array(n);
+    // 1. Suppress exterior background & non-wood colorful/neutral overlay watermarks + inpaint before morphology
+    const rawRoiMask = new Uint8Array(n);
     const chromaMask = new Float32Array(n);
     const watermarkTol = roi.chromaMed > 14 ? 15 : 22;
+    let suppressedCount = 0;
     for (let y = roi.y0; y <= roi.y1; y++) {
       const row = y * w;
       for (let x = roi.x0; x <= roi.x1; x++) {
@@ -1124,26 +1181,43 @@ export class ImageVectorizer {
         const isNeutralOverlay = roi.chromaMed > 14 && roi.L[i] > 84 && rgbSat < 18;
         if (isNeutralOverlay || (dc > watermarkTol && (roi.L[i] > roi.lMed + 8 || dc > 23))) {
           chromaMask[i] = (isNeutralOverlay || dc > watermarkTol + 4) ? 0 : Math.max(0, 1.0 - (dc - watermarkTol) / 4.0);
-          roiMask[i] = chromaMask[i] > 0.25 ? 1 : 0;
+          rawRoiMask[i] = chromaMask[i] > 0.25 ? 1 : 0;
+          if (!rawRoiMask[i]) suppressedCount++;
         } else {
-          roiMask[i] = 1;
+          rawRoiMask[i] = 1;
           chromaMask[i] = 1.0;
+        }
+      }
+    }
+    // 2px dilation around watermark patches so anti-aliased edges never trace false rectangular rings
+    const roiMask = new Uint8Array(rawRoiMask);
+    if (suppressedCount > 0) {
+      for (let y = roi.y0 + 2; y <= roi.y1 - 2; y++) {
+        const row = y * w;
+        for (let x = roi.x0 + 2; x <= roi.x1 - 2; x++) {
+          const i = row + x;
+          if (!rawRoiMask[i]) continue;
+          if (!rawRoiMask[i - 1] || !rawRoiMask[i + 1] || !rawRoiMask[i - w] || !rawRoiMask[i + w]
+            || !rawRoiMask[i - 2] || !rawRoiMask[i + 2] || !rawRoiMask[i - 2 * w] || !rawRoiMask[i + 2 * w]) {
+            roiMask[i] = 0;
+            chromaMask[i] = 0;
+          }
         }
       }
     }
 
     const sx = opts.bounds.w / w;
     const sy = opts.bounds.h / h;
-    const roiMaxSpanW = roi.w * sx * 0.88;
-    const roiMaxSpanH = roi.h * sy * 0.88;
-    const roiEdgeLeftMm = opts.bounds.x + (roi.x0 + 12) * sx;
-    const roiEdgeRightMm = opts.bounds.x + (roi.x1 - 12) * sx;
-    const roiEdgeTopMm = opts.bounds.y + (roi.y0 + 16) * sy;
-    const roiEdgeBotMm = opts.bounds.y + (roi.y1 - 16) * sy;
-    const minWoodSpanMm = Math.max(opts.minSpanMm || 0.9, 1.1);
-    const minFeatureAreaPx = Math.max(opts.minAreaPx || 12, Math.round(roi.w * roi.h * 0.00024));
+    const roiMaxSpanW = roi.w * sx * 0.94;
+    const roiMaxSpanH = roi.h * sy * 0.94;
+    const roiEdgeLeftMm = opts.bounds.x + (roi.x0 + 4) * sx;
+    const roiEdgeRightMm = opts.bounds.x + (roi.x1 - 4) * sx;
+    const roiEdgeTopMm = opts.bounds.y + (roi.y0 + 4) * sy;
+    const roiEdgeBotMm = opts.bounds.y + (roi.y1 - 4) * sy;
+    const minWoodSpanMm = Math.max(opts.minSpanMm || 0.9, 1.15);
+    const minFeatureAreaPx = Math.max(opts.minAreaPx || 14, Math.round(roi.w * roi.h * 0.00032));
 
-    const filterWoodEnts = (ents) => ents.filter((ent) => {
+    const filterWoodEnts = (ents, { filterGrainStreaks = false } = {}) => ents.filter((ent) => {
       let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
       for (const p of ent.points) {
         if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
@@ -1151,17 +1225,31 @@ export class ImageVectorizer {
       }
       const ew = maxX - minX, eh = maxY - minY;
       if (ew > roiMaxSpanW && eh > roiMaxSpanH) return false;
-      if ((minX <= roiEdgeLeftMm || maxX >= roiEdgeRightMm) && ew < roi.w * sx * 0.08 && eh > roi.h * sy * 0.25) return false;
-      if ((minY <= roiEdgeTopMm || maxY >= roiEdgeBotMm) && eh < roi.h * sy * 0.07 && ew > roi.w * sx * 0.25) return false;
-      const isBorderMarginSliver =
-        minX <= roiEdgeLeftMm || maxX >= roiEdgeRightMm || minY <= roiEdgeTopMm || maxY >= roiEdgeBotMm;
-      if (isBorderMarginSliver && ew * eh < roi.w * sx * roi.h * sy * 0.0022 && (!ent.holes || ent.holes.length === 0)) return false;
+      if ((minX <= roiEdgeLeftMm || maxX >= roiEdgeRightMm) && ew < roi.w * sx * 0.04 && eh > roi.h * sy * 0.35) return false;
+      if ((minY <= roiEdgeTopMm || maxY >= roiEdgeBotMm) && eh < roi.h * sy * 0.04 && ew > roi.w * sx * 0.35) return false;
+      if (filterGrainStreaks && ew >= eh * 3.8 && eh < roi.h * sy * 0.045 && (minX <= opts.bounds.x + 20 * sx || maxX >= opts.bounds.x + (w - 20) * sx)) return false;
+      if (filterGrainStreaks && (minX <= opts.bounds.x + (roi.x0 + 48) * sx || maxX >= opts.bounds.x + (roi.x1 - 48) * sx) && ew * eh < opts.bounds.w * opts.bounds.h * 0.0025 && (!ent.holes || ent.holes.length === 0)) return false;
+      const isOuterSpeck = (minX <= opts.bounds.x + (roi.x0 + 18) * sx || maxX >= opts.bounds.x + (roi.x1 - 18) * sx || minY <= opts.bounds.y + (roi.y0 + 18) * sy || maxY >= opts.bounds.y + (roi.y1 - 18) * sy)
+        && ew * eh < roi.w * sx * roi.h * sy * 0.0022 && (!ent.holes || ent.holes.length === 0);
+      if (isOuterSpeck) return false;
       return true;
     });
 
-    // 2. Clean 2px wood/bamboo grain suppression via Guided Filter
-    const smoothLuma = ImageVectorizer.guidedFilter(denoisedLuma, w, h, 2, 130);
-    const innerPad = 5;
+    // 2. Replace watermark cutouts with neutral local panel tone BEFORE morphology, then crisp radius-1 denoise
+    let preMorphLuma = denoisedLuma;
+    if (suppressedCount > 0) {
+      const inpaintMean = ImageVectorizer.maskedBoxMean(denoisedLuma, roiMask, w, h, Math.max(8, Math.round(roi.w * 0.032)));
+      preMorphLuma = new Float32Array(denoisedLuma);
+      for (let y = roi.y0; y <= roi.y1; y++) {
+        const row = y * w;
+        for (let x = roi.x0; x <= roi.x1; x++) {
+          const i = row + x;
+          if (!roiMask[i]) preMorphLuma[i] = inpaintMean[i];
+        }
+      }
+    }
+    const smoothLuma = ImageVectorizer.guidedFilter(preMorphLuma, w, h, 1, 75);
+    const innerPad = 4;
     const xMin = Math.max(1, roi.x0 + innerPad), xMax = Math.min(w - 2, roi.x1 - innerPad);
     const yMin = Math.max(1, roi.y0 + innerPad), yMax = Math.min(h - 2, roi.y1 - innerPad);
 
@@ -1212,7 +1300,7 @@ export class ImageVectorizer {
         }
       }
       const dOtsu = dCnt > 40 ? ImageVectorizer.computeOtsuStats(diffHist, dCnt) : { threshold: 38 };
-      const dTh = Math.max(32, Math.min(78, dOtsu.threshold * 0.92));
+      const dTh = Math.max(38, Math.min(82, dOtsu.threshold * 1.04));
       const engMask = new Uint8Array(n);
       const engScalar = new Float32Array(n);
       for (let i = 0; i < n; i++) {
@@ -1225,7 +1313,7 @@ export class ImageVectorizer {
       const engEnts = filterWoodEnts(ImageVectorizer.vectorizeMaskLoops(eLoops, diffField, w, h, -1, {
         ...opts,
         refineEdges: false,
-        minAreaPx: Math.max(5, Math.round(roi.w * roi.h * 0.000045)),
+        minAreaPx: Math.max(8, Math.round(roi.w * roi.h * 0.000065)),
         minSpanMm: Math.max(0.45, (opts.minSpanMm || 0.9) * 0.55),
         fillColor: '#fbbf24',
         strokeColor: '#38bdf8',
@@ -1236,7 +1324,7 @@ export class ImageVectorizer {
         mode: 'max',
         adaptiveRadius: false,
         rejectFullFrame: false,
-      }));
+      }), { filterGrainStreaks: true });
       engEnts.forEach((e) => { if (e.relief) e.relief.radiusMm = 1.6; });
       if (engEnts.length >= 2) return engEnts.slice(0, opts.maxContours);
     }
@@ -1331,25 +1419,40 @@ export class ImageVectorizer {
     const rTh = opts.threshold > 0 ? Math.max(10, opts.threshold * 145) : Math.max(14, Math.min(54, rOtsu * 0.62 + detailAdj));
     const gTh = opts.threshold > 0 ? Math.max(10, opts.threshold * 145) : Math.max(14, Math.min(54, gOtsu * 0.62 + detailAdj));
 
+    // Gently smooth scalar channels once before marching contours (eliminates pixel staircases while keeping dark V-crevice separations crisp!)
+    const smoothRaised = ImageVectorizer.gaussianBlur3x3(cleanRaised, w, h);
+    const smoothGroove = ImageVectorizer.gaussianBlur3x3(cleanGroove, w, h);
+
     const raisedMask = new Uint8Array(n);
     const raisedScalar = new Float32Array(n);
     const grooveMask = new Uint8Array(n);
     const grooveScalar = new Float32Array(n);
 
     for (let i = 0; i < n; i++) {
-      const isCreviceCut = cleanGroove[i] >= gTh * 0.72 && cleanGroove[i] > cleanRaised[i] * 0.88;
-      const rSolid = roiMask[i] && cleanRaised[i] >= rTh && !isCreviceCut;
+      const isCreviceCut = cleanGroove[i] >= gTh * 0.78 && cleanGroove[i] > cleanRaised[i] * 0.90;
+      const rVal = isCreviceCut ? 0 : smoothRaised[i];
+      const rSolid = roiMask[i] && rVal >= rTh && !isCreviceCut;
       raisedMask[i] = rSolid ? 1 : 0;
-      raisedScalar[i] = isCreviceCut ? 12 : -cleanRaised[i];
+      raisedScalar[i] = isCreviceCut ? 12 : -rVal;
 
-      const gSolid = roiMask[i] && cleanGroove[i] >= gTh && cleanGroove[i] >= cleanRaised[i] * 0.94;
+      const gSolid = roiMask[i] && smoothGroove[i] >= gTh && smoothGroove[i] >= smoothRaised[i] * 0.92;
       grooveMask[i] = gSolid ? 1 : 0;
-      grooveScalar[i] = -cleanGroove[i];
+      grooveScalar[i] = -smoothGroove[i];
     }
 
+    // Prune isolated single-pixel wood grain nibs while filling 1px pinholes
     const cleanR = ImageVectorizer.morphClose(raisedMask, w, h, 0);
+    for (let y = yMin; y < yMax; y++) {
+      const row = y * w;
+      for (let x = xMin; x < xMax; x++) {
+        const i = row + x;
+        if (!cleanR[i]) continue;
+        const n4 = cleanR[i - 1] + cleanR[i + 1] + cleanR[i - w] + cleanR[i + w];
+        if (n4 <= 1) cleanR[i] = 0;
+      }
+    }
     const rLoops = ImageVectorizer.marchSquares(cleanR, w, h, raisedScalar, -rTh);
-    const raisedEnts = filterWoodEnts(ImageVectorizer.vectorizeMaskLoops(rLoops, cleanRaised, w, h, -1, {
+    const raisedEnts = filterWoodEnts(ImageVectorizer.vectorizeMaskLoops(rLoops, smoothRaised, w, h, -1, {
       ...opts,
       refineEdges: false,
       minAreaPx: minFeatureAreaPx,
@@ -1375,7 +1478,7 @@ export class ImageVectorizer {
       const row = y * w;
       for (let x = xMin; x <= xMax; x++) {
         const i = row + x;
-        if (!bridgedG[i] && roiMask[i] && cleanRaised[i] < rTh * 0.72 && cleanGroove[i] >= gTh * 0.36) {
+        if (!bridgedG[i] && roiMask[i] && smoothRaised[i] < rTh * 0.72 && smoothGroove[i] >= gTh * 0.36) {
           const hGap = (grooveMask[i - 1] && grooveMask[i + 1]) || (x > 2 && x < w - 3 && grooveMask[i - 2] && grooveMask[i + 2]);
           const vGap = (grooveMask[i - w] && grooveMask[i + w]) || (y > 2 && y < h - 3 && grooveMask[i - 2 * w] && grooveMask[i + 2 * w]);
           if (hGap || vGap) bridgedG[i] = 1;
@@ -1399,7 +1502,7 @@ export class ImageVectorizer {
     }
     const cleanG = ImageVectorizer.morphClose(bridgedG, w, h, 0);
     const gLoops = ImageVectorizer.marchSquares(cleanG, w, h, grooveScalar, -gTh);
-    const grooveEnts = filterWoodEnts(ImageVectorizer.vectorizeMaskLoops(gLoops, cleanGroove, w, h, -1, {
+    const grooveEnts = filterWoodEnts(ImageVectorizer.vectorizeMaskLoops(gLoops, smoothGroove, w, h, -1, {
       ...opts,
       refineEdges: false,
       minAreaPx: Math.max(8, Math.round(minFeatureAreaPx * 0.65)),
@@ -2106,11 +2209,11 @@ export class ImageVectorizer {
     if (circleAnchors) return circleAnchors;
 
     const n = workLoop.length;
-    // Periodic 1-pass Taubin-cleaned probe loop so Marching Squares stairsteps never trigger fake corners!
+    // Periodic 3-pass Taubin-cleaned probe loop so Marching Squares / grain stairsteps never trigger fake corners!
     let probeLoop = workLoop;
-    if (n >= 8) {
+    if (n >= 10) {
       const wrap = workLoop.concat([workLoop[0], workLoop[1]]);
-      const sm = ImageVectorizer.taubinSmoothOpen(wrap, 1);
+      const sm = ImageVectorizer.taubinSmoothOpen(wrap, 3);
       probeLoop = sm.slice(0, n);
     }
 
@@ -2123,10 +2226,10 @@ export class ImageVectorizer {
     const perimeter = s[n];
     if (perimeter < 4.0) return null;
 
-    // Sharp corner probe chord (large enough to ignore pixel grid, small enough to keep star/letter tips!)
-    const wChord = perimeter >= 20
-      ? Math.max(3.0, Math.min(perimeter * 0.065, 2.5 * scaleRatio))
-      : Math.max(1.8, perimeter * 0.12);
+    // Sharp corner probe chord (large enough to ignore pixel grid & wood ripples, sharp on genuine geometric tips)
+    const wChord = perimeter >= 24
+      ? Math.max(4.2, Math.min(perimeter * 0.075, 3.6 * scaleRatio))
+      : Math.max(2.0, perimeter * 0.14);
     const sampleArc = (loopArr, uTarget) => {
       const u = ((uTarget % perimeter) + perimeter) % perimeter;
       let lo = 0, hi = n;
@@ -2140,7 +2243,7 @@ export class ImageVectorizer {
       return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
     };
 
-    const minCornerRad = Math.max(0.55, 1.18 - (opts.corners || 0.6) * 0.50);
+    const minCornerRad = Math.max(0.72, 1.32 - (opts.corners || 0.65) * 0.56);
     const turns = new Float32Array(n);
     const cand = [];
     for (let i = 0; i < n; i++) {
@@ -2157,9 +2260,9 @@ export class ImageVectorizer {
       const ang = turns[i];
       if (ang < minCornerRad) continue;
       // Distinguish genuine sharp vertex from uniform curved arc via local curvature prominence!
-      const stepIdx = Math.max(1, Math.round((wChord * 1.15) / Math.max(0.5, perimeter / n)));
+      const stepIdx = Math.max(1, Math.round((wChord * 1.2) / Math.max(0.5, perimeter / n)));
       const avgNb = 0.5 * (turns[(i - stepIdx + n) % n] + turns[(i + stepIdx) % n]);
-      if (ang >= 1.12 || ang - avgNb >= 0.28) {
+      if (ang >= 1.26 || ang - avgNb >= 0.36) {
         cand.push(i);
       }
     }
@@ -2170,7 +2273,7 @@ export class ImageVectorizer {
       let ok = true;
       for (const kept of cornerIdx) {
         const d = Math.abs(s[idx] - s[kept]);
-        if (Math.min(d, perimeter - d) < wChord * 0.72) { ok = false; break; }
+        if (Math.min(d, perimeter - d) < wChord * 0.85) { ok = false; break; }
       }
       if (ok) cornerIdx.push(idx);
     }
@@ -2194,10 +2297,10 @@ export class ImageVectorizer {
 
       const smoothed = ImageVectorizer.taubinSmoothOpen(
         workLoop.slice(splitPair[0]).concat(workLoop.slice(0, splitPair[0] + 1)),
-        3
+        4
       );
       const midInSmoothed = (splitPair[1] - splitPair[0]);
-      const errSq = Math.pow(Math.max(0.32, (1.08 - opts.detailFactor) * 0.95 * scaleRatio), 2);
+      const errSq = Math.pow(Math.max(0.52, (1.12 - opts.detailFactor) * 1.45 * scaleRatio), 2);
 
       const fitHalf = (subPts) => {
         const len = subPts.length;
@@ -2230,13 +2333,13 @@ export class ImageVectorizer {
       rawSpans.push(spanPts);
     }
 
-    const lineTol = Math.max(0.55, (1.08 - opts.detailFactor) * 0.85 + 0.35 * scaleRatio);
-    const guardArc = Math.min(2.2, wChord * 0.45);
+    const lineTol = Math.max(0.36, (1.02 - opts.detailFactor) * 0.52 * scaleRatio);
+    const guardArc = Math.min(2.0, wChord * 0.40);
     const snapAxisLine = (tls, Ls) => {
-      if (!tls || Ls < 14) return tls;
+      if (!tls || Ls < 12) return tls;
       const [dx, dy] = tls.d;
-      if (Math.abs(dy) < 0.025) return { c: tls.c, d: [dx >= 0 ? 1 : -1, 0], dev: tls.dev };
-      if (Math.abs(dx) < 0.025) return { c: tls.c, d: [0, dy >= 0 ? 1 : -1], dev: tls.dev };
+      if (Math.abs(dy) < 0.032) return { c: tls.c, d: [dx >= 0 ? 1 : -1, 0], dev: tls.dev };
+      if (Math.abs(dx) < 0.032) return { c: tls.c, d: [0, dy >= 0 ? 1 : -1], dev: tls.dev };
       return tls;
     };
 
@@ -2249,32 +2352,34 @@ export class ImageVectorizer {
       const mid = [];
       for (let i = 0; i < q; i++) if (sl[i] >= guardArc && sl[i] <= Ls - guardArc) mid.push(P[i]);
 
-      if (Ls < guardArc * 2.2 || mid.length < 3) {
-        info.isLine = true;
-        const d = Math.hypot(P[q - 1][0] - P[0][0], P[q - 1][1] - P[0][1]) || 1;
-        info.A = info.B = snapAxisLine({ c: P[0], d: [(P[q - 1][0] - P[0][0]) / d, (P[q - 1][1] - P[0][1]) / d], dev: 0 }, Ls);
-        return info;
-      }
-
-      const tlsAll = ImageVectorizer.fitLineTLS(mid);
-      const straightLim = Ls >= 16 ? Math.min(2.7, Math.max(lineTol * 1.45, Ls * 0.042)) : lineTol;
+      // Only classify as straight CAD line if ALL points genuinely adhere to a straight line (never force curved short arcs!)
+      const lineSrc = mid.length >= 3 ? mid : P;
+      const tlsAll = q >= 3 ? ImageVectorizer.fitLineTLS(lineSrc) : null;
+      const straightLim = Ls >= 14 ? Math.min(1.08, Math.max(lineTol * 1.15, Ls * 0.018)) : lineTol * 0.92;
       if (tlsAll && tlsAll.dev <= straightLim) {
         let maxAll = 0;
         for (const p of P) {
           maxAll = Math.max(maxAll, Math.abs(-(p[0] - tlsAll.c[0]) * tlsAll.d[1] + (p[1] - tlsAll.c[1]) * tlsAll.d[0]));
         }
-        if (maxAll <= straightLim * 1.45) {
+        if (maxAll <= straightLim * 1.4) {
           info.isLine = true;
           info.A = info.B = snapAxisLine(tlsAll, Ls);
           return info;
         }
       }
 
-      const tanLen = Math.min(wChord * 2.4, Ls * 0.42);
+      if (q <= 2 || Ls < 2.2) {
+        info.isLine = true;
+        const d = Math.hypot(P[q - 1][0] - P[0][0], P[q - 1][1] - P[0][1]) || 1;
+        info.A = info.B = snapAxisLine({ c: P[0], d: [(P[q - 1][0] - P[0][0]) / d, (P[q - 1][1] - P[0][1]) / d], dev: 0 }, Ls);
+        return info;
+      }
+
+      const tanLen = Math.min(wChord * 2.2, Ls * 0.44);
       const startSeg = [], endSeg = [];
       for (let i = 0; i < q; i++) {
-        if (sl[i] >= guardArc * 0.4 && sl[i] <= guardArc * 0.4 + tanLen) startSeg.push(P[i]);
-        if (sl[i] <= Ls - guardArc * 0.4 && sl[i] >= Ls - guardArc * 0.4 - tanLen) endSeg.push(P[i]);
+        if (sl[i] >= guardArc * 0.3 && sl[i] <= guardArc * 0.3 + tanLen) startSeg.push(P[i]);
+        if (sl[i] <= Ls - guardArc * 0.3 && sl[i] >= Ls - guardArc * 0.3 - tanLen) endSeg.push(P[i]);
       }
       if (startSeg.length >= 3) info.A = ImageVectorizer.fitLineTLS(startSeg);
       if (endSeg.length >= 3) info.B = ImageVectorizer.fitLineTLS(endSeg);
@@ -2292,11 +2397,11 @@ export class ImageVectorizer {
         const s1 = spanInfos[j], s2 = spanInfos[nextJ];
         if (!s1.isLine || !s2.isLine || !s1.A || !s2.A) continue;
         const dot = s1.A.d[0] * s2.A.d[0] + s1.A.d[1] * s2.A.d[1];
-        if (dot < 0.94) continue;
+        if (dot < 0.95) continue;
         const combinedP = s1.P.slice(0, -1).concat(s2.P);
         const tlsComb = ImageVectorizer.fitLineTLS(combinedP);
         const combLs = s1.Ls + s2.Ls;
-        const combLim = combLs >= 16 ? Math.min(2.7, Math.max(lineTol * 1.45, combLs * 0.042)) : lineTol * 1.35;
+        const combLim = combLs >= 16 ? Math.min(1.15, Math.max(lineTol * 1.25, combLs * 0.02)) : lineTol * 1.15;
         if (tlsComb && tlsComb.dev <= combLim) {
           const combInfo = classifySpan(combinedP);
           combInfo.isLine = true;
@@ -2328,7 +2433,7 @@ export class ImageVectorizer {
       snappedCorners.push(X || pc);
     }
 
-    const fitErrSq = Math.pow(Math.max(0.32, (1.08 - opts.detailFactor) * 0.95 * scaleRatio), 2);
+    const fitErrSq = Math.pow(Math.max(0.52, (1.12 - opts.detailFactor) * 1.45 * scaleRatio), 2);
     const segmentsList = [];
 
     for (let j = 0; j < mFinal; j++) {
@@ -2356,7 +2461,7 @@ export class ImageVectorizer {
       pinned[0] = ca;
       pinned[q - 1] = cb;
 
-      const smPts = ImageVectorizer.taubinSmoothOpen(pinned, 3);
+      const smPts = ImageVectorizer.taubinSmoothOpen(pinned, 4);
       const kTan = Math.min(q - 1, 3);
       const tHat1 = ImageVectorizer.normVec([smPts[kTan][0] - smPts[0][0], smPts[kTan][1] - smPts[0][1]]);
       const tHat2 = ImageVectorizer.normVec([smPts[q - 1 - kTan][0] - smPts[q - 1][0], smPts[q - 1 - kTan][1] - smPts[q - 1][1]]);

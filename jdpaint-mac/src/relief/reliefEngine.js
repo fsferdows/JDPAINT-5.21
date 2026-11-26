@@ -265,24 +265,30 @@ export class ReliefEngine {
         const closedMed = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(smL, N, N, medR, true), N, N, medR, false);
         const planeR = Math.max(10, Math.round(minRoi * 0.08));
         const plane = ImageVectorizer.maskedBoxMean(smL, roiMask, N, N, planeR);
-        const baseLevel = invert ? 0.65 : 0.35;
+        const baseLevel = invert ? 0.68 : 0.30;
+        const woodBuf = new Float32Array(N * N);
         for (let i = 0; i < N * N; i++) {
           const inRoiBox = roiMask[i] || wmMask[i];
           if (!inRoiBox) {
-            this.data[i] = 0;
+            woodBuf[i] = 0;
             continue;
           }
           if (wmMask[i]) {
-            // Suppress colored/white watermark bump smoothly onto flat local door plane
-            this.data[i] = Math.pow(baseLevel, gamma);
+            woodBuf[i] = Math.pow(baseLevel, gamma);
             continue;
           }
-          const wh = (Math.max(0, smL[i] - openedL[i]) * 0.45 + Math.max(0, smL[i] - openedMed[i]) * 0.55) / 72.0;
-          const bh = (Math.max(0, closedL[i] - smL[i]) * 0.45 + Math.max(0, closedMed[i] - smL[i]) * 0.55) / 72.0;
-          const slow = (smL[i] - plane[i]) / 100.0;
-          const rawDelta = (wh * 1.15 - bh * 0.95 + slow * 0.42) * (invert ? -1 : 1);
+          const wh = (Math.max(0, smL[i] - openedL[i]) * 0.42 + Math.max(0, smL[i] - openedMed[i]) * 0.58) / 68.0;
+          const bh = (Math.max(0, closedL[i] - smL[i]) * 0.42 + Math.max(0, closedMed[i] - smL[i]) * 0.58) / 68.0;
+          const slow = (smL[i] - plane[i]) / 96.0;
+          const rawDelta = (wh * 1.42 - bh * 1.08 + slow * 0.45) * (invert ? -1 : 1);
           const zNorm = Math.max(0.05, Math.min(1.0, baseLevel + rawDelta));
-          this.data[i] = Math.pow(zNorm, gamma);
+          woodBuf[i] = Math.pow(zNorm, gamma);
+        }
+        // Smooth high-frequency wood grain micro-ripples inside ROI while keeping carved borders crisp
+        const smoothWood = ImageVectorizer.guidedFilter(woodBuf, N, N, 1, 0.006);
+        for (let i = 0; i < N * N; i++) {
+          const inRoiBox = roiMask[i] || wmMask[i];
+          this.data[i] = inRoiBox ? Math.max(0, Math.min(1.0, smoothWood[i])) : 0;
         }
         this.notify();
         return;

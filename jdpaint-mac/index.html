@@ -90,6 +90,7 @@
           <button class="act-tool" data-tool="reshape"><span class="icon">〰️</span>Reshape Outline Brush (H)</button>
           <hr>
           <button class="act-tool" data-tool="pen"><span class="icon">✒️</span>Pen / Bezier Curve Tool (B)</button>
+          <button class="act-tool" data-tool="pen-edit"><span class="icon">🖊️</span>Click Pen Reshape Tool (Q)</button>
           <button class="act-tool" data-tool="freehand"><span class="icon">🖌️</span>Freehand Sketch Brush (F)</button>
           <button class="act-tool" data-tool="polyline"><span class="icon">〽</span>Smart Polyline (P)</button>
           <button class="act-tool" data-tool="line"><span class="icon">╱</span>Line Segment Tool (L)</button>
@@ -238,8 +239,8 @@
         <span class="tb-label" title="Number of Color Clusters / Grayscale Tone Layers (2-16)">Colors:</span>
         <input type="number" id="trace-colors" class="tb-input" min="2" max="16" value="6" style="width: 38px;" title="Number of Color or Tone Layers (2-16)">
         <span class="tb-label">Detail:</span>
-        <input type="range" id="slider-trace-detail" min="10" max="90" value="50" style="width: 52px;" title="Adjust Trace Path Precision (Higher = tighter fit to fine curves)">
-        <span id="lbl-trace-detail" style="font-size: 10px; width: 24px;">50%</span>
+        <input type="range" id="slider-trace-detail" min="10" max="90" value="70" style="width: 52px;" title="Adjust Trace Path Precision (Higher = tighter fit to fine curves)">
+        <span id="lbl-trace-detail" style="font-size: 10px; width: 24px;">70%</span>
         <button class="tb-btn btn-highlight-green" id="btn-auto-trace-2d" title="Automatically trace picture into editable 2D CAD vector layers!">⚡ Auto-Trace 2D</button>
         <button class="tb-btn btn-highlight" id="btn-puff-3d" title="Convert selected 2D Pen/Curve/Shape into 3D relief!">💨 Selection → 3D</button>
         <button class="tb-btn btn-highlight" id="btn-rebuild-3d" title="Rebuild full 3D Relief from all visible 2D layers">🔄 Canvas → 3D</button>
@@ -294,6 +295,10 @@
           <button class="tb-tool-btn" data-tool="pen" title="Pen Curve (B): Click points to trace smooth Bezier curves, press Enter or click start to close">
             <span class="tool-icon">✒️</span>
             <span class="tool-name">Pen Curve</span>
+          </button>
+          <button class="tb-tool-btn" data-tool="pen-edit" title="Click Pen Reshape (Q): Click any traced layer &amp; click point-by-point to reshape its curves smoothly, or drag nodes &amp; handles">
+            <span class="tool-icon">🖊️</span>
+            <span class="tool-name">Click Pen</span>
           </button>
           <button class="tb-tool-btn" data-tool="freehand" title="Freehand Brush (F): Hold & drag smoothly to sketch freeform curves">
             <span class="tool-icon">🖌️</span>

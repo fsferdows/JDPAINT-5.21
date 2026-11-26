@@ -101,18 +101,41 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    // Case 1.5: Smart Polyline Tool active -> Show Instant 1-by-1 Design Detection, Reshape & Tracing Sub-Modes!
+    // Case 1.4: Click Pen Reshape Tool (Q) -> Click layer & click point-by-point to reshape curve!
+    if (cadCanvas.activeTool === 'pen-edit' && !cadCanvas.currentDraft) {
+      cadFloatingBar.style.display = 'flex';
+      const pem = cadCanvas.penEditMode || 'span';
+      cadFloatingBar.innerHTML = `
+        <span style="color:#34d399;font-weight:bold;">Click Pen (Q):</span>
+        <button class="cad-float-btn${pem === 'span' ? ' primary' : ''}" id="fl-pen-span" title="Click point 1 on layer outline -> click point 2..N -> click back on layer (or Enter/DblClick) to reshape curve!">🖊️ Click-by-Click Reshape</button>
+        <button class="cad-float-btn${pem === 'point' ? ' primary' : ''}" id="fl-pen-point" title="Click directly on outline edge to insert & drag a smooth control point (Right-click deletes node)">✛ Click Point Insert</button>
+        <span style="font-size:10px;color:#cbd5e1;">Drag handles/nodes directly anytime</span>
+      `;
+      document.getElementById('fl-pen-span')?.addEventListener('click', () => {
+        cadCanvas.penEditMode = 'span';
+        updateFloatingCadBar();
+      });
+      document.getElementById('fl-pen-point')?.addEventListener('click', () => {
+        cadCanvas.penEditMode = 'point';
+        updateFloatingCadBar();
+      });
+      return;
+    }
+
+    // Case 1.5: Smart Polyline Tool active -> Show Instant 1-by-1 Design Detection, Sensitivity & Tracing Sub-Modes!
     if (cadCanvas.activeTool === 'polyline' && !cadCanvas.currentDraft) {
       cadFloatingBar.style.display = 'flex';
       const sm = cadCanvas.polylineSmartMode || 'capture';
       const pScale = cadCanvas.polylinePartScale || 'small';
+      const pSens = cadCanvas.smartPolySensitivity || 'balanced';
       const hasPic = !!cadCanvas._edgeGuide;
       cadFloatingBar.innerHTML = `
-        <span style="color:#22d3ee;font-weight:bold;">Smart Polyline${hasPic ? '' : ' (Load Picture for Shape Detect)'}:</span>
-        <button class="cad-float-btn${sm === 'capture' ? ' primary' : ''}" id="fl-poly-capture" title="Hover over any small petal/part & Left-Click to capture 1-by-1; Click shape/nodes to reshape">✨ Detect &amp; Grab Part</button>
+        <span style="color:#22d3ee;font-weight:bold;">Smart Poly${hasPic ? '' : ' (Load Picture)'}:</span>
+        <button class="cad-float-btn${sm === 'capture' ? ' primary' : ''}" id="fl-poly-capture" title="Hover over any small petal/part & Left-Click to capture 1-by-1; Click shape/nodes to reshape">✨ Detect &amp; Grab</button>
         <button class="cad-float-btn${sm === 'magnetic' ? ' primary' : ''}" id="fl-poly-magnetic" title="Click points along outline — curve automatically hugs photo edges!">🧲 Edge Follower</button>
         <button class="cad-float-btn${sm === 'manual' ? ' primary' : ''}" id="fl-poly-manual" title="Classic straight point-to-point CAD polyline">📏 Straight Line</button>
-        <button class="cad-float-btn${pScale === 'small' ? ' primary' : ''}" id="fl-poly-size" title="Toggle between Tight 1-by-1 Part Capture and Medium Panel Capture">${pScale === 'small' ? '🔍 Part: Tight 1-by-1' : '⬛ Part: Medium'}</button>
+        <button class="cad-float-btn${pScale === 'small' ? ' primary' : ''}" id="fl-poly-size" title="Toggle between Tight 1-by-1 Part Capture and Medium Panel Capture">${pScale === 'small' ? '🔍 1-by-1' : '⬛ Medium'}</button>
+        <button class="cad-float-btn" id="fl-poly-sens" title="Cycle motif capture sensitivity: Tight / Balanced / Wide">🎯 ${pSens[0].toUpperCase() + pSens.slice(1)}</button>
       `;
       const setPolyMode = (mode) => {
         cadCanvas.polylineSmartMode = mode;
@@ -126,6 +149,13 @@ document.addEventListener('DOMContentLoaded', () => {
       document.getElementById('fl-poly-manual')?.addEventListener('click', () => setPolyMode('manual'));
       document.getElementById('fl-poly-size')?.addEventListener('click', () => {
         cadCanvas.polylinePartScale = cadCanvas.polylinePartScale === 'small' ? 'medium' : 'small';
+        cadCanvas.detectedShapePreview = null;
+        cadCanvas.requestRender();
+        updateFloatingCadBar();
+      });
+      document.getElementById('fl-poly-sens')?.addEventListener('click', () => {
+        const order = ['tight', 'balanced', 'wide'];
+        cadCanvas.smartPolySensitivity = order[(order.indexOf(pSens) + 1) % order.length];
         cadCanvas.detectedShapePreview = null;
         cadCanvas.requestRender();
         updateFloatingCadBar();
@@ -157,6 +187,7 @@ document.addEventListener('DOMContentLoaded', () => {
         <label>W:<input type="number" id="fl-dim-w" step="0.5" min="0.5" value="${bw.toFixed(1)}"></label>
         <label>H:<input type="number" id="fl-dim-h" step="0.5" min="0.5" value="${bh.toFixed(1)}"></label>
         <button class="cad-float-btn" id="fl-nodes" title="Edit Nodes (N)">☩ Nodes</button>
+        <button class="cad-float-btn" id="fl-pen-edit" title="Click Pen Reshape (Q)">🖊️ Click Pen</button>
         <button class="cad-float-btn" id="fl-reshape" title="Reshape Brush (H)">〰️ Reshape</button>
         <button class="cad-float-btn" id="fl-fillet" title="Round Corners (3mm Fillet)">◠ Fillet</button>
         <button class="cad-float-btn" id="fl-mir-copy" title="Mirror Duplicate Left ↔ Right">🪞 Mirror Copy</button>
@@ -176,6 +207,7 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById(id)?.addEventListener('change', applyDims);
       });
       document.getElementById('fl-nodes')?.addEventListener('click', () => selectTool('node'));
+      document.getElementById('fl-pen-edit')?.addEventListener('click', () => selectTool('pen-edit'));
       document.getElementById('fl-reshape')?.addEventListener('click', () => selectTool('reshape'));
       document.getElementById('fl-fillet')?.addEventListener('click', () => {
         const n = cadCanvas.filletSelected(3.0);
@@ -324,6 +356,7 @@ document.addEventListener('DOMContentLoaded', () => {
       let hint = '';
       if (toolName === 'select') hint = 'Click shape/layer to select, drag to move, drag 8 handles to resize, green handle to rotate.';
       else if (toolName === 'pen') hint = 'Click ON an outline -> draw new shape -> click BACK on outline + Enter/DblClick to replace that section directly!';
+      else if (toolName === 'pen-edit') hint = 'Click any traced layer edge -> click point 1..N to reshape curve -> click back on layer (or Enter/DblClick) to update!';
       else if (toolName === 'reshape') hint = 'Drag smoothly across ANY traced outline to bend & fix its shape like clay!';
       else if (toolName === 'freehand') hint = 'Hold & drag smoothly anywhere to sketch a freehand curve layer.';
       else if (toolName === 'node') hint = 'Click curve to reveal nodes, click edge to add+drag node immediately, right-click or Del to remove node.';
@@ -948,7 +981,7 @@ document.addEventListener('DOMContentLoaded', () => {
       threshold: parseFloat(document.getElementById('trace-threshold-mode')?.value) || -1,
       invert: document.getElementById('relief-invert-check')?.checked || false,
       traceMode: document.getElementById('trace-mode-select')?.value || 'auto',
-      detail: (parseInt(sliderTraceDetail?.value || '50', 10)) / 100,
+      detail: (parseInt(sliderTraceDetail?.value || '70', 10)) / 100,
       colorCount: Math.max(2, Math.min(16, parseInt(document.getElementById('trace-colors')?.value || '6', 10) || 6)),
       stackMethod: document.getElementById('trace-stack-mode')?.value || 'stacked',
       corners: (parseInt(document.getElementById('trace-corners')?.value || '65', 10)) / 100,
@@ -959,27 +992,27 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // ============================================================
-  // AUTO-TRACE PICTURE TO 2D VECTORS (Instant 2D Conversion!)
+  // AUTO-TRACE PICTURE TO 2D VECTORS (Step-by-Step Instant 2D Conversion!)
   // ============================================================
-  function runAutoTrace2D() {
+  async function runAutoTrace2D() {
     if (!loadedImageElement) {
       alert('Please load a picture first using "🖼️ Load Picture...".');
       return;
     }
 
     const opts = getTraceOptions();
-    statusMode.textContent = `Tracing (${opts.traceMode.toUpperCase()}, ${opts.colorCount} colors/tones, ${Math.round(opts.detail * 100)}% detail) into separate 2D compound vector layers...`;
-    setTimeout(() => {
-      const count = cadCanvas.autoTraceReferenceImage({
-        ...opts,
-        smoothCurves: true,
-        autoEnable3D: true,
-      });
-      selectTool('select');
-      renderLayerList();
-      syncSelectedLayerInspector();
-      statusMode.textContent = `Auto-Trace complete! Generated ${count} compound 2D layers (${opts.traceMode}). Use Node Edit (N) to tweak Bezier handles, or Canvas → 3D!`;
-    }, 30);
+    statusMode.textContent = `Step 1/5: Initializing (${opts.traceMode.toUpperCase()}, ${Math.round(opts.detail * 100)}% detail)...`;
+    const count = await cadCanvas.autoTraceReferenceImageAsync({
+      ...opts,
+      smoothCurves: true,
+      autoEnable3D: true,
+    }, (prog) => {
+      statusMode.textContent = prog.label;
+    });
+    selectTool('select');
+    renderLayerList();
+    syncSelectedLayerInspector();
+    statusMode.textContent = `Auto-Trace complete! Generated ${count} accurate 2D layers (${opts.traceMode}). Use Click Pen (Q) or Node Edit (N) to customize any curve!`;
   }
 
   document.getElementById('btn-auto-trace-2d').addEventListener('click', runAutoTrace2D);
@@ -1036,57 +1069,59 @@ document.addEventListener('DOMContentLoaded', () => {
   // ============================================================
   // ONE-CLICK AUTO DUAL CONVERSION (100% Synced 2D Vector Layers + 3D Relief!)
   // ============================================================
-  function runOneClickAuto() {
+  async function runOneClickAuto() {
     if (!loadedImageElement) {
       alert('Please load a picture first using "🖼️ Load Picture...".');
       return;
     }
 
-    statusMode.textContent = 'Running Illustrator-Grade Image Trace + 100% Layer-Synchronized 3D Relief...';
-    setTimeout(() => {
-      const opts = getTraceOptions();
-      const style = document.getElementById('relief-style')?.value || 'sculpted';
-      const edgeStrength = parseFloat(document.getElementById('relief-edge-strength')?.value) || 0.35;
-      const removeWhiteBg = document.getElementById('relief-remove-bg')?.checked ?? true;
+    const opts = getTraceOptions();
+    const style = document.getElementById('relief-style')?.value || 'sculpted';
+    const edgeStrength = parseFloat(document.getElementById('relief-edge-strength')?.value) || 0.35;
+    const removeWhiteBg = document.getElementById('relief-remove-bg')?.checked ?? true;
 
-      // 1. Pre-compute optional photo texture buffer (kept available in Base Layer panel)
-      reliefEngine.loadImageHighAccuracy(loadedImageElement, {
-        style,
-        edgeStrength,
-        invert: opts.invert,
-        removeWhiteBg,
-        denoise: true,
-      });
-      basePhotoBuffer = new Float32Array(reliefEngine.data);
+    statusMode.textContent = 'Step 1/5: Preparing relief depth field & image analysis...';
+    await new Promise((r) => setTimeout(r, 0));
 
-      // 2. Trace editable 2D compound Bezier vector layers (with autoEnable3D: true!)
-      const vectorCount = cadCanvas.autoTraceReferenceImage({
-        ...opts,
-        smoothCurves: true,
-        autoEnable3D: true,
-      });
+    // 1. Pre-compute high-accuracy relief heightmap buffer
+    reliefEngine.loadImageHighAccuracy(loadedImageElement, {
+      style,
+      edgeStrength,
+      invert: opts.invert,
+      removeWhiteBg,
+      denoise: true,
+    });
+    basePhotoBuffer = new Float32Array(reliefEngine.data);
 
-      // 3. Drive 3D Relief from traced 2D layers (+ watermark-free sculpted wood slab base on bas-relief doors!)
-      if (vectorCount > 0) {
-        const tracedTail = cadCanvas.entities.slice(-vectorCount);
-        const isWoodBasRelief = tracedTail.some((e) => e.layerGroup === 'Raised Petals & Motifs' || e.layerGroup === 'Carved Grooves & Panels');
-        basePhotoEnabled = isWoodBasRelief;
-        basePhotoWeight = isWoodBasRelief ? 0.65 : 0.25;
-        if (chkClipBaseTo2d) chkClipBaseTo2d.checked = !isWoodBasRelief;
-        updateBasePhotoBox();
-        rebuild3DFromLayers(true);
-      } else {
-        basePhotoEnabled = true;
-        basePhotoWeight = 1.0;
-        updateBasePhotoBox();
-      }
+    // 2. Step-by-step Illustrator-Grade 2D compound Bezier vector trace (with autoEnable3D: true!)
+    const vectorCount = await cadCanvas.autoTraceReferenceImageAsync({
+      ...opts,
+      smoothCurves: true,
+      autoEnable3D: true,
+    }, (prog) => {
+      statusMode.textContent = prog.label;
+    });
 
-      selectTool('select');
-      renderLayerList();
-      syncSelectedLayerInspector();
-      if (panel3D.style.display === 'none') setViewMode('split');
-      statusMode.textContent = `1-Click Complete! ${vectorCount} compound 2D Layers ↔ 3D Relief synced 100% (${opts.traceMode}). Edit any layer & watch 3D update!`;
-    }, 30);
+    // 3. Drive 3D Relief cleanly from traced 2D layers (+ sculpted wood slab base on bas-relief doors)
+    if (vectorCount > 0) {
+      const tracedTail = cadCanvas.entities.slice(-vectorCount);
+      const isWoodBasRelief = tracedTail.some((e) => e.layerGroup === 'Raised Petals & Motifs' || e.layerGroup === 'Carved Grooves & Panels');
+      basePhotoEnabled = isWoodBasRelief;
+      basePhotoWeight = isWoodBasRelief ? 0.65 : 0.25;
+      if (chkClipBaseTo2d) chkClipBaseTo2d.checked = !isWoodBasRelief;
+      updateBasePhotoBox();
+      rebuild3DFromLayers(true);
+    } else {
+      basePhotoEnabled = true;
+      basePhotoWeight = 1.0;
+      updateBasePhotoBox();
+    }
+
+    selectTool('select');
+    renderLayerList();
+    syncSelectedLayerInspector();
+    if (panel3D.style.display === 'none') setViewMode('split');
+    statusMode.textContent = `1-Click Complete! ${vectorCount} compound 2D Layers ↔ 3D Relief synced 100% (${opts.traceMode}). Use Click Pen (Q) to reshape any layer!`;
   }
 
   const btnOneClick = document.getElementById('btn-one-click-auto');
@@ -1732,6 +1767,7 @@ document.addEventListener('DOMContentLoaded', () => {
       case 'n': case 'N': selectTool('node'); break;
       case 'h': case 'H': selectTool('reshape'); break;
       case 'b': case 'B': selectTool('pen'); break;
+      case 'q': case 'Q': selectTool('pen-edit'); break;
       case 'f': case 'F': selectTool('freehand'); break;
       case 'p': case 'P': selectTool('polyline'); break;
       case 'l': case 'L': selectTool('line'); break;
