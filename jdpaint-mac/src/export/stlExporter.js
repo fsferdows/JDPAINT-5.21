@@ -208,15 +208,27 @@ export class StlExporter {
   }
 
   /**
-   * Export an arbitrary indexed 3D AssetBuffer ({ positions, indices }) directly to watertight Binary STL.
+   * Export an arbitrary indexed 3D AssetBuffer ({ positions, indices }) directly to centered, upright Watertight Binary STL (mm).
    */
   static exportIndexedMeshToBinarySTL(meshData) {
     const pos = meshData.positions;
     const idx = meshData.indices;
+    const vCount = pos.length / 3;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, minZ = Infinity;
+    for (let i = 0; i < vCount; i++) {
+      const x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z;
+    }
+    const cx = isFinite(minX) ? (minX + maxX) * 0.5 : 0;
+    const cy = isFinite(minY) ? (minY + maxY) * 0.5 : 0;
+    const zShift = isFinite(minZ) ? -minZ : 0;
+
     const numTriangles = Math.floor(idx.length / 3);
     const buffer = new ArrayBuffer(84 + numTriangles * 50);
     const view = new DataView(buffer);
-    const headerStr = 'JDPaint 3D Asset Studio Binary STL Export';
+    const headerStr = 'JDPaint 3D Asset Studio Watertight Binary STL';
     for (let i = 0; i < 80; i++) view.setUint8(i, i < headerStr.length ? headerStr.charCodeAt(i) : 0);
     view.setUint32(80, numTriangles, true);
 
@@ -228,16 +240,16 @@ export class StlExporter {
       offset = StlExporter.writeTriangle(
         view,
         offset,
-        pos[i0], pos[i0 + 1], pos[i0 + 2],
-        pos[i1], pos[i1 + 1], pos[i1 + 2],
-        pos[i2], pos[i2 + 1], pos[i2 + 2]
+        pos[i0] - cx, pos[i0 + 1] - cy, pos[i0 + 2] + zShift,
+        pos[i1] - cx, pos[i1 + 1] - cy, pos[i1 + 2] + zShift,
+        pos[i2] - cx, pos[i2 + 1] - cy, pos[i2 + 2] + zShift
       );
     }
     return new Blob([buffer], { type: 'application/octet-stream' });
   }
 
   /**
-   * Export an indexed 3D AssetBuffer ({ positions, normals, uvs, indices }) cleanly to Wavefront OBJ.
+   * Export an indexed 3D AssetBuffer ({ positions, normals, uvs, indices }) to centered Wavefront OBJ (+Y up).
    */
   static exportIndexedMeshToOBJ(meshData) {
     const pos = meshData.positions;
@@ -245,16 +257,27 @@ export class StlExporter {
     const uvs = meshData.uvs;
     const idx = meshData.indices;
     const vCount = pos.length / 3;
-    const lines = ['# JDPaint 3D Asset Studio Wavefront OBJ Exporter'];
 
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (let i = 0; i < vCount; i++) {
+      const x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+    const cx = isFinite(minX) ? (minX + maxX) * 0.5 : 0;
+    const cy = isFinite(minY) ? (minY + maxY) * 0.5 : 0;
+    const cz = isFinite(minZ) ? (minZ + maxZ) * 0.5 : 0;
+
+    const lines = ['# JDPaint 3D Asset Studio Wavefront OBJ Exporter (Centered)'];
     for (let i = 0; i < vCount; i++) {
       const k = i * 3;
-      lines.push(`v ${pos[k].toFixed(3)} ${pos[k + 1].toFixed(3)} ${pos[k + 2].toFixed(3)}`);
+      lines.push(`v ${(pos[k] - cx).toFixed(4)} ${(pos[k + 1] - cy).toFixed(4)} ${(pos[k + 2] - cz).toFixed(4)}`);
     }
     if (uvs) {
       for (let i = 0; i < vCount; i++) {
         const k = i * 2;
-        lines.push(`vt ${uvs[k].toFixed(4)} ${uvs[k + 1].toFixed(4)}`);
+        lines.push(`vt ${uvs[k].toFixed(5)} ${uvs[k + 1].toFixed(5)}`);
       }
     }
     if (norms) {
@@ -331,19 +354,23 @@ export class StlExporter {
   }
 
   /**
-   * Export 3D mesh (from ReliefEngine OR Asset3DEngine) + Base Color PNG texture into Binary glTF 2.0 (.glb).
+   * Export 3D mesh + Full PBR Textures (BaseColor, Normal, MetallicRoughness) into centered Binary glTF 2.0 (.glb).
    */
   static exportToGLB(meshData, options = {}) {
     const {
       baseColorPngBytes = null,
+      normalPngBytes = null,
+      metallicRoughnessPngBytes = null,
       roughness = 0.55,
       metalness = 0.08,
+      normalScale = 0.85,
+      centerAndNormalize = true,
       name = 'JDPaint3DAsset',
     } = options;
 
-    const pos = meshData.positions;
-    const norms = meshData.normals;
-    const vCount = pos.length / 3;
+    const srcPos = meshData.positions;
+    const srcNorms = meshData.normals;
+    const vCount = srcPos.length / 3;
     const rawUvs = meshData.uvs;
     const uvs = new Float32Array(rawUvs.length);
     for (let i = 0; i < vCount; i++) {
@@ -352,14 +379,40 @@ export class StlExporter {
     }
     const idx = meshData.indices;
 
+    let rawMinX = Infinity, rawMinY = Infinity, rawMinZ = Infinity;
+    let rawMaxX = -Infinity, rawMaxY = -Infinity, rawMaxZ = -Infinity;
+    for (let i = 0; i < vCount; i++) {
+      const k = i * 3;
+      const x = srcPos[k], y = srcPos[k + 1], z = srcPos[k + 2];
+      if (x < rawMinX) rawMinX = x; if (x > rawMaxX) rawMaxX = x;
+      if (y < rawMinY) rawMinY = y; if (y > rawMaxY) rawMaxY = y;
+      if (z < rawMinZ) rawMinZ = z; if (z > rawMaxZ) rawMaxZ = z;
+    }
+
+    // Standard glTF 2.0 normalization: center at (0,0,0), fit max extent to 2.0 meters for Blender/QuickLook/Unity
+    const cx = centerAndNormalize ? (rawMinX + rawMaxX) * 0.5 : 0;
+    const cy = centerAndNormalize ? (rawMinY + rawMaxY) * 0.5 : 0;
+    const cz = centerAndNormalize ? (rawMinZ + rawMaxZ) * 0.5 : 0;
+    const maxExtent = Math.max(rawMaxX - rawMinX, rawMaxY - rawMinY, rawMaxZ - rawMinZ, 1e-6);
+    const scale = centerAndNormalize ? (2.0 / maxExtent) : 1.0;
+
+    const pos = new Float32Array(srcPos.length);
+    const norms = new Float32Array(srcNorms.length);
     let minX = Infinity, minY = Infinity, minZ = Infinity;
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
     for (let i = 0; i < vCount; i++) {
       const k = i * 3;
-      const x = pos[k], y = pos[k + 1], z = pos[k + 2];
+      const x = (srcPos[k] - cx) * scale;
+      const y = (srcPos[k + 1] - cy) * scale;
+      const z = (srcPos[k + 2] - cz) * scale;
+      pos[k] = x; pos[k + 1] = y; pos[k + 2] = z;
       if (x < minX) minX = x; if (x > maxX) maxX = x;
       if (y < minY) minY = y; if (y > maxY) maxY = y;
       if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+
+      const nx = srcNorms[k], ny = srcNorms[k + 1], nz = srcNorms[k + 2];
+      const nl = Math.hypot(nx, ny, nz) || 1;
+      norms[k] = nx / nl; norms[k + 1] = ny / nl; norms[k + 2] = nz / nl;
     }
 
     const pad4 = (n) => (n + 3) & ~3;
@@ -389,11 +442,13 @@ export class StlExporter {
     const bvUv = appendView(uvs, 34962);
     const bvIdx = appendView(idx, 34963);
 
+    const hasOrmTex = !!(metallicRoughnessPngBytes && metallicRoughnessPngBytes.byteLength > 0);
     const materialDef = {
       name: `${name}_Mat`,
       pbrMetallicRoughness: {
-        metallicFactor: metalness,
-        roughnessFactor: roughness,
+        // When metallicRoughnessTexture (G=Roughness, B=Metallic) is supplied, it already encodes calibrated [0..1] channels!
+        metallicFactor: hasOrmTex ? 1.0 : metalness,
+        roughnessFactor: hasOrmTex ? 1.0 : roughness,
       },
       doubleSided: true,
     };
@@ -401,14 +456,33 @@ export class StlExporter {
     const images = [];
     const textures = [];
     const samplers = [];
-    if (baseColorPngBytes && baseColorPngBytes.byteLength > 0) {
-      const bvTex = appendView(baseColorPngBytes, 0);
-      samplers.push({ magFilter: 9729, minFilter: 9987, wrapS: 33071, wrapT: 33071 });
+    const pushPngTexture = (pngBytes) => {
+      if (!pngBytes || pngBytes.byteLength === 0) return -1;
+      const bvTex = appendView(pngBytes, 0);
+      const idxImg = images.length;
+      if (samplers.length === 0) {
+        samplers.push({ magFilter: 9729, minFilter: 9987, wrapS: 33071, wrapT: 33071 });
+      }
       images.push({ bufferView: bvTex, mimeType: 'image/png' });
-      textures.push({ sampler: 0, source: 0 });
-      materialDef.pbrMetallicRoughness.baseColorTexture = { index: 0 };
+      textures.push({ sampler: 0, source: idxImg });
+      return idxImg;
+    };
+
+    const baseTexIdx = pushPngTexture(baseColorPngBytes);
+    if (baseTexIdx >= 0) {
+      materialDef.pbrMetallicRoughness.baseColorTexture = { index: baseTexIdx };
     } else {
       materialDef.pbrMetallicRoughness.baseColorFactor = [0.85, 0.72, 0.56, 1.0];
+    }
+
+    const normTexIdx = pushPngTexture(normalPngBytes);
+    if (normTexIdx >= 0) {
+      materialDef.normalTexture = { index: normTexIdx, scale: Math.max(0.1, Math.min(2.0, normalScale)) };
+    }
+
+    const ormTexIdx = pushPngTexture(metallicRoughnessPngBytes);
+    if (ormTexIdx >= 0) {
+      materialDef.pbrMetallicRoughness.metallicRoughnessTexture = { index: ormTexIdx };
     }
 
     const gltf = {

@@ -574,7 +574,7 @@ export class Viewport3D {
     }
   }
 
-  _buildCanvasTextureFromRgba(rgba, size, isSRGB = false) {
+  _buildCanvasFromRgba(rgba, size) {
     const canvas = document.createElement('canvas');
     canvas.width = size;
     canvas.height = size;
@@ -582,6 +582,11 @@ export class Viewport3D {
     const img = ctx.createImageData(size, size);
     img.data.set(rgba);
     ctx.putImageData(img, 0, 0);
+    return canvas;
+  }
+
+  _buildCanvasTextureFromRgba(rgba, size, isSRGB = false) {
+    const canvas = this._buildCanvasFromRgba(rgba, size);
     const tex = new THREE.CanvasTexture(canvas);
     tex.colorSpace = isSRGB ? THREE.SRGBColorSpace : THREE.NoColorSpace;
     tex.wrapS = THREE.ClampToEdgeWrapping;
@@ -618,6 +623,9 @@ export class Viewport3D {
       this._assetTextures.normal = this._buildCanvasTextureFromRgba(pbrMaps.normal, pbrMaps.size, false);
       this._assetTextures.roughness = this._buildCanvasTextureFromRgba(pbrMaps.roughness, pbrMaps.size, false);
       this._assetTextures.metallic = this._buildCanvasTextureFromRgba(pbrMaps.metallic, pbrMaps.size, false);
+      if (pbrMaps.metallicRoughness) {
+        this._assetTextures.metallicRoughnessCanvas = this._buildCanvasFromRgba(pbrMaps.metallicRoughness, pbrMaps.size);
+      }
     }
 
     const geom = new THREE.BufferGeometry();
@@ -753,6 +761,62 @@ export class Viewport3D {
 
   getBaseColorPngCanvas() {
     return this._assetTextures.baseColor?._sourceCanvas || null;
+  }
+
+  /**
+   * Prepare export-ready PNG canvases for .GLB export (applying user intensity, roughness & metalness adjustments).
+   */
+  getPbrExportCanvases(adj = null) {
+    if (!this.assetMesh || !this.assetData) {
+      const procTex = this.getProceduralTexture(this.currentMaterialType);
+      return { baseColor: procTex?.image || null, normal: null, metallicRoughness: null };
+    }
+
+    const boost = Math.max(0.4, Math.min(1.6, adj?.intensity ?? this.materialAdjust?.intensity ?? 1.0));
+    const targetRough = Math.max(0.08, Math.min(1.0, adj?.roughness ?? this.materialAdjust?.roughness ?? 0.55));
+    const targetMetal = Math.max(0.0, Math.min(1.0, adj?.metalness ?? this.materialAdjust?.metalness ?? 0.08));
+
+    let baseCanvas = this._assetTextures.baseColor?._sourceCanvas || null;
+    if (baseCanvas && Math.abs(boost - 1.0) > 0.02) {
+      const w = baseCanvas.width, h = baseCanvas.height;
+      const out = document.createElement('canvas');
+      out.width = w; out.height = h;
+      const octx = out.getContext('2d');
+      octx.drawImage(baseCanvas, 0, 0);
+      const img = octx.getImageData(0, 0, w, h);
+      const d = img.data;
+      for (let i = 0; i < d.length; i += 4) {
+        d[i] = Math.min(255, Math.round(d[i] * boost));
+        d[i + 1] = Math.min(255, Math.round(d[i + 1] * boost));
+        d[i + 2] = Math.min(255, Math.round(d[i + 2] * boost));
+      }
+      octx.putImageData(img, 0, 0);
+      baseCanvas = out;
+    }
+
+    const normalCanvas = this._assetTextures.normal?._sourceCanvas || null;
+    let ormCanvas = this._assetTextures.metallicRoughnessCanvas || null;
+    if (ormCanvas && (Math.abs(targetRough - 0.55) > 0.02 || Math.abs(targetMetal - 0.08) > 0.02)) {
+      const w = ormCanvas.width, h = ormCanvas.height;
+      const out = document.createElement('canvas');
+      out.width = w; out.height = h;
+      const octx = out.getContext('2d');
+      octx.drawImage(ormCanvas, 0, 0);
+      const img = octx.getImageData(0, 0, w, h);
+      const d = img.data;
+      const rScale = targetRough / 0.55;
+      for (let i = 0; i < d.length; i += 4) {
+        const gRaw = d[i + 1] / 255.0;
+        const bRaw = d[i + 2] / 255.0;
+        d[i + 1] = Math.max(12, Math.min(255, Math.round(gRaw * rScale * 255)));
+        const mBlended = Math.max(0.0, Math.min(1.0, targetMetal * 0.72 + bRaw * targetMetal * 0.45 + (targetMetal > 0.25 ? bRaw * 0.22 : 0)));
+        d[i + 2] = Math.round(mBlended * 255);
+      }
+      octx.putImageData(img, 0, 0);
+      ormCanvas = out;
+    }
+
+    return { baseColor: baseCanvas, normal: normalCanvas, metallicRoughness: ormCanvas };
   }
 
   _emitStats() {

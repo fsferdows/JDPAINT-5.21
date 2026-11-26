@@ -1192,21 +1192,22 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     const assetMode = document.getElementById('asset-mode-select')?.value || 'double-sided';
-    const resolution = parseInt(document.getElementById('asset-res-select')?.value || '144', 10) || 144;
+    const resolution = parseInt(document.getElementById('asset-res-select')?.value || '160', 10) || 160;
     const thicknessMm = Math.max(2, parseFloat(document.getElementById('asset-thickness')?.value || '22') || 22);
     const removeBg = document.getElementById('asset-remove-bg')?.checked ?? true;
     const delight = document.getElementById('asset-delight')?.checked ?? true;
     const invert = document.getElementById('relief-invert-check')?.checked || false;
 
-    statusMode.textContent = `Step 1/3: Isolating subject silhouette & synthesizing PBR maps (${resolution}×${resolution})...`;
+    statusMode.textContent = `Step 1/3: Isolating subject silhouette & synthesizing 1024px PBR maps (${resolution}×${resolution})...`;
     await new Promise((r) => setTimeout(r, 0));
 
     const analysis = Asset3DEngine.analyzeImage(loadedImageElement, {
       resolution,
+      texSize: 1024,
       removeBg,
       delight,
       invert,
-      edgeStrength: parseFloat(document.getElementById('relief-edge-strength')?.value || '0.35') || 0.35,
+      edgeStrength: parseFloat(document.getElementById('relief-edge-strength')?.value || '0.38') || 0.38,
     });
 
     statusMode.textContent = `Step 2/3: Reconstructing closed ${assetMode.toUpperCase()} volumetric 3D mesh...`;
@@ -1759,29 +1760,39 @@ document.addEventListener('DOMContentLoaded', () => {
     dialogGcode.close();
   });
 
-  // 3D Asset & Relief Exports (.GLB PBR, Binary .STL, Wavefront .OBJ)
+  // 3D Asset & Relief Exports (.GLB Full PBR, Centered Binary .STL, Wavefront .OBJ)
   async function exportGLB() {
-    statusMode.textContent = 'Exporting Binary glTF 2.0 (.glb) 3D Asset with PBR Textures...';
+    statusMode.textContent = 'Exporting Binary glTF 2.0 (.glb) 3D Asset with BaseColor + Normal + ORM PBR Textures...';
     const meshData = (viewport3D.assetMesh && viewport3D.assetData)
       ? viewport3D.assetData
       : StlExporter.reliefToMeshData(reliefEngine);
 
-    let pngBytes = null;
-    const baseCanvas = viewport3D.getBaseColorPngCanvas();
-    if (baseCanvas && typeof baseCanvas.toBlob === 'function') {
-      const pngBlob = await new Promise((resolve) => baseCanvas.toBlob(resolve, 'image/png'));
-      if (pngBlob) pngBytes = new Uint8Array(await pngBlob.arrayBuffer());
-    }
-
     const adj = readAssetMaterialAdjustment();
+    const canvases = viewport3D.getPbrExportCanvases(adj);
+    const encodePng = async (canvas) => {
+      if (!canvas || typeof canvas.toBlob !== 'function') return null;
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+      return blob ? new Uint8Array(await blob.arrayBuffer()) : null;
+    };
+
+    const [baseColorPngBytes, normalPngBytes, metallicRoughnessPngBytes] = await Promise.all([
+      encodePng(canvases.baseColor),
+      encodePng(canvases.normal),
+      encodePng(canvases.metallicRoughness),
+    ]);
+
     const glbBlob = StlExporter.exportToGLB(meshData, {
-      baseColorPngBytes: pngBytes,
+      baseColorPngBytes,
+      normalPngBytes,
+      metallicRoughnessPngBytes,
+      normalScale: 0.85 * adj.contrast,
       roughness: adj.roughness,
       metalness: adj.metalness,
+      centerAndNormalize: true,
       name: 'JDPaint3DAsset',
     });
     StlExporter.downloadBlob('jdpaint-3d-asset.glb', glbBlob);
-    statusMode.textContent = `Exported Binary .GLB (${(glbBlob.size / 1024).toFixed(1)} KB, Blender/Unity/QuickLook ready).`;
+    statusMode.textContent = `Exported Centered Binary .GLB (${(glbBlob.size / 1024).toFixed(1)} KB, Full PBR ready for Blender/Unity/QuickLook).`;
   }
 
   function exportSTL() {
