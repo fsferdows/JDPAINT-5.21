@@ -18,7 +18,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const refStatus = document.getElementById('ref-image-status');
 
   // Engines
-  const reliefEngine = new ReliefEngine(100, 100, 8, 256);
+  const reliefEngine = new ReliefEngine(100, 100, 8, 384);
   const viewport3D = new Viewport3D(threeWrapper, reliefEngine);
   const camEngine = new CamEngine();
 
@@ -257,7 +257,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
   document.getElementById('prop-grid-res').addEventListener('change', (e) => {
     const res = parseInt(e.target.value, 10);
-    reliefEngine.setResolution(res);
+    reliefEngine.resolution = res;
+    reliefEngine.data = new Float32Array(res * res);
+    if (loadedImageElement && basePhotoEnabled) {
+      const style = document.getElementById('relief-style')?.value || 'sculpted';
+      const edgeStrength = parseFloat(document.getElementById('relief-edge-strength')?.value) || 0.35;
+      const invert = document.getElementById('relief-invert-check')?.checked || false;
+      const removeWhiteBg = document.getElementById('relief-remove-bg')?.checked ?? true;
+      reliefEngine.loadImageHighAccuracy(loadedImageElement, { style, edgeStrength, invert, removeWhiteBg, denoise: true });
+      basePhotoBuffer = new Float32Array(reliefEngine.data);
+    }
+    if (cadCanvas.entities.length > 0) {
+      rebuild3DFromLayers(true);
+    } else if (!loadedImageElement) {
+      reliefEngine.loadPreset('rosette');
+    }
     viewport3D.buildMesh();
   });
 
@@ -1052,10 +1066,13 @@ document.addEventListener('DOMContentLoaded', () => {
         autoEnable3D: true,
       });
 
-      // 3. Drive 3D Relief directly from the exact traced 2D vector layers for 100% 2D↔3D fidelity!
+      // 3. Drive 3D Relief from traced 2D layers (+ watermark-free sculpted wood slab base on bas-relief doors!)
       if (vectorCount > 0) {
-        basePhotoEnabled = false;
-        basePhotoWeight = 0.25;
+        const tracedTail = cadCanvas.entities.slice(-vectorCount);
+        const isWoodBasRelief = tracedTail.some((e) => e.layerGroup === 'Raised Petals & Motifs' || e.layerGroup === 'Carved Grooves & Panels');
+        basePhotoEnabled = isWoodBasRelief;
+        basePhotoWeight = isWoodBasRelief ? 0.65 : 0.25;
+        if (chkClipBaseTo2d) chkClipBaseTo2d.checked = !isWoodBasRelief;
         updateBasePhotoBox();
         rebuild3DFromLayers(true);
       } else {

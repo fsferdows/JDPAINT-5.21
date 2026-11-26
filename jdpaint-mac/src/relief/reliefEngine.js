@@ -171,22 +171,123 @@ export class ReliefEngine {
     const pixels = ctx.getImageData(0, 0, N, N).data;
 
     const rawGray = new Float32Array(N * N);
+    const rArr = new Float32Array(N * N);
+    const gArr = new Float32Array(N * N);
+    const bArr = new Float32Array(N * N);
     const histogram = new Uint32Array(256);
 
     // 1. High-Precision Rec. 709 Luminance + Histogram
     let globalSum = 0;
     for (let i = 0; i < N * N; i++) {
-      const lByte = Math.round(0.2126 * pixels[i * 4] + 0.7152 * pixels[i * 4 + 1] + 0.0722 * pixels[i * 4 + 2]);
+      rArr[i] = pixels[i * 4];
+      gArr[i] = pixels[i * 4 + 1];
+      bArr[i] = pixels[i * 4 + 2];
+      const lByte = Math.round(0.2126 * rArr[i] + 0.7152 * gArr[i] + 0.0722 * bArr[i]);
       rawGray[i] = lByte / 255.0;
       globalSum += rawGray[i];
       histogram[lByte]++;
     }
     const globalMean = globalSum / (N * N);
 
-    // 1b. Wood-Grain Suppression + Shading Gradient Equalization for Textured Wood Photos
+    // 1b. Wood Plaque & Carving Photo Detection -> Multi-Scale Sculpted Relief (avoids inverting wood doors from white outer room walls!)
     const otsuStats = ImageVectorizer.computeOtsuStats(histogram, N * N);
     const isTexturedPhoto = otsuStats.separability < 0.85;
     const rawLuma = ImageVectorizer.gaussianBlur3x3(rawGray, N, N);
+
+    if (style !== 'linear') {
+      const luma255 = new Float32Array(N * N);
+      for (let i = 0; i < N * N; i++) luma255[i] = rawGray[i] * 255.0;
+      const roi = ImageVectorizer.detectFurnitureROI(rArr, gArr, bArr, luma255, N, N);
+      if (roi.chromaMed >= 12) {
+        const smL = ImageVectorizer.guidedFilter(luma255, N, N, 2, 130);
+        const roiMask = new Uint8Array(N * N);
+        const wmRaw = new Uint8Array(N * N);
+        const wmTol = roi.chromaMed > 14 ? 14 : 20;
+
+        for (let y = roi.y0; y <= roi.y1; y++) {
+          const row = y * N;
+          for (let x = roi.x0; x <= roi.x1; x++) {
+            const i = row + x;
+            const dc = roi.chromaDiff[i];
+            const rgbSat = Math.max(rArr[i], gArr[i], bArr[i]) - Math.min(rArr[i], gArr[i], bArr[i]);
+            const isNeutralOverlay = roi.chromaMed > 14 && roi.L[i] > 80 && rgbSat < 20;
+            if (isNeutralOverlay || (dc > wmTol && (roi.L[i] > roi.lMed + 6 || dc > 21))) {
+              wmRaw[i] = 1;
+            } else {
+              roiMask[i] = 1;
+            }
+          }
+        }
+        // Dilate watermark mask by 1px to suppress colored overlay AA edge halos completely
+        const wmMask = new Uint8Array(wmRaw);
+        for (let y = roi.y0 + 1; y < roi.y1; y++) {
+          const row = y * N;
+          for (let x = roi.x0 + 1; x < roi.x1; x++) {
+            const i = row + x;
+            if (wmRaw[i - 1] || wmRaw[i + 1] || wmRaw[i - N] || wmRaw[i + N]) {
+              wmMask[i] = 1;
+              roiMask[i] = 0;
+            }
+          }
+        }
+
+        // Check if engraved 2-tone plaque (e.g. laser/burnt wood sign) vs 3D bas-relief furniture door
+        const rHist = new Uint32Array(256);
+        let rCnt = 0;
+        for (let i = 0; i < N * N; i++) if (roiMask[i]) { rHist[Math.max(0, Math.min(255, Math.round(smL[i])))]++; rCnt++; }
+        const rOtsu = rCnt > 50 ? ImageVectorizer.computeOtsuStats(rHist, rCnt) : { separability: 0, threshold: 128, m1: 100, m2: 120 };
+
+        if (rOtsu.separability >= 0.80 && Math.abs(rOtsu.m2 - rOtsu.m1) >= 65) {
+          // Flat engraved wood plaque: cancel background bamboo planks completely & trace crisp relief
+          const isDarkDesign = rOtsu.m2 > rOtsu.m1;
+          const bgSeed = new Uint8Array(N * N);
+          for (let i = 0; i < N * N; i++) {
+            if (roi.chromaDiff[i] <= 24 && (isDarkDesign ? smL[i] >= rOtsu.threshold : smL[i] <= rOtsu.threshold)) bgSeed[i] = 1;
+          }
+          const planeR = Math.max(8, Math.round(Math.min(roi.w, roi.h) * 0.08));
+          const bgPlane = ImageVectorizer.maskedBoxMean(smL, bgSeed, N, N, planeR);
+          for (let i = 0; i < N * N; i++) {
+            if (roi.chromaDiff[i] > 24) { this.data[i] = 0; continue; }
+            const dVal = isDarkDesign ? Math.max(0, bgPlane[i] - smL[i]) : Math.max(0, smL[i] - bgPlane[i]);
+            const cleanZ = Math.max(0, Math.min(1, (dVal - 26) / 72.0));
+            this.data[i] = Math.pow(cleanZ, 0.85) * 0.72;
+          }
+          this.notify();
+          return;
+        }
+
+        const minRoi = Math.min(roi.w, roi.h);
+        const minR = Math.max(2, Math.min(5, Math.round(minRoi * 0.014)));
+        const medR = Math.max(5, Math.min(14, Math.round(minRoi * 0.045)));
+        const openedL = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(smL, N, N, minR, false), N, N, minR, true);
+        const closedL = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(smL, N, N, minR, true), N, N, minR, false);
+        const openedMed = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(smL, N, N, medR, false), N, N, medR, true);
+        const closedMed = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(smL, N, N, medR, true), N, N, medR, false);
+        const planeR = Math.max(10, Math.round(minRoi * 0.08));
+        const plane = ImageVectorizer.maskedBoxMean(smL, roiMask, N, N, planeR);
+        const baseLevel = invert ? 0.65 : 0.35;
+        for (let i = 0; i < N * N; i++) {
+          const inRoiBox = roiMask[i] || wmMask[i];
+          if (!inRoiBox) {
+            this.data[i] = 0;
+            continue;
+          }
+          if (wmMask[i]) {
+            // Suppress colored/white watermark bump smoothly onto flat local door plane
+            this.data[i] = Math.pow(baseLevel, gamma);
+            continue;
+          }
+          const wh = (Math.max(0, smL[i] - openedL[i]) * 0.45 + Math.max(0, smL[i] - openedMed[i]) * 0.55) / 72.0;
+          const bh = (Math.max(0, closedL[i] - smL[i]) * 0.45 + Math.max(0, closedMed[i] - smL[i]) * 0.55) / 72.0;
+          const slow = (smL[i] - plane[i]) / 100.0;
+          const rawDelta = (wh * 1.15 - bh * 0.95 + slow * 0.42) * (invert ? -1 : 1);
+          const zNorm = Math.max(0.05, Math.min(1.0, baseLevel + rawDelta));
+          this.data[i] = Math.pow(zNorm, gamma);
+        }
+        this.notify();
+        return;
+      }
+    }
 
     if (isTexturedPhoto) {
       const sat = ImageVectorizer.buildIntegralImage(rawLuma, N, N);

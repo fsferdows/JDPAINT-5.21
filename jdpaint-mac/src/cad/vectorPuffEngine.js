@@ -294,11 +294,11 @@ export class VectorPuffEngine {
 
     const scaleX = N / wMm;
     const scaleY = N / hMm;
-    const mmPerPixel = wMm / N;
+    const mmPerPixel = (wMm + hMm) / (2 * N);
 
     const isStroke = VectorPuffEngine.shouldStrokeEntity(ent, forceCloseOpen);
     const strokeHalfWidthMm = Math.max(1.0, Math.min(radiusMm, 25.0));
-    const strokeWidthPx = Math.max(2, strokeHalfWidthMm * 2 * scaleX);
+    const strokeWidthPx = Math.max(2, strokeHalfWidthMm * 2 * Math.min(scaleX, scaleY));
     const padPx = isStroke ? Math.ceil(strokeWidthPx / 2 + 4) : 4;
 
     const box = VectorPuffEngine.getEntityPixelBox(ent, scaleX, scaleY, N, padPx);
@@ -364,10 +364,16 @@ export class VectorPuffEngine {
 
     const effectiveRadiusMm = isStroke ? strokeHalfWidthMm : radiusMm;
     const rawTargetPx = Math.max(1.0, effectiveRadiusMm / mmPerPixel);
-    const targetRadiusPixels = (adaptiveRadius || ent.relief?.adaptiveRadius) && actualMaxDistPx > 0
+    const isAdaptive = !!(adaptiveRadius || ent.relief?.adaptiveRadius);
+    const targetRadiusPixels = isAdaptive && actualMaxDistPx > 0
       ? Math.min(rawTargetPx, Math.max(1.2, actualMaxDistPx))
       : rawTargetPx;
-    const normHeight = Math.min(1.0, Math.max(0.0, Math.abs(heightMm) / maxDepth));
+    // Prevent only ultra-thin (<0.8mm wide) micro noise from towering as spikes while keeping normal 1mm+ carved petals lush & bold
+    const widthTaper = isAdaptive && shape !== 'flat'
+      ? Math.min(1.0, Math.max(0.45, (actualMaxDistPx * mmPerPixel) / 0.42))
+      : 1.0;
+    const normHeight = Math.min(1.0, Math.max(0.0, Math.abs(heightMm) / maxDepth)) * widthTaper;
+    const flatBevelPx = Math.max(1.5, Math.min(rawTargetPx, Math.max(2.0, actualMaxDistPx * 0.35)));
 
     for (let ly = 0; ly < box.bh; ly++) {
       const globalRow = (box.y0 + ly) * N;
@@ -380,7 +386,10 @@ export class VectorPuffEngine {
 
           let profileZ = 0;
           if (shape === 'dome') {
-            profileZ = Math.sqrt(Math.max(0, 1.0 - Math.pow(1.0 - t, 2)));
+            // Blend smooth S-base with elliptic dome so perimeter rises gracefully without black staircase edge cliffs!
+            const circ = Math.pow(Math.max(0, 1.0 - Math.pow(1.0 - t, 2)), 0.72);
+            const sinBell = 0.5 * (1.0 - Math.cos(t * Math.PI));
+            profileZ = circ * 0.55 + sinBell * 0.45;
           } else if (shape === 'cone') {
             profileZ = t;
           } else if (shape === 'smooth') {
@@ -395,8 +404,9 @@ export class VectorPuffEngine {
             // Concave bowl/dish profile (carves inward cleanly)
             profileZ = 1.0 - Math.sqrt(Math.max(0, 1.0 - t * t));
           } else if (shape === 'flat') {
-            // Crisp tabletop extrusion with subtle 1.5px chamfered shoulder to avoid jagged stairsteps
-            profileZ = d < 1.5 ? d / 1.5 : 1.0;
+            // Crisp beveled plateau for architectural signage & plaques
+            const tb = Math.min(1.0, d / flatBevelPx);
+            profileZ = tb * tb * (3.0 - 2.0 * tb);
           }
 
           const zVal = profileZ * normHeight * alphaCov[lIdx];
@@ -489,7 +499,7 @@ export class VectorPuffEngine {
         if (mask[row + q] === 0) {
           dist[row + q] = 0;
         } else {
-          dist[row + q] = d2 >= INF * 0.5 ? Math.max(w, h) : Math.max(0.45, Math.sqrt(d2) - 0.35);
+          dist[row + q] = d2 >= INF * 0.5 ? Math.max(w, h) : Math.max(0.25, Math.sqrt(d2) - 0.5);
         }
       }
     }

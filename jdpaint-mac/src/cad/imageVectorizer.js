@@ -922,7 +922,7 @@ export class ImageVectorizer {
     lVals.sort((u, v) => u - v);
     const lMed = lVals.length > 0 ? lVals[Math.floor(lVals.length * 0.5)] : 50;
 
-    // Classify pixels consistent with panel material & deep carving shadow undercuts
+    // Classify pixels consistent with furniture panel tone & carved undercuts
     const panelMask = new Uint8Array(n);
     const chromaDiff = new Float32Array(n);
     for (let i = 0; i < n; i++) {
@@ -1111,7 +1111,7 @@ export class ImageVectorizer {
     const n = w * h;
     const roi = ImageVectorizer.detectFurnitureROI(rArr, gArr, bArr, lumaRaw, w, h);
 
-    // 1. Suppress exterior background & non-wood colorful watermarks ("DTECH", "WOOD WORLD", "Doors Fair")
+    // 1. Suppress exterior background & non-wood colorful/neutral overlay watermarks
     const roiMask = new Uint8Array(n);
     const chromaMask = new Float32Array(n);
     const watermarkTol = roi.chromaMed > 14 ? 15 : 22;
@@ -1120,8 +1120,10 @@ export class ImageVectorizer {
       for (let x = roi.x0; x <= roi.x1; x++) {
         const i = row + x;
         const dc = roi.chromaDiff[i];
-        if (dc > watermarkTol && (roi.L[i] > roi.lMed + 8 || dc > 23)) {
-          chromaMask[i] = dc > watermarkTol + 4 ? 0 : Math.max(0, 1.0 - (dc - watermarkTol) / 4.0);
+        const rgbSat = Math.max(rArr[i], gArr[i], bArr[i]) - Math.min(rArr[i], gArr[i], bArr[i]);
+        const isNeutralOverlay = roi.chromaMed > 14 && roi.L[i] > 84 && rgbSat < 18;
+        if (isNeutralOverlay || (dc > watermarkTol && (roi.L[i] > roi.lMed + 8 || dc > 23))) {
+          chromaMask[i] = (isNeutralOverlay || dc > watermarkTol + 4) ? 0 : Math.max(0, 1.0 - (dc - watermarkTol) / 4.0);
           roiMask[i] = chromaMask[i] > 0.25 ? 1 : 0;
         } else {
           roiMask[i] = 1;
@@ -1134,10 +1136,10 @@ export class ImageVectorizer {
     const sy = opts.bounds.h / h;
     const roiMaxSpanW = roi.w * sx * 0.88;
     const roiMaxSpanH = roi.h * sy * 0.88;
-    const roiEdgeLeftMm = opts.bounds.x + (roi.x0 + 6) * sx;
-    const roiEdgeRightMm = opts.bounds.x + (roi.x1 - 6) * sx;
-    const roiEdgeTopMm = opts.bounds.y + (roi.y0 + 6) * sy;
-    const roiEdgeBotMm = opts.bounds.y + (roi.y1 - 6) * sy;
+    const roiEdgeLeftMm = opts.bounds.x + (roi.x0 + 12) * sx;
+    const roiEdgeRightMm = opts.bounds.x + (roi.x1 - 12) * sx;
+    const roiEdgeTopMm = opts.bounds.y + (roi.y0 + 16) * sy;
+    const roiEdgeBotMm = opts.bounds.y + (roi.y1 - 16) * sy;
     const minWoodSpanMm = Math.max(opts.minSpanMm || 0.9, 1.1);
     const minFeatureAreaPx = Math.max(opts.minAreaPx || 12, Math.round(roi.w * roi.h * 0.00024));
 
@@ -1151,9 +1153,9 @@ export class ImageVectorizer {
       if (ew > roiMaxSpanW && eh > roiMaxSpanH) return false;
       if ((minX <= roiEdgeLeftMm || maxX >= roiEdgeRightMm) && ew < roi.w * sx * 0.08 && eh > roi.h * sy * 0.25) return false;
       if ((minY <= roiEdgeTopMm || maxY >= roiEdgeBotMm) && eh < roi.h * sy * 0.07 && ew > roi.w * sx * 0.25) return false;
-      const shortSide = Math.min(ew, eh);
-      const longSide = Math.max(ew, eh);
-      if (shortSide < 1.95 && longSide / Math.max(0.2, shortSide) > 10.5 && (!ent.holes || ent.holes.length === 0)) return false;
+      const isBorderMarginSliver =
+        minX <= roiEdgeLeftMm || maxX >= roiEdgeRightMm || minY <= roiEdgeTopMm || maxY >= roiEdgeBotMm;
+      if (isBorderMarginSliver && ew * eh < roi.w * sx * roi.h * sy * 0.0022 && (!ent.holes || ent.holes.length === 0)) return false;
       return true;
     });
 
@@ -1229,12 +1231,13 @@ export class ImageVectorizer {
         strokeColor: '#38bdf8',
         layerGroup: 'Engraved Wood Design',
         namePrefix: 'Engraved Motif',
-        heightMm: Number((opts.maxDepthMm * 0.72).toFixed(2)),
-        shape: 'dome',
+        heightMm: Number((opts.maxDepthMm * 0.55).toFixed(2)),
+        shape: 'flat',
         mode: 'max',
-        adaptiveRadius: true,
+        adaptiveRadius: false,
         rejectFullFrame: false,
       }));
+      engEnts.forEach((e) => { if (e.relief) e.relief.radiusMm = 1.6; });
       if (engEnts.length >= 2) return engEnts.slice(0, opts.maxContours);
     }
 
@@ -1243,8 +1246,8 @@ export class ImageVectorizer {
     const localPlane = ImageVectorizer.maskedBoxMean(smoothLuma, roiMask, w, h, planeR);
 
     const minRoi = Math.min(roi.w, roi.h);
-    const rFine = Math.max(2, Math.min(4, Math.round(minRoi * 0.0085)));
-    const rMed = Math.max(5, Math.min(8, Math.round(minRoi * 0.017)));
+    const rFine = Math.max(2, Math.min(3, Math.round(minRoi * 0.0065)));
+    const rMed = Math.max(5, Math.min(7, Math.round(minRoi * 0.015)));
 
     const closedFine = ImageVectorizer.separableExtrema(
       ImageVectorizer.separableExtrema(smoothLuma, w, h, rFine, true), w, h, rFine, false
@@ -1274,8 +1277,9 @@ export class ImageVectorizer {
         const bhM = Math.max(0, closedMed[i] - smoothLuma[i]);
         const negDiff = Math.max(0, localPlane[i] - smoothLuma[i]);
 
-        rawWh[i] = Math.min(255, ((whF * 0.62 + whM * 0.38) * 1.52 + posDiff * 0.22) * chromaMask[i]);
-        rawBh[i] = Math.min(255, ((bhF * 0.64 + bhM * 0.36) * 1.54 + negDiff * 0.28) * chromaMask[i]);
+        // Keep raised petals crisp against local V-crevices (minimal background mound posDiff!) while grooves preserve channels
+        rawWh[i] = Math.min(255, ((whF * 0.68 + whM * 0.32) * 1.62 + posDiff * 0.05) * chromaMask[i]);
+        rawBh[i] = Math.min(255, ((bhF * 0.68 + bhM * 0.32) * 1.56 + negDiff * 0.16) * chromaMask[i]);
       }
     }
 
@@ -1310,8 +1314,8 @@ export class ImageVectorizer {
       const row = y * w;
       for (let x = xMin; x <= xMax; x++) {
         const i = row + x;
-        const rv = Math.min(255, Math.max(0, (raisedScore[i] - rFloor * 1.28) * 1.8));
-        const gv = Math.min(255, Math.max(0, (grooveScore[i] - gFloor * 1.28) * 1.8));
+        const rv = Math.min(255, Math.max(0, (raisedScore[i] - rFloor * 1.24) * 1.8));
+        const gv = Math.min(255, Math.max(0, (grooveScore[i] - gFloor * 1.20) * 1.8));
         cleanRaised[i] = rv;
         cleanGroove[i] = gv;
         const rh = Math.min(255, Math.round(Math.min(rCap * 1.8, rv)));
@@ -1364,15 +1368,31 @@ export class ImageVectorizer {
       rejectFullFrame: true,
     }));
 
-    // Heal 1px directional collinear continuity breaks inside carved panel frames (strictly outside raised petals!)
+    // Build structural groove mask: bridge 1-2px collinear gaps along rails/louvers & filter ONLY chaotic 3px inter-petal valleys
     const bridgedG = new Uint8Array(grooveMask);
+    const trapR = 3;
     for (let y = yMin; y <= yMax; y++) {
       const row = y * w;
       for (let x = xMin; x <= xMax; x++) {
         const i = row + x;
-        if (!bridgedG[i] && roiMask[i] && cleanRaised[i] < rTh * 0.65 && cleanGroove[i] >= gTh * 0.45) {
-          if ((grooveMask[i - 1] && grooveMask[i + 1]) || (grooveMask[i - w] && grooveMask[i + w])) {
-            bridgedG[i] = 1;
+        if (!bridgedG[i] && roiMask[i] && cleanRaised[i] < rTh * 0.72 && cleanGroove[i] >= gTh * 0.36) {
+          const hGap = (grooveMask[i - 1] && grooveMask[i + 1]) || (x > 2 && x < w - 3 && grooveMask[i - 2] && grooveMask[i + 2]);
+          const vGap = (grooveMask[i - w] && grooveMask[i + w]) || (y > 2 && y < h - 3 && grooveMask[i - 2 * w] && grooveMask[i + 2 * w]);
+          if (hGap || vGap) bridgedG[i] = 1;
+        }
+        if (bridgedG[i]) {
+          // Keep clean linear horizontal louvers & vertical panel grooves intact; suppress only tight 3px 4-way pocket blotches
+          const isLinearRun = (x > 3 && x < w - 4 && grooveMask[i - 2] && grooveMask[i + 2])
+            || (y > 3 && y < h - 4 && grooveMask[i - 2 * w] && grooveMask[i + 2 * w]);
+          if (!isLinearRun) {
+            let hitL = false, hitR = false, hitU = false, hitD = false;
+            for (let d = 1; d <= trapR; d++) {
+              if (x - d >= 0 && cleanR[row + x - d]) hitL = true;
+              if (x + d < w && cleanR[row + x + d]) hitR = true;
+              if (y - d >= 0 && cleanR[(y - d) * w + x]) hitU = true;
+              if (y + d < h && cleanR[(y + d) * w + x]) hitD = true;
+            }
+            if ((hitL && hitR) && (hitU && hitD)) bridgedG[i] = 0;
           }
         }
       }
@@ -1382,8 +1402,8 @@ export class ImageVectorizer {
     const grooveEnts = filterWoodEnts(ImageVectorizer.vectorizeMaskLoops(gLoops, cleanGroove, w, h, -1, {
       ...opts,
       refineEdges: false,
-      minAreaPx: minFeatureAreaPx,
-      minSpanMm: minWoodSpanMm,
+      minAreaPx: Math.max(8, Math.round(minFeatureAreaPx * 0.65)),
+      minSpanMm: Math.max(0.85, minWoodSpanMm * 0.85),
       maxContours: Math.floor(opts.maxContours * 0.45),
       fillColor: '#0ea5e9',
       strokeColor: '#38bdf8',
@@ -1391,8 +1411,8 @@ export class ImageVectorizer {
       namePrefix: 'Molding / Groove',
       toneLevel: 1,
       toneTotal: 2,
-      heightMm: Number((opts.maxDepthMm * 0.38).toFixed(2)),
-      shape: 'vcarve',
+      heightMm: Number((opts.maxDepthMm * 0.30).toFixed(2)),
+      shape: 'smooth',
       mode: 'max',
       adaptiveRadius: true,
       rejectFullFrame: true,
@@ -2086,6 +2106,14 @@ export class ImageVectorizer {
     if (circleAnchors) return circleAnchors;
 
     const n = workLoop.length;
+    // Periodic 1-pass Taubin-cleaned probe loop so Marching Squares stairsteps never trigger fake corners!
+    let probeLoop = workLoop;
+    if (n >= 8) {
+      const wrap = workLoop.concat([workLoop[0], workLoop[1]]);
+      const sm = ImageVectorizer.taubinSmoothOpen(wrap, 1);
+      probeLoop = sm.slice(0, n);
+    }
+
     // Step 2: Cumulative arc length along subpixel contour
     const s = new Float64Array(n + 1);
     for (let i = 0; i < n; i++) {
@@ -2095,36 +2123,45 @@ export class ImageVectorizer {
     const perimeter = s[n];
     if (perimeter < 4.0) return null;
 
-    // Staircase-immune chord window (~4.5..7.5px on normal paths, proportional on tiny features)
-    const wChord = perimeter >= 22
-      ? Math.max(4.4, Math.min(perimeter * 0.10, 3.6 * scaleRatio))
-      : Math.max(2.0, perimeter * 0.14);
-    const sampleArc = (uTarget) => {
+    // Sharp corner probe chord (large enough to ignore pixel grid, small enough to keep star/letter tips!)
+    const wChord = perimeter >= 20
+      ? Math.max(3.0, Math.min(perimeter * 0.065, 2.5 * scaleRatio))
+      : Math.max(1.8, perimeter * 0.12);
+    const sampleArc = (loopArr, uTarget) => {
       const u = ((uTarget % perimeter) + perimeter) % perimeter;
       let lo = 0, hi = n;
       while (hi - lo > 1) {
         const m = (lo + hi) >> 1;
         if (s[m] <= u) lo = m; else hi = m;
       }
-      const a = workLoop[lo], b = workLoop[(lo + 1) % n];
+      const a = loopArr[lo], b = loopArr[(lo + 1) % n];
       const seg = s[lo + 1] - s[lo] || 1;
       const t = (u - s[lo]) / seg;
       return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
     };
 
-    const minCornerRad = Math.max(0.42, 1.06 - (opts.corners || 0.6) * 0.60);
+    const minCornerRad = Math.max(0.55, 1.18 - (opts.corners || 0.6) * 0.50);
     const turns = new Float32Array(n);
     const cand = [];
     for (let i = 0; i < n; i++) {
-      const p = workLoop[i];
-      const a = sampleArc(s[i] - wChord);
-      const b = sampleArc(s[i] + wChord);
+      const p = probeLoop[i];
+      const a = sampleArc(probeLoop, s[i] - wChord);
+      const b = sampleArc(probeLoop, s[i] + wChord);
       const ux = p[0] - a[0], uy = p[1] - a[1];
       const vx = b[0] - p[0], vy = b[1] - p[1];
       const den = Math.hypot(ux, uy) * Math.hypot(vx, vy);
-      const ang = den > 1e-9 ? Math.acos(Math.max(-1, Math.min(1, (ux * vx + uy * vy) / den))) : 0;
-      turns[i] = ang;
-      if (ang >= minCornerRad) cand.push(i);
+      turns[i] = den > 1e-9 ? Math.acos(Math.max(-1, Math.min(1, (ux * vx + uy * vy) / den))) : 0;
+    }
+
+    for (let i = 0; i < n; i++) {
+      const ang = turns[i];
+      if (ang < minCornerRad) continue;
+      // Distinguish genuine sharp vertex from uniform curved arc via local curvature prominence!
+      const stepIdx = Math.max(1, Math.round((wChord * 1.15) / Math.max(0.5, perimeter / n)));
+      const avgNb = 0.5 * (turns[(i - stepIdx + n) % n] + turns[(i + stepIdx) % n]);
+      if (ang >= 1.12 || ang - avgNb >= 0.28) {
+        cand.push(i);
+      }
     }
 
     cand.sort((a, b) => turns[b] - turns[a] || a - b);
@@ -2258,7 +2295,9 @@ export class ImageVectorizer {
         if (dot < 0.94) continue;
         const combinedP = s1.P.slice(0, -1).concat(s2.P);
         const tlsComb = ImageVectorizer.fitLineTLS(combinedP);
-        if (tlsComb && tlsComb.dev <= lineTol * 1.45) {
+        const combLs = s1.Ls + s2.Ls;
+        const combLim = combLs >= 16 ? Math.min(2.7, Math.max(lineTol * 1.45, combLs * 0.042)) : lineTol * 1.35;
+        if (tlsComb && tlsComb.dev <= combLim) {
           const combInfo = classifySpan(combinedP);
           combInfo.isLine = true;
           combInfo.A = combInfo.B = snapAxisLine(tlsComb, combInfo.Ls);
