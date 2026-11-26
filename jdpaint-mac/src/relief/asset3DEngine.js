@@ -25,9 +25,11 @@ export class Asset3DEngine {
     const {
       assetMode = 'double-sided',
       resolution = 256,
-      texSize = 1024,
+      texSize = 4096,
       removeBg = true,
       delight = true,
+      enhanceImage = true,
+      splitParts = false,
       invert = false,
       edgeStrength = 0.36,
       filletRatio = 0.012,
@@ -37,8 +39,8 @@ export class Asset3DEngine {
       useNeuralAI = true,
     } = options;
 
-    await emit(1, 8, `Stage 1/5: Rasterizing high-density aspect grid & isolating subject (${resolution}px tier)...`);
-    const prep = Asset3DEngine._prepareCanvasAndMask(imgElement, { resolution, texSize, removeBg, delight, invert, edgeStrength });
+    await emit(1, 8, `Stage 1/5: Rasterizing high-density aspect grid & isolating subject (${resolution}px / ${texSize}px PBR)...`);
+    const prep = Asset3DEngine._prepareCanvasAndMask(imgElement, { resolution, texSize, removeBg, delight, enhanceImage, invert, edgeStrength });
 
     if (useNeuralAI && NeuralVision.isBrowserRuntime()) {
       const neuralRes = await NeuralVision.analyzeSubjectAsync(
@@ -81,19 +83,19 @@ export class Asset3DEngine {
       }
     }
 
-    await emit(2, 46, `Stage 2/5: Computing ${prep.neuralDepth ? 'Depth-Anything V2 + ' : ''}Felzenszwalb L2 SDF & ${prep.isPlanarPanel ? 'Planar CNC Relief' : 'Jacobi Poisson 3D Volume'}...`);
+    await emit(2, 46, `Stage 2/5: Computing ${prep.neuralDepth ? 'Depth-Anything V2 + ' : ''}Poisson SFS + L2 SDF (${prep.isPlanarPanel ? 'Planar CNC Relief' : 'Volumetric 3D'})...`);
     Asset3DEngine._solveSurfaceDepth(prep, { delight, invert, edgeStrength });
 
     await emit(3, 64, `Stage 3/5: Applying Volume-Preserving Taubin Fairing & Sobel Rolling-Ball Fillet (r=${filletRatio.toFixed(3)})...`);
     Asset3DEngine.taubinSmoothDepth(prep.depth, prep.fgMask, prep.resX, prep.resY, prep.isPlanarPanel ? 6 : 5);
     Asset3DEngine.applySlopeAwareFillet(prep.depth, prep.fgMask, prep.resX, prep.resY, prep.aspect >= 1 ? widthMm : widthMm * prep.aspect, thicknessMm, filletRatio);
 
-    await emit(4, 82, `Stage 4/5: Newton-Raphson zero-isocontour rim snapping & watertight manifold ${assetMode.toUpperCase()} mesh (${prep.resX}×${prep.resY})...`);
+    await emit(4, 82, `Stage 4/5: Newton zero-isocontour rim snapping & watertight manifold ${assetMode.toUpperCase()} mesh (${prep.resX}×${prep.resY})...`);
     const analysis = Asset3DEngine._finalizeAnalysis(prep, { texSize, removeBg, delight });
-    const meshData = Asset3DEngine.buildAssetMeshData(analysis, { assetMode, widthMm, heightMm, thicknessMm });
+    const meshData = Asset3DEngine.buildAssetMeshData(analysis, { assetMode, widthMm, heightMm, thicknessMm, splitParts });
 
-    await emit(5, 96, 'Stage 5/5: Synthesizing 1024px Cavity-AO BaseColor, Normal, Roughness & ORM PBR maps...');
-    await emit(5, 100, `Complete: ${meshData.stats.faces.toLocaleString()} watertight faces ready!`);
+    await emit(5, 96, `Stage 5/5: Synthesizing ${analysis.texSize}px Cavity-AO BaseColor, Normal, Roughness & ORM PBR maps...`);
+    await emit(5, 100, `Complete: ${meshData.stats.faces.toLocaleString()} watertight faces (${analysis.texSize}px PBR) ready!`);
 
     return { analysis, meshData };
   }
@@ -121,7 +123,7 @@ export class Asset3DEngine {
   }
 
   /**
-   * Optional Cloud Neural 3D Generator via Meshy API v1 (for users providing their own Meshy API key).
+   * Optional Cloud Neural 3D Generator via Meshy API v1/multi-view (4K input upload + High Detail / Smart Topology).
    */
   static async generateViaMeshyCloudApi(imgElement, apiKey, options = {}, onProgress = null) {
     const cleanKey = String(apiKey || '').trim();
@@ -129,38 +131,67 @@ export class Asset3DEngine {
     const {
       aiModel = 'latest',
       topology = 'triangle',
-      targetPolycount = 60000,
+      targetPolycount = 300000,
       enablePbr = true,
       shouldRemesh = true,
+      imageEnhancement = true,
+      extraImages = [],
     } = options;
 
-    if (typeof onProgress === 'function') onProgress(1, 8, 'Uploading image to Meshy Cloud API v1...');
-    const c = document.createElement('canvas');
-    const iw = imgElement.naturalWidth || imgElement.width || 512;
-    const ih = imgElement.naturalHeight || imgElement.height || 512;
-    const maxEdge = 1024;
-    const sc = Math.min(1.0, maxEdge / Math.max(1, iw, ih));
-    c.width = Math.max(64, Math.round(iw * sc));
-    c.height = Math.max(64, Math.round(ih * sc));
-    c.getContext('2d').drawImage(imgElement, 0, 0, c.width, c.height);
-    const imageUrl = c.toDataURL('image/png');
+    const encodeImgDataUrl = (img) => {
+      const c = document.createElement('canvas');
+      const iw = img.naturalWidth || img.width || 512;
+      const ih = img.naturalHeight || img.height || 512;
+      const maxEdge = 4096;
+      const sc = Math.min(1.0, maxEdge / Math.max(1, iw, ih));
+      c.width = Math.max(64, Math.round(iw * sc));
+      c.height = Math.max(64, Math.round(ih * sc));
+      const ctx = c.getContext('2d');
+      if (ctx) {
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(img, 0, 0, c.width, c.height);
+      }
+      return c.toDataURL('image/png');
+    };
+
+    if (typeof onProgress === 'function') onProgress(1, 8, 'Uploading 4K image(s) to Meshy Cloud Neural 3D API...');
+    const imageUrl = encodeImgDataUrl(imgElement);
+    const extraUrls = Array.isArray(extraImages) ? extraImages.filter(Boolean).map(encodeImgDataUrl) : [];
+    const useMultiView = extraUrls.length >= 1;
 
     const headers = {
       Authorization: `Bearer ${cleanKey}`,
       'Content-Type': 'application/json',
     };
-    const createResp = await fetch('https://api.meshy.ai/openapi/v1/image-to-3d', {
+    const endpoint = useMultiView
+      ? 'https://api.meshy.ai/openapi/v1/multi-image-to-3d'
+      : 'https://api.meshy.ai/openapi/v1/image-to-3d';
+    const bodyPayload = useMultiView
+      ? {
+          image_urls: [imageUrl, ...extraUrls].slice(0, 4),
+          ai_model: aiModel,
+          topology,
+          target_polycount: targetPolycount,
+          enable_pbr: enablePbr,
+          should_remesh: shouldRemesh,
+          should_texture: true,
+        }
+      : {
+          image_url: imageUrl,
+          ai_model: aiModel,
+          topology,
+          target_polycount: targetPolycount,
+          enable_pbr: enablePbr,
+          should_remesh: shouldRemesh,
+          should_texture: true,
+          moderation: false,
+          ...(imageEnhancement ? { model_type: topology === 'quad' ? 'lowpoly' : 'standard' } : {}),
+        };
+
+    const createResp = await fetch(endpoint, {
       method: 'POST',
       headers,
-      body: JSON.stringify({
-        image_url: imageUrl,
-        ai_model: aiModel,
-        topology,
-        target_polycount: targetPolycount,
-        enable_pbr: enablePbr,
-        should_remesh: shouldRemesh,
-        should_texture: true,
-      }),
+      body: JSON.stringify(bodyPayload),
     });
     if (!createResp.ok) {
       const msg = await createResp.text();
@@ -170,9 +201,12 @@ export class Asset3DEngine {
     const taskId = created.result;
     if (!taskId) throw new Error('Meshy API did not return a valid task id.');
 
-    for (let poll = 0; poll < 120; poll++) {
+    const pollBase = useMultiView
+      ? 'https://api.meshy.ai/openapi/v1/multi-image-to-3d'
+      : 'https://api.meshy.ai/openapi/v1/image-to-3d';
+    for (let poll = 0; poll < 150; poll++) {
       await new Promise((r) => setTimeout(r, 2000));
-      const pollResp = await fetch(`https://api.meshy.ai/openapi/v1/image-to-3d/${encodeURIComponent(taskId)}`, { headers });
+      const pollResp = await fetch(`${pollBase}/${encodeURIComponent(taskId)}`, { headers });
       if (!pollResp.ok) continue;
       const task = await pollResp.json();
       const pct = Math.max(12, Math.min(96, Math.round(task.progress || 15)));
@@ -180,7 +214,7 @@ export class Asset3DEngine {
         onProgress(3, pct, `Meshy Cloud Neural Inference (${task.status || 'IN_PROGRESS'})... ${pct}%`);
       }
       if (task.status === 'SUCCEEDED' && task.model_urls?.glb) {
-        if (typeof onProgress === 'function') onProgress(5, 98, 'Downloading generated neural .GLB PBR asset...');
+        if (typeof onProgress === 'function') onProgress(5, 98, 'Downloading generated 4K PBR neural .GLB asset...');
         const glbResp = await fetch(task.model_urls.glb);
         if (!glbResp.ok) throw new Error(`Failed downloading Meshy GLB (${glbResp.status})`);
         const glbBuffer = await glbResp.arrayBuffer();
@@ -191,23 +225,23 @@ export class Asset3DEngine {
         throw new Error(task.task_error?.message || `Meshy task ${task.status}`);
       }
     }
-    throw new Error('Meshy Cloud task timed out after 4 minutes.');
+    throw new Error('Meshy Cloud task timed out after 5 minutes.');
   }
 
   static _prepareCanvasAndMask(imgElement, opts) {
-    const { resolution = 160, texSize = 1024, removeBg = true } = opts;
-    const baseRes = Math.max(48, Math.min(512, Math.round(resolution)));
+    const { resolution = 160, texSize = 1024, removeBg = true, enhanceImage = false } = opts;
+    const baseRes = Math.max(48, Math.min(1024, Math.round(resolution)));
     const iw = imgElement.naturalWidth || imgElement.width || 1;
     const ih = imgElement.naturalHeight || imgElement.height || 1;
     const imgAspect = iw / Math.max(1, ih);
 
-    // Choose adaptive rectangular grid (resX x resY) matching source aspect & High/Flagship quality budget
+    // Choose adaptive rectangular grid (resX x resY) matching source aspect & Flagship / 4K quality budget
     let resX = baseRes;
     let resY = baseRes;
     if (baseRes >= 128 || Math.abs(imgAspect - 1.0) >= 0.05) {
       const areaBudget = baseRes * baseRes * (baseRes >= 144 ? 1.65 : 1.45);
-      resX = Math.max(84, Math.min(512, Math.round(Math.sqrt(areaBudget * imgAspect))));
-      resY = Math.max(84, Math.min(512, Math.round(Math.sqrt(areaBudget / imgAspect))));
+      resX = Math.max(84, Math.min(1024, Math.round(Math.sqrt(areaBudget * imgAspect))));
+      resY = Math.max(84, Math.min(1024, Math.round(Math.sqrt(areaBudget / imgAspect))));
     }
 
     const drawToCanvas = (w, h, sx = 0, sy = 0, sw = iw, sh = ih) => {
@@ -229,7 +263,7 @@ export class Asset3DEngine {
     let activeAspect = imgAspect;
     let srcCropX = 0, srcCropY = 0, srcCropW = iw, srcCropH = ih;
 
-    const extractMaskAndStats = (buf, W, H) => {
+    const extractMaskAndStats = (buf, W, H, keepFullRect = false) => {
       const total = W * H;
       const rArr = new Float32Array(total);
       const gArr = new Float32Array(total);
@@ -253,8 +287,10 @@ export class Asset3DEngine {
         chromaL[i] = cl; chromaA[i] = ca; chromaB[i] = cb;
       }
 
-      const fgMask = Asset3DEngine.extractBorderConnectedForeground(alpha, chromaL, chromaA, chromaB, W, H, { removeBg, hasTransparency });
-      ImageVectorizer.removeCheckerboardPinches(fgMask, W, H, false);
+      const fgMask = keepFullRect
+        ? new Uint8Array(total).fill(1)
+        : Asset3DEngine.extractBorderConnectedForeground(alpha, chromaL, chromaA, chromaB, W, H, { removeBg, hasTransparency });
+      if (!keepFullRect) ImageVectorizer.removeCheckerboardPinches(fgMask, W, H, false);
 
       let minFgX = W - 1, maxFgX = 0, minFgY = H - 1, maxFgY = 0, fgCount = 0;
       for (let y = 0; y < H; y++) {
@@ -356,15 +392,28 @@ export class Asset3DEngine {
         srcCropH = Math.max(8, ((cy1 - cy0) / Math.max(1, resY - 1)) * ih);
         activeAspect = srcCropW / Math.max(1, srcCropH);
         const areaBudget = baseRes * baseRes * (baseRes >= 144 ? 1.65 : 1.5);
-        resX = Math.max(96, Math.min(512, Math.round(Math.sqrt(areaBudget * activeAspect))));
-        resY = Math.max(96, Math.min(512, Math.round(Math.sqrt(areaBudget / activeAspect))));
+        resX = Math.max(96, Math.min(1024, Math.round(Math.sqrt(areaBudget * activeAspect))));
+        resY = Math.max(96, Math.min(1024, Math.round(Math.sqrt(areaBudget / activeAspect))));
         rgba = drawToCanvas(resX, resY, srcCropX, srcCropY, srcCropW, srcCropH);
-        data = extractMaskAndStats(rgba, resX, resY);
+        const lockedPanel = data.isPlanarPanel && !data.hasTransparency;
+        data = extractMaskAndStats(rgba, resX, resY, lockedPanel);
+        if (lockedPanel) data.isPlanarPanel = true;
       }
     }
 
-    const tSize = Math.max(256, Math.min(1024, Math.round(texSize)));
+    const tSize = Math.max(256, Math.min(4096, Math.round(texSize)));
     const texRgba = drawToCanvas(tSize, tSize, srcCropX, srcCropY, srcCropW, srcCropH);
+
+    // Subtle Meshy Image Enhancement pass (gentle local crispness boost without shifting border silhouette)
+    if (enhanceImage && data.total > 64) {
+      const lSm = ImageVectorizer.gaussianBlur3x3(data.luma, resX, resY);
+      for (let i = 0; i < data.total; i++) {
+        if (!data.fgMask[i]) continue;
+        const hi = data.luma[i] - lSm[i];
+        data.luma[i] = Math.max(0, Math.min(1, data.luma[i] + hi * 0.28));
+        data.luma255[i] = data.luma[i] * 255.0;
+      }
+    }
 
     // Exact Felzenszwalb L2 Signed Distance Field & Kovesi Gaussian smooth phi for zero-isocontour rim snapping
     const { phi, dIn: rawDist } = ImageVectorizer.computeSignedDistancePhi(data.fgMask, resX, resY, 1.0);
@@ -627,22 +676,24 @@ export class Asset3DEngine {
 
     const sSpan = Math.max(0.08, sMax - sMin);
     const nDepth = prep.neuralDepth || null;
+    const poissonZ = Asset3DEngine._solvePoissonDepthFromShading(rArr, gArr, bArr, lumaSmooth, fgMask, resX, resY);
     const combinedDepth = new Float32Array(total);
     for (let y = 1; y < resY - 1; y++) {
       for (let x = 1; x < resX - 1; x++) {
         const i = y * resX + x;
         if (!fgMask[i]) continue;
         const t = Math.min(1.0, smoothDist[i] / Math.max(3.0, maxDist * 0.85));
-        const macroDome = Math.sqrt(Math.max(0.0, 1.0 - (1.0 - t) * (1.0 - t)));
+        const macroDome = Math.pow(Math.max(0.0, 1.0 - Math.pow(1.0 - t, 1.85)), 0.56);
         const normSculpt = Math.max(0.0, Math.min(1.0, (sculptSignal[i] - sMin) / sSpan));
+        const pVal = invert ? (1.0 - poissonZ[i]) : poissonZ[i];
         const gx = lumaSmooth[i + 1] - lumaSmooth[i - 1];
         const gy = lumaSmooth[i + resX] - lumaSmooth[i - resX];
-        const edgeCrest = Math.min(0.10, Math.hypot(gx, gy) * edgeStrength * 0.45);
+        const edgeCrest = Math.min(0.12, Math.hypot(gx, gy) * edgeStrength * 0.50);
         if (nDepth) {
           const nd = invert ? 1.0 - nDepth[i] : nDepth[i];
-          combinedDepth[i] = Math.max(0.08, Math.min(1.0, nd * 0.62 + macroDome * 0.24 + normSculpt * 0.14 + edgeCrest * 0.08));
+          combinedDepth[i] = Math.max(0.08, Math.min(1.0, nd * 0.54 + pVal * 0.20 + macroDome * 0.16 + normSculpt * 0.14 + edgeCrest * 0.08));
         } else {
-          combinedDepth[i] = Math.max(0.08, Math.min(1.0, macroDome * 0.54 + normSculpt * 0.38 + edgeCrest * 0.10));
+          combinedDepth[i] = Math.max(0.08, Math.min(1.0, pVal * 0.40 + macroDome * 0.36 + normSculpt * 0.24 + edgeCrest * 0.08));
         }
       }
     }
@@ -671,6 +722,107 @@ export class Asset3DEngine {
       jacobiBuf.set(jacobiNext);
     }
     for (let i = 0; i < total; i++) depth[i] = fgMask[i] ? Math.max(0.08, Math.min(1.0, jacobiBuf[i])) : 0;
+  }
+
+  /**
+   * Multigrid Red-Black SOR Dirichlet Poisson Normal Integrator (`∇²Z = div(p, q)` with `Z=0` at silhouette).
+   * Suppresses flat chromatic albedo jumps while recovering smooth convex 3D curvature from surface shading.
+   */
+  static _solvePoissonDepthFromShading(rArr, gArr, bArr, lumaSmooth, fgMask, W, H) {
+    const total = W * H;
+    const zOut = new Float32Array(total);
+    if (W < 8 || H < 8) return zOut;
+
+    const div = new Float32Array(total);
+    const gx = new Float32Array(total);
+    const gy = new Float32Array(total);
+    for (let y = 1; y < H - 1; y++) {
+      const row = y * W;
+      for (let x = 1; x < W - 1; x++) {
+        const i = row + x;
+        if (!fgMask[i]) continue;
+        const dcX = (Math.abs((rArr[i + 1] - gArr[i + 1]) - (rArr[i - 1] - gArr[i - 1])) + Math.abs((gArr[i + 1] - bArr[i + 1]) - (gArr[i - 1] - bArr[i - 1]))) / 255.0;
+        const dcY = (Math.abs((rArr[i + W] - gArr[i + W]) - (rArr[i - W] - gArr[i - W])) + Math.abs((gArr[i + W] - bArr[i + W]) - (gArr[i - W] - bArr[i - W]))) / 255.0;
+        const wx = Math.exp(-dcX * dcX * 14.0);
+        const wy = Math.exp(-dcY * dcY * 14.0);
+        gx[i] = (lumaSmooth[i + 1] - lumaSmooth[i - 1]) * 0.5 * wx;
+        gy[i] = (lumaSmooth[i + W] - lumaSmooth[i - W]) * 0.5 * wy;
+      }
+    }
+    for (let y = 1; y < H - 1; y++) {
+      const row = y * W;
+      for (let x = 1; x < W - 1; x++) {
+        const i = row + x;
+        if (!fgMask[i]) continue;
+        div[i] = (gx[i + 1] - gx[i - 1] + gy[i + W] - gy[i - W]) * 0.5;
+      }
+    }
+
+    // Coarse pyramid warm-start (2x downsample) so low-frequency 3D dome inflation propagates rapidly
+    const cw = Math.max(4, W >> 1);
+    const ch = Math.max(4, H >> 1);
+    const cDiv = new Float32Array(cw * ch);
+    const cFg = new Uint8Array(cw * ch);
+    const cZ = new Float32Array(cw * ch);
+    for (let cy = 0; cy < ch; cy++) {
+      const fy = Math.min(H - 1, cy * 2);
+      for (let cx = 0; cx < cw; cx++) {
+        const fx = Math.min(W - 1, cx * 2);
+        const ci = cy * cw + cx;
+        const fi = fy * W + fx;
+        cFg[ci] = fgMask[fi];
+        cDiv[ci] = div[fi] * 4.0;
+      }
+    }
+    const omegaC = 1.62;
+    for (let it = 0; it < 36; it++) {
+      const par = it & 1;
+      for (let cy = 1; cy < ch - 1; cy++) {
+        const r = cy * cw;
+        for (let cx = 1 + ((cy + par) & 1); cx < cw - 1; cx += 2) {
+          const ci = r + cx;
+          if (!cFg[ci]) continue;
+          const sumN = (cFg[ci - 1] ? cZ[ci - 1] : 0) + (cFg[ci + 1] ? cZ[ci + 1] : 0) + (cFg[ci - cw] ? cZ[ci - cw] : 0) + (cFg[ci + cw] ? cZ[ci + cw] : 0);
+          const gs = (sumN - cDiv[ci]) * 0.25;
+          cZ[ci] += omegaC * (gs - cZ[ci]);
+        }
+      }
+    }
+
+    for (let y = 0; y < H; y++) {
+      const cy = Math.min(ch - 1, y >> 1);
+      const r = y * W, cr = cy * cw;
+      for (let x = 0; x < W; x++) {
+        if (!fgMask[r + x]) continue;
+        zOut[r + x] = cZ[cr + Math.min(cw - 1, x >> 1)];
+      }
+    }
+
+    const omega = 1.55;
+    for (let it = 0; it < 18; it++) {
+      const par = it & 1;
+      for (let y = 1; y < H - 1; y++) {
+        const r = y * W;
+        for (let x = 1 + ((y + par) & 1); x < W - 1; x += 2) {
+          const i = r + x;
+          if (!fgMask[i]) continue;
+          const sumN = (fgMask[i - 1] ? zOut[i - 1] : 0) + (fgMask[i + 1] ? zOut[i + 1] : 0) + (fgMask[i - W] ? zOut[i - W] : 0) + (fgMask[i + W] ? zOut[i + W] : 0);
+          const gs = (sumN - div[i]) * 0.25;
+          zOut[i] += omega * (gs - zOut[i]);
+        }
+      }
+    }
+
+    const vals = [];
+    for (let i = 0; i < total; i += 2) if (fgMask[i]) vals.push(zOut[i]);
+    vals.sort((a, b) => a - b);
+    const lo = vals.length > 20 ? vals[Math.floor(vals.length * 0.02)] : -1;
+    const hi = vals.length > 20 ? vals[Math.floor(vals.length * 0.98)] : 1;
+    const span = Math.max(1e-4, hi - lo);
+    for (let i = 0; i < total; i++) {
+      zOut[i] = fgMask[i] ? Math.max(0.04, Math.min(1.0, (zOut[i] - lo) / span)) : 0;
+    }
+    return zOut;
   }
 
   /**
@@ -1173,7 +1325,7 @@ export class Asset3DEngine {
         const dx = (lum[y * size + xr] - lum[y * size + xl]) * gradGain;
         const dy = (lum[yd * size + x] - lum[yu * size + x]) * gradGain;
         let nx = -dx, ny = dy, nz = 1.0;
-        const inv = 1.0 / Math.hypot(nx, ny, nz);
+        const inv = 1.0 / Math.sqrt(nx * nx + ny * ny + 1.0);
         nx *= inv; ny *= inv; nz *= inv;
         normal[p] = Math.round((nx * 0.5 + 0.5) * 255);
         normal[p + 1] = Math.round((ny * 0.5 + 0.5) * 255);
@@ -1182,7 +1334,7 @@ export class Asset3DEngine {
 
         const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
         const ch = (mx - mn) / 255.0;
-        const gradMag = Math.min(1.0, Math.hypot(dx, dy) * 1.35);
+        const gradMag = Math.min(1.0, Math.sqrt(dx * dx + dy * dy) * 1.35);
         const roughVal = Math.max(0.24, Math.min(0.92, 0.72 - lum[i] * 0.24 + gradMag * 0.20));
         const rv = Math.round(roughVal * 255);
         roughness[p] = rv; roughness[p + 1] = rv; roughness[p + 2] = rv; roughness[p + 3] = 255;
@@ -1480,6 +1632,7 @@ export class Asset3DEngine {
         for (let ix = 1; ix < W - 1; ix++) {
           const vi = row + ix;
           if (!activeVert[vi] || isBoundaryVert[vi]) continue;
+          if (isPlanar && dist[vi] < 3.5) continue;
           const zc = depth[vi];
           let minZ = zc, maxZ = zc;
           const nbs = [vi - 1, vi + 1, vi - W, vi + W, vi - W - 1, vi - W + 1, vi + W - 1, vi + W + 1];
@@ -1523,7 +1676,7 @@ export class Asset3DEngine {
 
     const isRelief = assetMode === 'relief';
     const halfT = thicknessMm * 0.5;
-    const backScale = assetMode === 'inflated' ? 0.90 : (assetMode === 'double-sided' ? (isPlanar ? 0.72 : 0.58) : 0.0);
+    const backScale = assetMode === 'inflated' ? 0.92 : (assetMode === 'double-sided' ? (isPlanar ? 0.72 : 0.76) : 0.0);
     const minRimZ = isRelief ? 0.0 : (isPlanar ? Math.max(1.2, halfT * 0.34) : halfT * 0.14);
     const offX = (stageW - fitW) * 0.5;
     const offY = (stageH - fitH) * 0.5;
@@ -1552,9 +1705,11 @@ export class Asset3DEngine {
           zF = isRim ? Math.max(0.6, thicknessMm * 0.18) : (thicknessMm * 0.18 + dNorm * thicknessMm * 0.82);
           zB = 0.0;
         } else if (isPlanar && assetMode !== 'inflated') {
-          const rimChamfer = Math.min(dNorm * 0.88, 0.44);
-          zF = isRim ? Math.max(minRimZ, halfT * rimChamfer) : Math.max(minRimZ, halfT * dNorm);
-          zB = isRim ? -Math.max(minRimZ * 0.85, halfT * rimChamfer * backScale) : -Math.max(minRimZ * 0.85, halfT * backScale * dNorm);
+          const railZ = 0.44;
+          const edgeT = Math.min(1.0, Math.max(0.0, (dist[vi] - 0.5) / 2.5));
+          const dPl = dNorm * edgeT + railZ * (1.0 - edgeT);
+          zF = isRim ? Math.max(minRimZ, halfT * railZ) : Math.max(minRimZ, halfT * dPl);
+          zB = isRim ? -Math.max(minRimZ * 0.85, halfT * railZ * backScale) : -Math.max(minRimZ * 0.85, halfT * backScale * dPl);
         } else if (assetMode === 'inflated') {
           zF = isRim ? minRimZ : Math.max(minRimZ, halfT * (macroSmooth * 0.48 + dNorm * 0.52));
           zB = isRim ? -minRimZ : -Math.max(minRimZ, halfT * backScale * (macroSmooth * 0.78 + dNorm * 0.22));

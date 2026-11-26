@@ -460,11 +460,12 @@ export class ImageVectorizer {
       await yieldFrame();
     };
 
-    await report(1, 5, 'Step 1/5 (12%): High-Res Supersampling & Illumination Normalization...', 12);
+    await report(1, 5, 'Step 1/5 (12%): 4K High-Res Supersampling & Illumination Normalization...', 12);
     const iw = img.naturalWidth || img.width || 1;
     const ih = img.naturalHeight || img.height || 1;
     const detailHint = typeof options === 'object' && typeof options.detail === 'number' ? options.detail : 0.7;
-    const maxDimension = (typeof options === 'object' && options.maxDimension) || Math.min(1408, Math.round(920 + detailHint * 488));
+    const requestedMax = (typeof options === 'object' && (options.maxDimension || options.traceQuality)) || Math.round(1600 + detailHint * 1400);
+    const maxDimension = Math.max(120, Math.min(4096, Math.round(requestedMax)));
 
     let scaleW = maxDimension;
     let scaleH = Math.round((ih / iw) * maxDimension);
@@ -472,8 +473,8 @@ export class ImageVectorizer {
       scaleH = maxDimension;
       scaleW = Math.round((iw / ih) * maxDimension);
     }
-    scaleW = Math.max(120, Math.min(1408, scaleW));
-    scaleH = Math.max(120, Math.min(1408, scaleH));
+    scaleW = Math.max(120, Math.min(4096, scaleW));
+    scaleH = Math.max(120, Math.min(4096, scaleH));
 
     const canvas = document.createElement('canvas');
     canvas.width = scaleW;
@@ -487,8 +488,12 @@ export class ImageVectorizer {
     const pixels = ctx.getImageData(0, 0, scaleW, scaleH).data;
     const bounds = ImageVectorizer.getImageFitBounds(img, widthMm, heightMm);
 
-    await report(2, 5, 'Step 2/5 (34%): Edge-Preserving Denoise & Relief Channel Separation...', 34);
-    const vectors = ImageVectorizer.traceFromImageData(pixels, scaleW, scaleH, bounds, options);
+    await report(2, 5, `Step 2/5 (34%): Computing ${scaleW}×${scaleH} Scharr Edge Field & Denoised Channels...`, 34);
+    const traceOpts = {
+      ...(typeof options === 'object' ? options : { threshold: options }),
+      maxContours: (typeof options === 'object' && options.maxContours) || (maxDimension >= 2048 ? 820 : 480),
+    };
+    const vectors = ImageVectorizer.traceFromImageData(pixels, scaleW, scaleH, bounds, traceOpts);
 
     await report(3, 5, `Step 3/5 (62%): Subpixel Contour Extraction & Nested Hole Hierarchy (${vectors.length} regions)...`, 62);
     await report(4, 5, 'Step 4/5 (84%): Fitting Corner-Exact Cubic Beziers & Eliminating Self-Intersections...', 84);
@@ -587,17 +592,18 @@ export class ImageVectorizer {
     if (effectiveMode === 'lineart') effectiveMode = 'bw-logo';
 
     const detailFactor = Math.max(0.1, Math.min(0.95, detail));
-    const scaleRatio = Math.max(1.0, Math.min(2.4, Math.max(scaleW, scaleH) / 420.0));
+    const scaleRatio = Math.max(1.0, Math.min(3.2, Math.max(scaleW, scaleH) / 480.0));
     const pxPerMm = Math.max(scaleW / Math.max(1, bounds.w), scaleH / Math.max(1, bounds.h));
 
-    // Smooth edge-preserving Guided Denoise (radius=1 at normal/high detail to keep tight petals crisp!)
+    // Smooth edge-preserving Guided Denoise + full-resolution Scharr RGB gradient ridge field for subpixel outline lock
     const filterRadius = detailFactor >= 0.45 ? 1 : 2;
     const denoisedLuma = ImageVectorizer.guidedFilter(lumaRaw, scaleW, scaleH, filterRadius, effectiveMode === 'bw-logo' ? 85 : 145);
+    const gradField = ImageVectorizer.computeScharrGradientField(rArr, gArr, bArr, lumaRaw, scaleW, scaleH);
 
     const commonFitOpts = {
       detailFactor,
       corners: Math.max(0.1, Math.min(0.95, corners)),
-      minAreaPx: Math.max(4, noisePx * (1.25 - detailFactor * 0.65)),
+      minAreaPx: Math.max(4, noisePx * (1.25 - detailFactor * 0.65) * (scaleRatio > 2.0 ? 1.5 : 1.0)),
       minSpanMm,
       maxContours,
       scaleRatio,
@@ -606,6 +612,7 @@ export class ImageVectorizer {
       scaleW,
       scaleH,
       maxDepthMm,
+      gradField,
     };
 
     // Dispatch to dedicated Illustrator Preset Pipeline
@@ -1013,27 +1020,41 @@ export class ImageVectorizer {
       colFrac[x] = c / ySpan;
     }
     const smoothCol = new Float64Array(w);
+    const colRad = Math.max(3, Math.round(w * 0.008));
+    const colPref = new Float64Array(w + 1);
+    for (let x = 0; x < w; x++) colPref[x + 1] = colPref[x] + colFrac[x];
     for (let x = 0; x < w; x++) {
-      let s = 0, cnt = 0;
-      for (let dx = -3; dx <= 3; dx++) {
-        const xx = x + dx;
-        if (xx >= 0 && xx < w) { s += colFrac[xx]; cnt++; }
-      }
-      smoothCol[x] = s / cnt;
+      const x0 = Math.max(0, x - colRad), x1 = Math.min(w, x + colRad + 1);
+      smoothCol[x] = (colPref[x1] - colPref[x0]) / (x1 - x0);
     }
     const midX = Math.floor(w * 0.5);
     let rx0 = midX, rx1 = midX;
-    while (rx0 > 0 && smoothCol[rx0 - 1] >= 0.35) rx0--;
-    while (rx1 < w - 1 && smoothCol[rx1 + 1] >= 0.35) rx1++;
-
-    // Fallback if center band is mostly dark carving: check widest contiguous band >= 0.32
-    if (rx1 - rx0 < w * 0.28) {
-      rx0 = 0; rx1 = w - 1;
-      for (let x = 0; x < midX; x++) { if (smoothCol[x] >= 0.30) { rx0 = x; break; } }
-      for (let x = w - 1; x > midX; x--) { if (smoothCol[x] >= 0.30) { rx1 = x; break; } }
+    const minRunX = Math.max(3, Math.round(w * 0.022));
+    // Scan inward from left/right outer edges so dark central panels never prematurely truncate outer rails
+    let outerRx0 = -1, outerRx1 = -1;
+    for (let x = 0; x <= midX; x++) {
+      let ok = true;
+      for (let k = 0; k < minRunX && x + k < w; k++) {
+        if (smoothCol[x + k] < 0.34) { ok = false; break; }
+      }
+      if (ok) { outerRx0 = x; break; }
+    }
+    for (let x = w - 1; x >= midX; x--) {
+      let ok = true;
+      for (let k = 0; k < minRunX && x - k >= 0; k++) {
+        if (smoothCol[x - k] < 0.34) { ok = false; break; }
+      }
+      if (ok) { outerRx1 = x; break; }
+    }
+    if (outerRx0 !== -1 && outerRx1 > outerRx0 + w * 0.25) {
+      rx0 = outerRx0;
+      rx1 = outerRx1;
+    } else {
+      while (rx0 > 0 && smoothCol[rx0 - 1] >= 0.35) rx0--;
+      while (rx1 < w - 1 && smoothCol[rx1 + 1] >= 0.35) rx1++;
     }
 
-    // Compute row profile strictly within [rx0..rx1] and walk outward from center Y
+    // Compute row profile strictly within [rx0..rx1] and scan inward from top/bottom (bridges middle rails cleanly at 4K!)
     const rowFrac = new Float64Array(h);
     const xSpan = Math.max(1, rx1 - rx0 + 1);
     for (let y = 0; y < h; y++) {
@@ -1043,23 +1064,37 @@ export class ImageVectorizer {
       rowFrac[y] = c / xSpan;
     }
     const smoothRow = new Float64Array(h);
+    const rowRad = Math.max(3, Math.round(h * 0.008));
+    const rowPref = new Float64Array(h + 1);
+    for (let y = 0; y < h; y++) rowPref[y + 1] = rowPref[y] + rowFrac[y];
     for (let y = 0; y < h; y++) {
-      let s = 0, cnt = 0;
-      for (let dy = -3; dy <= 3; dy++) {
-        const yy = y + dy;
-        if (yy >= 0 && yy < h) { s += rowFrac[yy]; cnt++; }
-      }
-      smoothRow[y] = s / cnt;
+      const y0 = Math.max(0, y - rowRad), y1 = Math.min(h, y + rowRad + 1);
+      smoothRow[y] = (rowPref[y1] - rowPref[y0]) / (y1 - y0);
     }
     const midY = Math.floor(h * 0.5);
     let ry0 = midY, ry1 = midY;
-    while (ry0 > 0 && smoothRow[ry0 - 1] >= 0.35) ry0--;
-    while (ry1 < h - 1 && smoothRow[ry1 + 1] >= 0.35) ry1++;
-
-    if (ry1 - ry0 < h * 0.28) {
-      ry0 = 0; ry1 = h - 1;
-      for (let y = 0; y < midY; y++) { if (smoothRow[y] >= 0.30) { ry0 = y; break; } }
-      for (let y = h - 1; y > midY; y--) { if (smoothRow[y] >= 0.30) { ry1 = y; break; } }
+    const minRunY = Math.max(3, Math.round(h * 0.022));
+    let outerRy0 = -1, outerRy1 = -1;
+    for (let y = 0; y <= midY; y++) {
+      let ok = true;
+      for (let k = 0; k < minRunY && y + k < h; k++) {
+        if (smoothRow[y + k] < 0.34) { ok = false; break; }
+      }
+      if (ok) { outerRy0 = y; break; }
+    }
+    for (let y = h - 1; y >= midY; y--) {
+      let ok = true;
+      for (let k = 0; k < minRunY && y - k >= 0; k++) {
+        if (smoothRow[y - k] < 0.34) { ok = false; break; }
+      }
+      if (ok) { outerRy1 = y; break; }
+    }
+    if (outerRy0 !== -1 && outerRy1 > outerRy0 + h * 0.28) {
+      ry0 = outerRy0;
+      ry1 = outerRy1;
+    } else {
+      while (ry0 > 0 && smoothRow[ry0 - 1] >= 0.35) ry0--;
+      while (ry1 < h - 1 && smoothRow[ry1 + 1] >= 0.35) ry1++;
     }
 
     // Inset minimally ONLY on sides that had detected exterior walls/margins so outer door rails stay intact!
@@ -1261,14 +1296,14 @@ export class ImageVectorizer {
       }
       const ew = maxX - minX, eh = maxY - minY;
       if (ew > roiMaxSpanW && eh > roiMaxSpanH) return false;
-      if ((minX <= roiEdgeLeftMm || maxX >= roiEdgeRightMm) && ew < roi.w * sx * 0.04 && eh > roi.h * sy * 0.35) return false;
-      if ((minY <= roiEdgeTopMm || maxY >= roiEdgeBotMm) && eh < roi.h * sy * 0.04 && ew > roi.w * sx * 0.35) return false;
+      if ((minX <= opts.bounds.x + 2 * sx || maxX >= opts.bounds.x + (w - 2) * sx) && ew < sx * 2.5 && eh > roi.h * sy * 0.40) return false;
+      if ((minY <= opts.bounds.y + 2 * sy || maxY >= opts.bounds.y + (h - 2) * sy) && eh < sy * 2.5 && ew > roi.w * sx * 0.40) return false;
       if (filterGrainStreaks && ew >= eh * 3.8 && eh < roi.h * sy * 0.045 && (minX <= opts.bounds.x + 20 * sx || maxX >= opts.bounds.x + (w - 20) * sx)) return false;
       if (filterGrainStreaks && (minX <= opts.bounds.x + (roi.x0 + 48) * sx || maxX >= opts.bounds.x + (roi.x1 - 48) * sx) && ew * eh < opts.bounds.w * opts.bounds.h * 0.0025 && (!ent.holes || ent.holes.length === 0)) return false;
       const aspectRatio = Math.max(ew, eh) / Math.max(0.25, Math.min(ew, eh));
-      if (!ent.holes?.length && aspectRatio >= 5.2 && Math.min(ew, eh) < Math.min(roi.w * sx, roi.h * sy) * 0.032) return false;
+      if (!ent.holes?.length && aspectRatio >= 6.5 && Math.min(ew, eh) < Math.min(roi.w * sx, roi.h * sy) * 0.022) return false;
       const isOuterSpeck = (minX <= opts.bounds.x + (roi.x0 + 18) * sx || maxX >= opts.bounds.x + (roi.x1 - 18) * sx || minY <= opts.bounds.y + (roi.y0 + 18) * sy || maxY >= opts.bounds.y + (roi.y1 - 18) * sy)
-        && ew * eh < roi.w * sx * roi.h * sy * 0.0022 && (!ent.holes || ent.holes.length === 0);
+        && ew * eh < roi.w * sx * roi.h * sy * 0.0018 && (!ent.holes || ent.holes.length === 0);
       if (isOuterSpeck) return false;
       return true;
     });
@@ -1368,12 +1403,12 @@ export class ImageVectorizer {
     }
 
     // 3. 3D Bas-Relief Furniture Wood Carving Mode: Multi-Scale Gaussian-Smoothed White-Hat + Black-Hat
-    const planeR = Math.max(7, Math.round(Math.min(roi.w, roi.h) * 0.042));
+    const minRoi = Math.min(roi.w, roi.h);
+    const planeR = Math.max(7, Math.min(48, Math.round(minRoi * 0.042)));
     const localPlane = ImageVectorizer.maskedBoxMean(smoothLuma, roiMask, w, h, planeR);
 
-    const minRoi = Math.min(roi.w, roi.h);
-    const rFine = Math.max(2, Math.min(3, Math.round(minRoi * 0.0065)));
-    const rMed = Math.max(5, Math.min(7, Math.round(minRoi * 0.015)));
+    const rFine = Math.max(2, Math.min(8, Math.round(minRoi * 0.0065)));
+    const rMed = Math.max(5, Math.min(18, Math.round(minRoi * 0.015)));
 
     const closedFine = ImageVectorizer.separableExtrema(
       ImageVectorizer.separableExtrema(smoothLuma, w, h, rFine, true), w, h, rFine, false
@@ -1864,6 +1899,80 @@ export class ImageVectorizer {
   }
 
   /**
+   * 3x3 Scharr multi-channel edge magnitude field on sharp source pixels for subpixel contour locking.
+   */
+  static computeScharrGradientField(rArr, gArr, bArr, lumaRaw, w, h) {
+    const n = w * h;
+    const mag = new Float32Array(n);
+    if (w < 3 || h < 3) return mag;
+    for (let y = 1; y < h - 1; y++) {
+      const r0 = (y - 1) * w, r1 = y * w, r2 = (y + 1) * w;
+      for (let x = 1; x < w - 1; x++) {
+        const i = r1 + x;
+        const gxL = (lumaRaw[r0 + x + 1] - lumaRaw[r0 + x - 1]) * 3 + (lumaRaw[r1 + x + 1] - lumaRaw[r1 + x - 1]) * 10 + (lumaRaw[r2 + x + 1] - lumaRaw[r2 + x - 1]) * 3;
+        const gyL = (lumaRaw[r2 + x - 1] - lumaRaw[r0 + x - 1]) * 3 + (lumaRaw[r2 + x] - lumaRaw[r0 + x]) * 10 + (lumaRaw[r2 + x + 1] - lumaRaw[r0 + x + 1]) * 3;
+        const gL = Math.hypot(gxL, gyL) * 0.0625;
+        const gR = Math.hypot(rArr[i + 1] - rArr[i - 1], rArr[i + w] - rArr[i - w]) * 0.5;
+        const gG = Math.hypot(gArr[i + 1] - gArr[i - 1], gArr[i + w] - gArr[i - w]) * 0.5;
+        const gB = Math.hypot(bArr[i + 1] - bArr[i - 1], bArr[i + w] - bArr[i - w]) * 0.5;
+        mag[i] = Math.min(255, Math.max(gL, gR * 0.85, gG * 0.85, gB * 0.85));
+      }
+    }
+    return mag;
+  }
+
+  /**
+   * Snap contour samples onto the exact parabolic subpixel ridge peak of |∇I| along surface normals.
+   */
+  static snapLoopToGradientRidge(pts, gradField, w, h, maxShiftPx = 1.05) {
+    const n = pts?.length || 0;
+    if (!gradField || n < 8) return pts;
+    const sampleGrad = (x, y) => {
+      const cx = Math.max(0, Math.min(w - 1.001, x));
+      const cy = Math.max(0, Math.min(h - 1.001, y));
+      const i = cx | 0, j = cy | 0;
+      const fx = cx - i, fy = cy - j;
+      const a = j * w + i;
+      return (gradField[a] * (1 - fx) + gradField[a + 1] * fx) * (1 - fy) + (gradField[a + w] * (1 - fx) + gradField[a + w + 1] * fx) * fy;
+    };
+    const shifts = new Float32Array(n);
+    const nxArr = new Float32Array(n);
+    const nyArr = new Float32Array(n);
+    const step = 0.55;
+    for (let i = 0; i < n; i++) {
+      const a = pts[(i - 2 + n) % n];
+      const b = pts[(i + 2) % n];
+      const p = pts[i];
+      let nx = a[1] - b[1];
+      let ny = b[0] - a[0];
+      const len = Math.hypot(nx, ny);
+      if (len < 1e-6) continue;
+      nx /= len; ny /= len;
+      nxArr[i] = nx; nyArr[i] = ny;
+      const gM = sampleGrad(p[0] - nx * step, p[1] - ny * step);
+      const g0 = sampleGrad(p[0], p[1]);
+      const gP = sampleGrad(p[0] + nx * step, p[1] + ny * step);
+      const gPeak = Math.max(gM, g0, gP);
+      if (gPeak < 22) continue;
+      const denom = gM - 2 * g0 + gP;
+      let t = 0;
+      if (denom < -1.5) {
+        t = (0.5 * (gM - gP) / denom) * step;
+      } else if (gP > g0 && gP > gM) {
+        t = step * 0.72;
+      } else if (gM > g0 && gM > gP) {
+        t = -step * 0.72;
+      }
+      shifts[i] = Math.max(-maxShiftPx, Math.min(maxShiftPx, t));
+    }
+    return pts.map((p, i) => {
+      const mWin = [shifts[(i - 1 + n) % n], shifts[i], shifts[(i + 1) % n]].sort((u, v) => u - v);
+      const sVal = mWin[1];
+      return [p[0] + nxArr[i] * sVal, p[1] + nyArr[i] * sVal];
+    });
+  }
+
+  /**
    * Slide open or closed subpixel contour along normals to the exact 50% intensity crossing on original raw luma.
    */
   static refineContourToField(pts, closed, rawField, w, h, sign, scaleRatio) {
@@ -2309,7 +2418,10 @@ export class ImageVectorizer {
     const doRefine = opts.refineEdges !== false;
 
     // Step 1: Subpixel edge refinement first so staircase steps don't create false 45° corners!
-    const workLoop = doRefine ? ImageVectorizer.refineContourToField(rawLoop, true, rawField, w, h, refSign, scaleRatio) : rawLoop;
+    let workLoop = doRefine ? ImageVectorizer.refineContourToField(rawLoop, true, rawField, w, h, refSign, scaleRatio) : rawLoop;
+    if (opts.gradField) {
+      workLoop = ImageVectorizer.snapLoopToGradientRidge(workLoop, opts.gradField, w, h, doRefine ? 0.72 : 1.05);
+    }
     const circleAnchors = ImageVectorizer.detectExactCircle(workLoop);
     if (circleAnchors) return circleAnchors;
 
@@ -2402,10 +2514,10 @@ export class ImageVectorizer {
 
       const smoothed = ImageVectorizer.taubinSmoothOpen(
         workLoop.slice(splitPair[0]).concat(workLoop.slice(0, splitPair[0] + 1)),
-        4
+        2
       );
       const midInSmoothed = (splitPair[1] - splitPair[0]);
-      const errSq = Math.pow(Math.max(0.36, (1.08 - opts.detailFactor) * 1.15 * scaleRatio), 2);
+      const errSq = Math.pow(Math.max(0.24, (1.04 - opts.detailFactor) * 0.92 * scaleRatio), 2);
 
       const fitHalf = (subPts) => {
         const len = subPts.length;
@@ -2538,7 +2650,7 @@ export class ImageVectorizer {
       snappedCorners.push(X || pc);
     }
 
-    const fitErrSq = Math.pow(Math.max(0.36, (1.08 - opts.detailFactor) * 1.15 * scaleRatio), 2);
+    const fitErrSq = Math.pow(Math.max(0.24, (1.04 - opts.detailFactor) * 0.92 * scaleRatio), 2);
     const segmentsList = [];
 
     for (let j = 0; j < mFinal; j++) {
@@ -2566,7 +2678,7 @@ export class ImageVectorizer {
       pinned[0] = ca;
       pinned[q - 1] = cb;
 
-      const smPts = ImageVectorizer.taubinSmoothOpen(pinned, 4);
+      const smPts = ImageVectorizer.taubinSmoothOpen(pinned, 2);
       const kTan = Math.min(q - 1, 3);
       const tHat1 = ImageVectorizer.normVec([smPts[kTan][0] - smPts[0][0], smPts[kTan][1] - smPts[0][1]]);
       const tHat2 = ImageVectorizer.normVec([smPts[q - 1 - kTan][0] - smPts[q - 1][0], smPts[q - 1 - kTan][1] - smPts[q - 1][1]]);
@@ -2682,8 +2794,8 @@ export class ImageVectorizer {
     const sx = bounds.w / scaleW;
     const sy = bounds.h / scaleH;
     const mapPt = (p) => ({
-      x: Number((bounds.x + p.x * sx).toFixed(3)),
-      y: Number((bounds.y + p.y * sy).toFixed(3)),
+      x: Number((bounds.x + p.x * sx).toFixed(4)),
+      y: Number((bounds.y + p.y * sy).toFixed(4)),
     });
     return anchors.map((a) => {
       const base = mapPt(a);

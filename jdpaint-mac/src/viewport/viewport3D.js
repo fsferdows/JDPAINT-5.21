@@ -26,6 +26,7 @@ export class Viewport3D {
     this.cutterMesh = null;
     this.dirLight1 = null;
     this._textures = {};
+    this._solidMatCapTex = null;
     this._simTimer = null;
     this._simSegments = [];
 
@@ -404,7 +405,7 @@ export class Viewport3D {
     // Solid bevelled CNC stock backing board underneath Z=0 so relief sits on realistic timber/metal block
     const slabThickness = Math.max(4, Math.min(14, (this.relief.maxDepth || 8) * 0.85));
     const slabGeom = new THREE.BoxGeometry(w, h, slabThickness);
-    slabGeom.translate(w / 2, h / 2, -slabThickness / 2 - 0.02);
+    slabGeom.translate(w / 2, h / 2, -slabThickness / 2 - 0.18);
     const slabMat = new THREE.MeshStandardMaterial({
       map: this.getProceduralTexture(this.currentMaterialType),
       color: this.getBaseTint(this.currentMaterialType),
@@ -673,8 +674,66 @@ export class Viewport3D {
     tex.colorSpace = isSRGB ? THREE.SRGBColorSpace : THREE.NoColorSpace;
     tex.wrapS = THREE.ClampToEdgeWrapping;
     tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.generateMipmaps = true;
+    const maxAniso = this.renderer?.capabilities?.getMaxAnisotropy ? this.renderer.capabilities.getMaxAnisotropy() : 4;
+    tex.anisotropy = Math.min(8, Math.max(1, maxAniso));
     tex.needsUpdate = true;
     tex._sourceCanvas = canvas;
+    return tex;
+  }
+
+  /**
+   * Procedural 512x512 Meshy-style Studio Clay MatCap (calibrated after Meshy Final Grey shader).
+   * Reveals fine sculpting folds, cavity edges & crisp planar CAD faces cleanly under Solid Mode.
+   */
+  _getMeshyStudioMatCap() {
+    if (this._solidMatCapTex) return this._solidMatCapTex;
+    const S = 512;
+    const canvas = document.createElement('canvas');
+    canvas.width = S;
+    canvas.height = S;
+    const ctx = canvas.getContext('2d');
+    const img = ctx.createImageData(S, S);
+    const d = img.data;
+    const kLen = Math.hypot(0.24, 0.68, 0.69);
+    const lx = 0.24 / kLen, ly = 0.68 / kLen, lz = 0.69 / kLen;
+    const hx = lx, hy = ly, hz = lz + 1.0;
+    const hLen = Math.hypot(hx, hy, hz);
+    const nhx = hx / hLen, nhy = hy / hLen, nhz = hz / hLen;
+    const fLen = Math.hypot(-0.58, -0.34, 0.74);
+    const fx = -0.58 / fLen, fy = -0.34 / fLen, fz = 0.74 / fLen;
+
+    for (let py = 0; py < S; py++) {
+      const ny = 1.0 - (2.0 * (py + 0.5)) / S;
+      for (let px = 0; px < S; px++) {
+        const nx = (2.0 * (px + 0.5)) / S - 1.0;
+        const r2 = nx * nx + ny * ny;
+        const nz = r2 < 1.0 ? Math.sqrt(1.0 - r2) : 0.0;
+        let nnx = nx, nny = ny, nnz = nz;
+        if (r2 >= 1.0) {
+          const inv = 1.0 / Math.sqrt(r2);
+          nnx *= inv; nny *= inv; nnz = 0.0;
+        }
+        const key = Math.max(0, nnx * lx + nny * ly + nnz * lz);
+        const fill = Math.max(0, nnx * fx + nny * fy + nnz * fz);
+        const hemi = 0.5 + 0.5 * nny;
+        const fresnel = Math.pow(Math.max(0, 1.0 - nnz), 2.35);
+        const spec = Math.pow(Math.max(0, nnx * nhx + nny * nhy + nnz * nhz), 28) * 0.20;
+        const lum = Math.max(0.14, Math.min(0.95, 0.34 + hemi * 0.16 + key * 0.36 + fill * 0.12 + fresnel * 0.14 + spec));
+        const rC = Math.round(Math.min(255, lum * 246 + fresnel * 8));
+        const gC = Math.round(Math.min(255, lum * 248 + fresnel * 10));
+        const bC = Math.round(Math.min(255, lum * 252 + fresnel * 16));
+        const idx = (py * S + px) * 4;
+        d[idx] = rC; d[idx + 1] = gC; d[idx + 2] = bC; d[idx + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.needsUpdate = true;
+    this._solidMatCapTex = tex;
     return tex;
   }
 
@@ -922,11 +981,11 @@ export class Viewport3D {
     }
 
     if (mode === 'solid') {
-      return new THREE.MeshStandardMaterial({
-        color: 0xa6adb8,
-        roughness: Math.max(0.36, Math.min(0.88, adj.roughness * 0.92)),
-        metalness: 0.03,
-        envMapIntensity: 0.36,
+      return new THREE.MeshMatcapMaterial({
+        matcap: this._getMeshyStudioMatCap(),
+        color: 0xf4f6f9,
+        normalMap: this._assetTextures.normal || null,
+        normalScale: new THREE.Vector2(0.45 * (adj.contrast || 1.0), 0.45 * (adj.contrast || 1.0)),
         wireframe: this.wireframe,
         side: THREE.DoubleSide,
       });
@@ -966,22 +1025,39 @@ export class Viewport3D {
       return;
     }
     const mode = this.shadingMode || 'standard';
+    const chan = this.pbrChannel || 'pbr';
     const adj = this.materialAdjust || { roughness: 0.55, metalness: 0.08, contrast: 1.0, intensity: 1.0 };
     this.assetMesh.traverse((child) => {
       if (!child.isMesh) return;
       const orig = child.userData?._origMat;
+      if (chan !== 'pbr' && orig) {
+        const mapKey = chan === 'baseColor' ? 'map' : chan === 'normal' ? 'normalMap' : chan === 'roughness' ? 'roughnessMap' : chan === 'metallic' ? 'metalnessMap' : null;
+        if (mapKey && orig[mapKey]) {
+          if (child.material && child.material !== orig && child.material !== child.userData._solidMat) child.material.dispose?.();
+          child.material = new THREE.MeshBasicMaterial({ map: orig[mapKey], wireframe: this.wireframe, side: THREE.DoubleSide });
+          return;
+        }
+      }
       if (mode === 'solid') {
         if (!child.userData._solidMat) {
-          child.userData._solidMat = new THREE.MeshStandardMaterial({
-            color: 0xa6adb8,
-            roughness: Math.max(0.36, Math.min(0.88, adj.roughness * 0.92)),
-            metalness: 0.03,
-            envMapIntensity: 0.36,
+          child.userData._solidMat = new THREE.MeshMatcapMaterial({
+            matcap: this._getMeshyStudioMatCap(),
+            color: 0xf2f5f9,
+            normalMap: orig?.normalMap || null,
+            normalScale: new THREE.Vector2(0.55 * (adj.contrast || 1.0), 0.55 * (adj.contrast || 1.0)),
             side: THREE.DoubleSide,
           });
         }
         child.userData._solidMat.wireframe = this.wireframe;
         child.material = child.userData._solidMat;
+      } else if (mode === 'unlit' && orig) {
+        if (child.material && child.material !== orig && child.material !== child.userData._solidMat) child.material.dispose?.();
+        child.material = new THREE.MeshBasicMaterial({
+          map: orig.map || null,
+          color: orig.color ? orig.color : new THREE.Color(0xdbe2ea),
+          wireframe: this.wireframe,
+          side: THREE.DoubleSide,
+        });
       } else if (orig) {
         child.material = orig;
         const mats = Array.isArray(orig) ? orig : [orig];
@@ -998,11 +1074,10 @@ export class Viewport3D {
     } else if (this.mesh) {
       if (mode === 'solid') {
         this.mesh.material.dispose();
-        this.mesh.material = new THREE.MeshStandardMaterial({
-          color: 0xa6adb8,
-          roughness: Math.max(0.42, Math.min(0.86, this.materialAdjust.roughness * 0.92)),
-          metalness: 0.03,
-          envMapIntensity: 0.36,
+        this.mesh.material = new THREE.MeshMatcapMaterial({
+          matcap: this._getMeshyStudioMatCap(),
+          vertexColors: true,
+          color: 0xf4f6f9,
           wireframe: this.wireframe,
         });
       } else if (mode === 'unlit') {

@@ -5142,7 +5142,7 @@ export class CadCanvas {
     const items = [];
     for (const ent of this.entities) {
       if (ent.visible === false) continue;
-      const rings = CadCanvas.sampleEntityRings(ent, 8);
+      const rings = CadCanvas.sampleEntityRings(ent, 24);
       const baseLayer = ent.layerGroup || ent.name || 'CAD_Layer';
       rings.forEach((pts, rIdx) => {
         if (pts && pts.length >= 2) {

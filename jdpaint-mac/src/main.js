@@ -986,11 +986,14 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function getTraceOptions() {
+    const traceQuality = parseInt(document.getElementById('trace-quality-select')?.value || '3840', 10) || 3840;
     return {
       threshold: parseFloat(document.getElementById('trace-threshold-mode')?.value) || -1,
       invert: document.getElementById('relief-invert-check')?.checked || false,
       traceMode: document.getElementById('trace-mode-select')?.value || 'auto',
       detail: (parseInt(sliderTraceDetail?.value || '70', 10)) / 100,
+      traceQuality,
+      maxDimension: traceQuality,
       colorCount: Math.max(2, Math.min(16, parseInt(document.getElementById('trace-colors')?.value || '6', 10) || 6)),
       stackMethod: document.getElementById('trace-stack-mode')?.value || 'stacked',
       corners: (parseInt(document.getElementById('trace-corners')?.value || '65', 10)) / 100,
@@ -1337,21 +1340,37 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const assetMode = document.getElementById('asset-mode-select')?.value || 'double-sided';
     const resolution = parseInt(document.getElementById('asset-res-select')?.value || '288', 10) || 288;
+    const texSize = Math.max(1024, Math.min(4096, parseInt(document.getElementById('asset-tex-res-select')?.value || '4096', 10) || 4096));
+    const topology = document.getElementById('asset-topology-select')?.value || 'triangle';
     const thicknessMm = Math.max(2, parseFloat(document.getElementById('asset-thickness')?.value || '22') || 22);
     const filletRatio = Math.max(0, Math.min(0.035, (parseInt(document.getElementById('asset-fillet')?.value || '12', 10) || 0) / 1000));
     const removeBg = document.getElementById('asset-remove-bg')?.checked ?? true;
     const delight = document.getElementById('asset-delight')?.checked ?? true;
+    const enhanceImage = document.getElementById('asset-enhance')?.checked ?? true;
     const invert = document.getElementById('relief-invert-check')?.checked || false;
     const edgeStrength = parseFloat(document.getElementById('relief-edge-strength')?.value || '0.38') || 0.38;
     const engineMode = document.getElementById('asset-engine-mode')?.value || 'hybrid';
     const meshyKey = (document.getElementById('asset-meshy-key')?.value || '').trim();
+    const multiViewInput = document.getElementById('asset-multiview-files');
+
+    const loadExtraViewImages = async () => {
+      const files = multiViewInput?.files ? Array.from(multiViewInput.files).slice(0, 3) : [];
+      if (files.length === 0) return [];
+      return Promise.all(files.map((f) => new Promise((resolve) => {
+        const u = URL.createObjectURL(f);
+        const im = new Image();
+        im.onload = () => { URL.revokeObjectURL(u); resolve(im); };
+        im.onerror = () => { URL.revokeObjectURL(u); resolve(null); };
+        im.src = u;
+      })));
+    };
 
     const progWrap = document.getElementById('asset-progress-wrap');
     const progBar = document.getElementById('asset-progress-bar');
     const progLbl = document.getElementById('asset-progress-label');
     const btnGen = document.getElementById('btn-generate-asset');
 
-    const prog = beginPipelineProgress('Meshy Volumetric 3D Asset Studio');
+    const prog = beginPipelineProgress(`Meshy ${texSize >= 4096 ? 'Ultra 4K' : `${texSize}px`} 3D Asset Studio`);
     const updateProgress = (_stage, pct, label) => {
       if (progWrap) progWrap.style.display = 'block';
       if (progBar) progBar.style.width = `${Math.max(4, Math.min(100, Math.round(pct)))}%`;
@@ -1364,16 +1383,19 @@ document.addEventListener('DOMContentLoaded', () => {
       let meshStats = null;
       if (engineMode === 'cloud') {
         if (!meshyKey) {
-          alert('Please enter your Meshy API key (`msy_...`) or switch Engine Mode to Offline 5-Stage Meshy SDF.');
+          alert('Please enter your Meshy API key (`msy_...`) or switch Engine Mode to Hybrid AI / Offline 5-Stage Meshy SDF.');
           return;
         }
+        const extraImages = await loadExtraViewImages();
         const cloudRes = await Asset3DEngine.generateViaMeshyCloudApi(
           loadedImageElement,
           meshyKey,
           {
-            topology: 'triangle',
-            targetPolycount: Math.min(250000, resolution * 350),
+            topology,
+            targetPolycount: topology === 'quad' ? 30000 : Math.min(300000, resolution * 480),
             enablePbr: true,
+            imageEnhancement: enhanceImage,
+            extraImages,
           },
           updateProgress
         );
@@ -1385,9 +1407,10 @@ document.addEventListener('DOMContentLoaded', () => {
           {
             assetMode,
             resolution,
-            texSize: 1024,
+            texSize,
             removeBg,
             delight,
+            enhanceImage,
             invert,
             edgeStrength,
             filletRatio,
@@ -2349,32 +2372,32 @@ document.addEventListener('DOMContentLoaded', () => {
     if (CadCanvas.hasCubicHandles(points)) {
       const ring = CadCanvas.normalizeClosedRing(points, isClosed);
       if (ring.length < 2) return '';
-      const d = [`M ${ring[0].x.toFixed(3)} ${ring[0].y.toFixed(3)}`];
+      const d = [`M ${ring[0].x.toFixed(4)} ${ring[0].y.toFixed(4)}`];
       const segCount = isClosed ? ring.length : ring.length - 1;
       for (let i = 0; i < segCount; i++) {
         const a = ring[i];
         const b = ring[(i + 1) % ring.length];
         if (!a.hOut && !b.hIn) {
-          d.push(`L ${b.x.toFixed(3)} ${b.y.toFixed(3)}`);
+          d.push(`L ${b.x.toFixed(4)} ${b.y.toFixed(4)}`);
         } else {
           const c1 = a.hOut || a;
           const c2 = b.hIn || b;
-          d.push(`C ${c1.x.toFixed(3)} ${c1.y.toFixed(3)}, ${c2.x.toFixed(3)} ${c2.y.toFixed(3)}, ${b.x.toFixed(3)} ${b.y.toFixed(3)}`);
+          d.push(`C ${c1.x.toFixed(4)} ${c1.y.toFixed(4)}, ${c2.x.toFixed(4)} ${c2.y.toFixed(4)}, ${b.x.toFixed(4)} ${b.y.toFixed(4)}`);
         }
       }
       if (isClosed) d.push('Z');
       return d.join(' ');
     }
-    const sampled = CadCanvas.sampleCurvePoints(points, isClosed, 6);
+    const sampled = CadCanvas.sampleCurvePoints(points, isClosed, 16);
     if (sampled.length < 2) return '';
-    const d = [`M ${sampled[0].x.toFixed(3)} ${sampled[0].y.toFixed(3)}`];
-    for (let i = 1; i < sampled.length; i++) d.push(`L ${sampled[i].x.toFixed(3)} ${sampled[i].y.toFixed(3)}`);
+    const d = [`M ${sampled[0].x.toFixed(4)} ${sampled[0].y.toFixed(4)}`];
+    for (let i = 1; i < sampled.length; i++) d.push(`L ${sampled[i].x.toFixed(4)} ${sampled[i].y.toFixed(4)}`);
     if (isClosed) d.push('Z');
     return d.join(' ');
   }
 
   // ============================================================
-  // SVG EXPORT (True Cubic Bezier + Compound Holes SVG Export)
+  // 4K SVG & 4096px VECTOR BLUEPRINT PNG EXPORTERS
   // ============================================================
   function exportSVG() {
     const w = cadCanvas.workpieceWidth;
@@ -2386,23 +2409,23 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     let svg = `<?xml version="1.0" encoding="UTF-8"?>\n`;
-    svg += `<svg xmlns="http://www.w3.org/2000/svg" width="${w}mm" height="${h}mm" viewBox="0 0 ${w} ${h}">\n`;
+    svg += `<svg xmlns="http://www.w3.org/2000/svg" width="${w}mm" height="${h}mm" viewBox="0 0 ${w} ${h}" shape-rendering="geometricPrecision">\n`;
     svg += `  <rect width="${w}" height="${h}" fill="none" stroke="#999" stroke-width="0.2"/>\n`;
 
     for (const ent of entities) {
       if (ent.visible === false) continue;
       const strokeCol = ent.color || '#38bdf8';
       const fillAttr = ent.isClosed && cadCanvas.showColorFills && ent.fillColor ? ent.fillColor : 'none';
-      const sw = ((ent.width || 1.5) * 0.3).toFixed(3);
+      const sw = ((ent.width || 1.5) * 0.25).toFixed(4);
       const idAttr = ent.name ? ` id="${escapeXml(ent.name)}"` : '';
 
       if (ent.type === 'line') {
-        svg += `  <line${idAttr} x1="${ent.x1.toFixed(3)}" y1="${ent.y1.toFixed(3)}" x2="${ent.x2.toFixed(3)}" y2="${ent.y2.toFixed(3)}" stroke="${strokeCol}" stroke-width="${sw}" fill="none"/>\n`;
+        svg += `  <line${idAttr} x1="${ent.x1.toFixed(4)}" y1="${ent.y1.toFixed(4)}" x2="${ent.x2.toFixed(4)}" y2="${ent.y2.toFixed(4)}" stroke="${strokeCol}" stroke-width="${sw}" stroke-linecap="round" fill="none"/>\n`;
       } else if (ent.type === 'rect') {
-        const rxAttr = ent.cornerRadius > 0 ? ` rx="${ent.cornerRadius.toFixed(3)}" ry="${ent.cornerRadius.toFixed(3)}"` : '';
-        svg += `  <rect${idAttr} x="${ent.x.toFixed(3)}" y="${ent.y.toFixed(3)}" width="${ent.w.toFixed(3)}" height="${ent.h.toFixed(3)}"${rxAttr} stroke="${strokeCol}" stroke-width="${sw}" fill="${fillAttr}"/>\n`;
+        const rxAttr = ent.cornerRadius > 0 ? ` rx="${ent.cornerRadius.toFixed(4)}" ry="${ent.cornerRadius.toFixed(4)}"` : '';
+        svg += `  <rect${idAttr} x="${ent.x.toFixed(4)}" y="${ent.y.toFixed(4)}" width="${ent.w.toFixed(4)}" height="${ent.h.toFixed(4)}"${rxAttr} stroke="${strokeCol}" stroke-width="${sw}" stroke-linejoin="round" fill="${fillAttr}"/>\n`;
       } else if (ent.type === 'circle') {
-        svg += `  <circle${idAttr} cx="${ent.cx.toFixed(3)}" cy="${ent.cy.toFixed(3)}" r="${ent.r.toFixed(3)}" stroke="${strokeCol}" stroke-width="${sw}" fill="${fillAttr}"/>\n`;
+        svg += `  <circle${idAttr} cx="${ent.cx.toFixed(4)}" cy="${ent.cy.toFixed(4)}" r="${ent.r.toFixed(4)}" stroke="${strokeCol}" stroke-width="${sw}" fill="${fillAttr}"/>\n`;
       } else if ((ent.type === 'polyline' || ent.type === 'curve') && ent.points?.length >= 2) {
         const subpaths = [];
         if (ent.type === 'curve') {
@@ -2413,7 +2436,7 @@ document.addEventListener('DOMContentLoaded', () => {
         } else {
           const polySub = (pts, closed) => {
             if (!pts || pts.length < 2) return '';
-            return `M ${pts.map((p) => `${p.x.toFixed(3)} ${p.y.toFixed(3)}`).join(' L ')}${closed ? ' Z' : ''}`;
+            return `M ${pts.map((p) => `${p.x.toFixed(4)} ${p.y.toFixed(4)}`).join(' L ')}${closed ? ' Z' : ''}`;
           };
           subpaths.push(polySub(ent.points, !!ent.isClosed));
           if (ent.holes) {
@@ -2422,10 +2445,10 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         const dAttr = subpaths.filter(Boolean).join(' ');
         if (dAttr) {
-          svg += `  <path${idAttr} d="${dAttr}" fill="${fillAttr}" fill-rule="evenodd" stroke="${strokeCol}" stroke-width="${sw}"/>\n`;
+          svg += `  <path${idAttr} d="${dAttr}" fill="${fillAttr}" fill-rule="evenodd" stroke="${strokeCol}" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round"/>\n`;
         }
       } else if (ent.type === 'text') {
-        svg += `  <text${idAttr} x="${ent.x.toFixed(3)}" y="${ent.y.toFixed(3)}" font-size="${(ent.size || 16) * 0.4}" font-weight="${ent.fontWeight || 'bold'}" font-family="${escapeXml(ent.fontFamily || 'sans-serif')}" fill="${strokeCol}">${escapeXml(ent.text)}</text>\n`;
+        svg += `  <text${idAttr} x="${ent.x.toFixed(4)}" y="${ent.y.toFixed(4)}" font-size="${(ent.size || 16) * 0.4}" font-weight="${ent.fontWeight || 'bold'}" font-family="${escapeXml(ent.fontFamily || 'sans-serif')}" fill="${strokeCol}">${escapeXml(ent.text)}</text>\n`;
       }
     }
 
@@ -2435,10 +2458,94 @@ document.addEventListener('DOMContentLoaded', () => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'jdpaint-vectors.svg';
+    a.download = 'jdpaint-vectors-4k.svg';
     a.click();
     URL.revokeObjectURL(url);
-    statusMode.textContent = `Exported ${entities.length} entities (Cubic Bezier SVG) to file.`;
+    statusMode.textContent = `Exported ${entities.length} 4K-precision Cubic Bezier vector entities to SVG.`;
+  }
+
+  function exportVector4KPNG() {
+    const entities = cadCanvas.entities;
+    if (entities.length === 0) {
+      alert('No 2D vector entities to export. Draw or auto-trace shapes first.');
+      return;
+    }
+    const w = Math.max(1, cadCanvas.workpieceWidth || 100);
+    const h = Math.max(1, cadCanvas.workpieceHeight || 100);
+    const maxEdge = 4096;
+    const cw = w >= h ? maxEdge : Math.max(256, Math.round((w / h) * maxEdge));
+    const ch = h >= w ? maxEdge : Math.max(256, Math.round((h / w) * maxEdge));
+    const scale = cw / w;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = cw;
+    canvas.height = ch;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, cw, ch);
+
+    const traceRing = (pts, closed) => {
+      if (!pts || pts.length < 2) return;
+      if (CadCanvas.hasCubicHandles(pts)) {
+        const ring = CadCanvas.normalizeClosedRing(pts, closed);
+        ctx.moveTo(ring[0].x * scale, ring[0].y * scale);
+        const segCount = closed ? ring.length : ring.length - 1;
+        for (let i = 0; i < segCount; i++) {
+          const a = ring[i], b = ring[(i + 1) % ring.length];
+          if (!a.hOut && !b.hIn) {
+            ctx.lineTo(b.x * scale, b.y * scale);
+          } else {
+            const c1 = a.hOut || a, c2 = b.hIn || b;
+            ctx.bezierCurveTo(c1.x * scale, c1.y * scale, c2.x * scale, c2.y * scale, b.x * scale, b.y * scale);
+          }
+        }
+      } else {
+        ctx.moveTo(pts[0].x * scale, pts[0].y * scale);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x * scale, pts[i].y * scale);
+      }
+      if (closed) ctx.closePath();
+    };
+
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (const ent of entities) {
+      if (ent.visible === false) continue;
+      const strokeCol = ent.color || '#38bdf8';
+      const swPx = Math.max(1.8, (ent.width || 1.5) * 0.12 * scale);
+      ctx.beginPath();
+      if (ent.type === 'line') {
+        ctx.moveTo(ent.x1 * scale, ent.y1 * scale);
+        ctx.lineTo(ent.x2 * scale, ent.y2 * scale);
+      } else if (ent.type === 'rect') {
+        ctx.roundRect(ent.x * scale, ent.y * scale, ent.w * scale, ent.h * scale, (ent.cornerRadius || 0) * scale);
+      } else if (ent.type === 'circle') {
+        ctx.arc(ent.cx * scale, ent.cy * scale, ent.r * scale, 0, Math.PI * 2);
+      } else if ((ent.type === 'polyline' || ent.type === 'curve') && ent.points?.length >= 2) {
+        traceRing(ent.points, !!ent.isClosed);
+        if (ent.holes) for (const hole of ent.holes) traceRing(hole, true);
+      } else if (ent.type === 'text') {
+        ctx.font = `${ent.fontWeight || 'bold'} ${Math.max(12, (ent.size || 16) * 0.4 * scale)}px ${ent.fontFamily || 'sans-serif'}`;
+        ctx.fillStyle = strokeCol;
+        ctx.fillText(ent.text || '', ent.x * scale, ent.y * scale);
+        continue;
+      }
+      if (ent.isClosed && cadCanvas.showColorFills && ent.fillColor) {
+        ctx.globalAlpha = 0.35;
+        ctx.fillStyle = ent.fillColor;
+        ctx.fill('evenodd');
+        ctx.globalAlpha = 1.0;
+      }
+      ctx.strokeStyle = strokeCol;
+      ctx.lineWidth = swPx;
+      ctx.stroke();
+    }
+
+    canvas.toBlob((blob) => {
+      if (blob) {
+        StlExporter.downloadBlob('jdpaint-vectors-4k.png', blob);
+        statusMode.textContent = `Exported Ultra 4K (${cw}×${ch}px) 2D Vector PNG Blueprint (${(blob.size / 1024).toFixed(1)} KB).`;
+      }
+    }, 'image/png');
   }
 
   function escapeXml(str) {
@@ -2449,6 +2556,10 @@ document.addEventListener('DOMContentLoaded', () => {
   if (menuExportSvg) menuExportSvg.addEventListener('click', exportSVG);
   const btnExportSvgTab = document.getElementById('btn-export-svg-tab');
   if (btnExportSvgTab) btnExportSvgTab.addEventListener('click', exportSVG);
+  const menuExportVec4k = document.getElementById('menu-file-export-vec4k');
+  if (menuExportVec4k) menuExportVec4k.addEventListener('click', exportVector4KPNG);
+  const btnExportVec4kTab = document.getElementById('btn-export-vec4k-tab');
+  if (btnExportVec4kTab) btnExportVec4kTab.addEventListener('click', exportVector4KPNG);
 
   // ============================================================
   // PROJECT OPEN (Load .jdp.json file)

@@ -31,7 +31,7 @@ export class NeuralVision {
     return 'wasm';
   }
 
-  static _drawCroppedInput(imgElement, srcCrop, maxEdge = 518) {
+  static _drawCroppedInput(imgElement, srcCrop, maxEdge = 672) {
     const iw = imgElement.naturalWidth || imgElement.width || 1;
     const ih = imgElement.naturalHeight || imgElement.height || 1;
     const sx = srcCrop?.w ? srcCrop.x : 0;
@@ -172,7 +172,7 @@ export class NeuralVision {
 
     try {
       const { RawImage } = await import('@huggingface/transformers');
-      const { canvas } = NeuralVision._drawCroppedInput(imgElement, srcCrop, 518);
+      const { canvas } = NeuralVision._drawCroppedInput(imgElement, srcCrop, 672);
       if (typeof HTMLCanvasElement === 'undefined' || !(canvas instanceof HTMLCanvasElement)) {
         return { depth: null, matte: null };
       }
