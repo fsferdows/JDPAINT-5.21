@@ -798,9 +798,15 @@ export class ImageVectorizer {
       }
 
       const cleanedMask = ImageVectorizer.morphClose(mask, w, h, 1);
-      // Smooth continuous scalar slightly so Marching Squares edges follow smooth subpixel boundaries
+      ImageVectorizer.removeCheckerboardPinches(cleanedMask, w, h, true);
+      const { phi } = ImageVectorizer.computeSignedDistancePhi(cleanedMask, w, h, 0.85);
       const smoothScalar = ImageVectorizer.gaussianBlur3x3(scalar, w, h);
-      const rawLoops = ImageVectorizer.marchSquares(cleanedMask, w, h, smoothScalar, 0.0);
+      const blendedScalar = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        // Blend continuous color distance with smooth Felzenszwalb L2 signed distance (0-crossing inside boundary)
+        blendedScalar[i] = smoothScalar[i] * 0.45 - phi[i] * 0.85;
+      }
+      const rawLoops = ImageVectorizer.marchSquares(cleanedMask, w, h, blendedScalar, 0.0);
 
       // Height increases smoothly up the layer stack for accurate 3D stepped/sculpted relief!
       const heightFrac = (li + 1) / activeClusters.length;
@@ -915,6 +921,7 @@ export class ImageVectorizer {
       }
 
       const cleaned = ImageVectorizer.morphClose(mask, w, h, 1);
+      ImageVectorizer.removeCheckerboardPinches(cleaned, w, h, false);
       const rawLoops = ImageVectorizer.marchSquares(cleaned, w, h, scalar, -th);
       const grayVal = Math.round(45 + ((lv + 1) / effLevels) * 195);
       const toneHex = ImageVectorizer.rgbToHex(grayVal, grayVal, grayVal);
@@ -1055,8 +1062,8 @@ export class ImageVectorizer {
     const hasBottomBg = ry1 < h - Math.max(5, h * 0.03);
     const edgeGuardX = Math.max(4, Math.round(w * 0.010));
     const edgeGuardY = Math.max(4, Math.round(h * 0.010));
-    const insetX = Math.max(4, Math.round((rx1 - rx0) * 0.014));
-    const insetY = Math.max(4, Math.round((ry1 - ry0) * 0.014));
+    const insetX = Math.max(4, Math.round((rx1 - rx0) * 0.022));
+    const insetY = Math.max(4, Math.round((ry1 - ry0) * 0.016));
 
     const ix0 = hasLeftBg ? Math.min(rx1 - 10, rx0 + insetX) : edgeGuardX;
     const ix1 = hasRightBg ? Math.max(ix0 + 10, rx1 - insetX) : w - 1 - edgeGuardX;
@@ -2772,5 +2779,179 @@ export class ImageVectorizer {
 
   static computeOtsuThreshold(histogram, totalPixels) {
     return ImageVectorizer.computeOtsuStats(histogram, totalPixels).threshold;
+  }
+
+  /**
+   * 1D Felzenszwalb-Huttenlocher exact squared Euclidean distance envelope along a scanline.
+   */
+  static _edt1d(f, d, v, z, n) {
+    let k = 0;
+    v[0] = 0;
+    z[0] = -1e20;
+    z[1] = 1e20;
+    for (let q = 1; q < n; q++) {
+      let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+      while (s <= z[k]) {
+        k--;
+        s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+      }
+      k++;
+      v[k] = q;
+      z[k] = s;
+      z[k + 1] = 1e20;
+    }
+    k = 0;
+    for (let q = 0; q < n; q++) {
+      while (z[k + 1] < q) k++;
+      const dx = q - v[k];
+      d[q] = dx * dx + f[v[k]];
+    }
+  }
+
+  /**
+   * Exact O(W*H) 2D Euclidean L2 Distance Transform (distance from pixels where mask == 0 into foreground mask == 1).
+   */
+  static computeL2Distance2D(mask, w, h) {
+    const n = w * h;
+    const dist = new Float32Array(n);
+    for (let i = 0; i < n; i++) dist[i] = mask[i] ? 1e20 : 0.0;
+    const maxDim = Math.max(w, h);
+    const f = new Float32Array(maxDim);
+    const d = new Float32Array(maxDim);
+    const v = new Int32Array(maxDim);
+    const z = new Float32Array(maxDim + 1);
+
+    for (let x = 0; x < w; x++) {
+      for (let y = 0; y < h; y++) f[y] = dist[y * w + x];
+      ImageVectorizer._edt1d(f, d, v, z, h);
+      for (let y = 0; y < h; y++) dist[y * w + x] = d[y];
+    }
+    for (let y = 0; y < h; y++) {
+      const row = y * w;
+      for (let x = 0; x < w; x++) f[x] = dist[row + x];
+      ImageVectorizer._edt1d(f, d, v, z, w);
+      for (let x = 0; x < w; x++) dist[row + x] = Math.sqrt(d[x]);
+    }
+    return dist;
+  }
+
+  /**
+   * Kovesi 3-pass separable sliding-window Gaussian smoothing in O(W*H).
+   */
+  static gaussianSmooth2D(field, w, h, sigma = 1.0) {
+    if (sigma <= 0 || w < 2 || h < 2) return field;
+    const wIdeal = Math.sqrt((12 * sigma * sigma) / 3 + 1);
+    let wl = Math.floor(wIdeal);
+    if (wl % 2 === 0) wl--;
+    const wu = wl + 2;
+    const m = Math.round((12 * sigma * sigma - 3 * wl * wl - 12 * wl - 9) / (-4 * wl - 4));
+    const tmp = new Float32Array(field.length);
+
+    for (let pass = 0; pass < 3; pass++) {
+      const boxW = pass < m ? wl : wu;
+      const r = (boxW - 1) >> 1;
+      if (r < 1) continue;
+      const scale = 1.0 / (r + r + 1);
+
+      for (let y = 0; y < h; y++) {
+        const row = y * w;
+        let leftIdx = row;
+        let rightIdx = row + r;
+        const first = field[row];
+        const last = field[row + w - 1];
+        let val = (r + 1) * first;
+        for (let j = 0; j < r; j++) val += field[row + Math.min(j, w - 1)];
+        for (let j = 0; j <= r; j++) {
+          val += (rightIdx < row + w ? field[rightIdx] : last) - first;
+          tmp[row + j] = val * scale;
+          rightIdx++;
+        }
+        for (let j = r + 1; j < w - r; j++) {
+          val += field[rightIdx++] - field[leftIdx++];
+          tmp[row + j] = val * scale;
+        }
+        for (let j = Math.max(r + 1, w - r); j < w; j++) {
+          val += last - field[leftIdx++];
+          tmp[row + j] = val * scale;
+        }
+      }
+
+      for (let x = 0; x < w; x++) {
+        let topIdx = x;
+        let botIdx = x + r * w;
+        const first = tmp[x];
+        const last = tmp[x + (h - 1) * w];
+        let val = (r + 1) * first;
+        for (let j = 0; j < r; j++) val += tmp[x + Math.min(j, h - 1) * w];
+        let outIdx = x;
+        for (let j = 0; j <= r; j++) {
+          val += (botIdx <= x + (h - 1) * w ? tmp[botIdx] : last) - first;
+          field[outIdx] = val * scale;
+          botIdx += w;
+          outIdx += w;
+        }
+        for (let j = r + 1; j < h - r; j++) {
+          val += tmp[botIdx] - tmp[topIdx];
+          field[outIdx] = val * scale;
+          botIdx += w;
+          topIdx += w;
+          outIdx += w;
+        }
+        for (let j = Math.max(r + 1, h - r); j < h; j++) {
+          val += last - tmp[topIdx];
+          field[outIdx] = val * scale;
+          topIdx += w;
+          outIdx += w;
+        }
+      }
+    }
+    return field;
+  }
+
+  /**
+   * Eliminate diagonal checkerboard corner pinches so 2D contours & 3D silhouettes remain manifold-clean.
+   */
+  static removeCheckerboardPinches(mask, w, h, bridge = false) {
+    const iters = bridge ? 6 : 1;
+    for (let it = 0; it < iters; it++) {
+      let changed = false;
+      for (let y = 0; y < h - 1; y++) {
+        const row0 = y * w;
+        const row1 = (y + 1) * w;
+        for (let x = 0; x < w - 1; x++) {
+          const a = mask[row0 + x];
+          const b = mask[row0 + x + 1];
+          const c = mask[row1 + x];
+          const d = mask[row1 + x + 1];
+          if (a && d && !b && !c) {
+            if (bridge) mask[row0 + x + 1] = 1;
+            else mask[row1 + x + 1] = 0;
+            changed = true;
+          } else if (b && c && !a && !d) {
+            if (bridge) mask[row0 + x] = 1;
+            else mask[row1 + x] = 0;
+            changed = true;
+          }
+        }
+      }
+      if (!changed) break;
+    }
+    return mask;
+  }
+
+  /**
+   * Exact L2 Signed Distance Field (phi > 0 inside mask, phi < 0 outside, smoothed via Kovesi Gaussian).
+   */
+  static computeSignedDistancePhi(mask, w, h, sigma = 1.0) {
+    const invMask = new Uint8Array(mask.length);
+    for (let i = 0; i < mask.length; i++) invMask[i] = mask[i] ? 0 : 1;
+    const dIn = ImageVectorizer.computeL2Distance2D(mask, w, h);
+    const dOut = ImageVectorizer.computeL2Distance2D(invMask, w, h);
+    const phi = new Float32Array(mask.length);
+    for (let i = 0; i < mask.length; i++) {
+      phi[i] = mask[i] ? dIn[i] : -dOut[i];
+    }
+    ImageVectorizer.gaussianSmooth2D(phi, w, h, sigma);
+    return { phi, dIn, dOut };
   }
 }

@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Beijing Jingdiao CNC CAD/CAM System - [JDPaint 5.21 (Mac Edition) - Untitled.jdp]</title>
+  <link rel="icon" href="data:,">
   <link rel="stylesheet" href="./src/styles/app.css">
 </head>
 <body>
@@ -850,9 +851,10 @@
             <div class="row">
               <label>Mesh Topology Res:</label>
               <select id="asset-res-select" class="win-input">
-                <option value="112">Standard (~25K faces)</option>
-                <option value="160" selected>High Detail (~51K faces)</option>
-                <option value="224">Ultra Detail (~100K faces)</option>
+                <option value="128">Standard Draft (~32K faces)</option>
+                <option value="208">High Detail (~100K faces)</option>
+                <option value="288" selected>Meshy Flagship (~330K faces)</option>
+                <option value="384">Flagship Ultra (~600K faces)</option>
               </select>
             </div>
             <div class="row">
@@ -863,6 +865,11 @@
               </div>
             </div>
             <div class="row">
+              <label>Edge Fillet Radius:</label>
+              <input type="range" id="asset-fillet" min="0" max="25" value="12" style="width:90px;">
+              <span id="lbl-asset-fillet" style="width:36px;text-align:right;font-size:11px;">0.012</span>
+            </div>
+            <div class="row">
               <label>Cut Background Mask:</label>
               <input type="checkbox" id="asset-remove-bg" checked>
             </div>
@@ -871,6 +878,27 @@
               <input type="checkbox" id="asset-delight" checked>
             </div>
             <button class="win-push-btn primary" id="btn-generate-asset" style="width:100%;margin-top:6px;">🚀 Generate 3D Asset from Picture</button>
+            <div id="asset-progress-wrap" style="display:none;margin-top:6px;">
+              <div style="width:100%;height:10px;background:#d6d2c4;border:1px inset #808080;border-radius:2px;overflow:hidden;">
+                <div id="asset-progress-bar" style="width:0%;height:100%;background:linear-gradient(90deg,#1d4ed8,#3b82f6);transition:width 0.16s ease;"></div>
+              </div>
+              <div id="asset-progress-label" style="font-size:10px;color:#333;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">Preparing 5-stage pipeline...</div>
+            </div>
+            <details style="margin-top:6px;border-top:1px solid #d4d0c4;padding-top:4px;">
+              <summary style="cursor:pointer;font-size:11px;font-weight:600;color:#1e3a8a;">⚡ Engine Source / Meshy Cloud API (Optional)</summary>
+              <div class="row" style="margin-top:4px;">
+                <label>Engine Mode:</label>
+                <select id="asset-engine-mode" class="win-input">
+                  <option value="local" selected>Offline 5-Stage Meshy SDF</option>
+                  <option value="cloud">Meshy Cloud AI v1 (API Key)</option>
+                </select>
+              </div>
+              <div class="row" style="margin-top:3px;">
+                <label>Meshy API Key:</label>
+                <input type="password" id="asset-meshy-key" class="win-input" placeholder="msy_... (optional)" style="flex:1;">
+              </div>
+              <div style="font-size:10px;color:#555;line-height:1.25;margin-top:3px;">Offline uses L2 SDF, slope-aware rolling-ball fillet &amp; Poisson dome locally. Cloud mode sends to api.meshy.ai for full 360° neural GLB.</div>
+            </details>
           </fieldset>
 
           <fieldset class="win-group">

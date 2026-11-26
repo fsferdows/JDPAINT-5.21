@@ -2,16 +2,60 @@ import { ImageVectorizer } from '../cad/imageVectorizer.js';
 import { VectorPuffEngine } from '../cad/vectorPuffEngine.js';
 
 /**
- * Meshy-Style Image-to-3D Volumetric Asset Generator & PBR Map Synthesizer.
- * Supports BOTH:
- * - Planar Architectural / Carved Wood Reliefs (panels, doors, plaques): aspect-fitted high-density grids,
- *   watermark suppression, grain smoothing, flat coplanar datum rails & flat print-ready backs.
- * - Organic 3D Cutout Assets (statues, coins, medallions, vases): smooth harmonic inflation (zero diagonal creases),
- *   Taubin perimeter fairing (zero staircasing), split bevel normals, seam-free Lathe 360, & Voronoi-padded 1024px PBR maps.
+ * Meshy-Architecture Volumetric Image-to-3D Reconstruction Engine & PBR Synthesizer.
+ * Combines Meshy AI client-side reconstruction algorithms verified via REA:
+ * - Felzenszwalb exact O(N) 2D Euclidean L2 Distance Transform (computeL2Distance2D)
+ * - Kovesi 3-pass separable circular Gaussian smoothing (gaussianSmooth2D)
+ * - Diagonal checkerboard pinch cleanup & Union-Find manifold component verification
+ * - [1,4,6,4,1] Sobel steep-slope detection + 30-deg normal-bilateral circular rolling-ball filleting
+ * - Subpixel Newton-Raphson zero-isocontour (phi=0) rim snapping & ordered boundary loop relaxation
+ * - 5-Stage asynchronous progressive pipeline + optional direct api.meshy.ai v1 cloud bridge
  */
 export class Asset3DEngine {
   /**
-   * Extract foreground/planar structure, adaptive aspect-matched depth field, and 1024px PBR maps.
+   * 5-Stage Asynchronous Meshy-Architecture Image-to-3D Pipeline with real progress updates.
+   */
+  static async generateAssetProgressiveAsync(imgElement, options = {}, onProgress = null) {
+    const emit = async (stage, pct, label) => {
+      if (typeof onProgress === 'function') onProgress(stage, pct, label);
+      await new Promise((r) => setTimeout(r, 0));
+    };
+
+    const {
+      assetMode = 'double-sided',
+      resolution = 256,
+      texSize = 1024,
+      removeBg = true,
+      delight = true,
+      invert = false,
+      edgeStrength = 0.36,
+      filletRatio = 0.012,
+      widthMm = 100,
+      heightMm = 100,
+      thicknessMm = 22,
+    } = options;
+
+    await emit(1, 10, `Stage 1/5: Rasterizing high-density aspect grid & isolating subject (${resolution}px tier)...`);
+    const prep = Asset3DEngine._prepareCanvasAndMask(imgElement, { resolution, texSize, removeBg, delight, invert, edgeStrength });
+
+    await emit(2, 32, `Stage 2/5: Computing Felzenszwalb L2 SDF & ${prep.isPlanarPanel ? 'Planar CNC Relief' : 'Jacobi Poisson 3D Volume'}...`);
+    Asset3DEngine._solveSurfaceDepth(prep, { delight, invert, edgeStrength });
+
+    await emit(3, 56, `Stage 3/5: Applying Meshy [1,4,6,4,1] steep-slope rolling-ball edge fillet (r=${filletRatio.toFixed(3)})...`);
+    Asset3DEngine.applySlopeAwareFillet(prep.depth, prep.fgMask, prep.resX, prep.resY, prep.aspect >= 1 ? widthMm : widthMm * prep.aspect, thicknessMm, filletRatio);
+
+    await emit(4, 78, `Stage 4/5: Newton-Raphson zero-isocontour rim snapping & manifold ${assetMode.toUpperCase()} mesh (${prep.resX}×${prep.resY})...`);
+    const analysis = Asset3DEngine._finalizeAnalysis(prep, { texSize, removeBg, delight });
+    const meshData = Asset3DEngine.buildAssetMeshData(analysis, { assetMode, widthMm, heightMm, thicknessMm });
+
+    await emit(5, 96, 'Stage 5/5: Synthesizing 1024px Voronoi-padded BaseColor, Normal, Roughness & ORM PBR maps...');
+    await emit(5, 100, `Complete: ${meshData.stats.faces.toLocaleString()} watertight faces ready!`);
+
+    return { analysis, meshData };
+  }
+
+  /**
+   * Synchronous entrypoint preserved for headless tests & fast preview scripting.
    */
   static analyzeImage(imgElement, options = {}) {
     const {
@@ -21,20 +65,105 @@ export class Asset3DEngine {
       delight = true,
       invert = false,
       edgeStrength = 0.35,
+      filletRatio = 0.012,
+      widthMm = 100,
+      thicknessMm = 22,
     } = options;
 
-    const baseRes = Math.max(48, Math.min(320, Math.round(resolution)));
+    const prep = Asset3DEngine._prepareCanvasAndMask(imgElement, { resolution, texSize, removeBg, delight, invert, edgeStrength });
+    Asset3DEngine._solveSurfaceDepth(prep, { delight, invert, edgeStrength });
+    Asset3DEngine.applySlopeAwareFillet(prep.depth, prep.fgMask, prep.resX, prep.resY, prep.aspect >= 1 ? widthMm : widthMm * prep.aspect, thicknessMm, filletRatio);
+    return Asset3DEngine._finalizeAnalysis(prep, { texSize, removeBg, delight });
+  }
+
+  /**
+   * Optional Cloud Neural 3D Generator via Meshy API v1 (for users providing their own Meshy API key).
+   */
+  static async generateViaMeshyCloudApi(imgElement, apiKey, options = {}, onProgress = null) {
+    const cleanKey = String(apiKey || '').trim();
+    if (!cleanKey) throw new Error('Meshy API key is required for Cloud Neural 3D mode.');
+    const {
+      aiModel = 'latest',
+      topology = 'triangle',
+      targetPolycount = 60000,
+      enablePbr = true,
+      shouldRemesh = true,
+    } = options;
+
+    if (typeof onProgress === 'function') onProgress(1, 8, 'Uploading image to Meshy Cloud API v1...');
+    const c = document.createElement('canvas');
+    const iw = imgElement.naturalWidth || imgElement.width || 512;
+    const ih = imgElement.naturalHeight || imgElement.height || 512;
+    const maxEdge = 1024;
+    const sc = Math.min(1.0, maxEdge / Math.max(1, iw, ih));
+    c.width = Math.max(64, Math.round(iw * sc));
+    c.height = Math.max(64, Math.round(ih * sc));
+    c.getContext('2d').drawImage(imgElement, 0, 0, c.width, c.height);
+    const imageUrl = c.toDataURL('image/png');
+
+    const headers = {
+      Authorization: `Bearer ${cleanKey}`,
+      'Content-Type': 'application/json',
+    };
+    const createResp = await fetch('https://api.meshy.ai/openapi/v1/image-to-3d', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        image_url: imageUrl,
+        ai_model: aiModel,
+        topology,
+        target_polycount: targetPolycount,
+        enable_pbr: enablePbr,
+        should_remesh: shouldRemesh,
+        should_texture: true,
+      }),
+    });
+    if (!createResp.ok) {
+      const msg = await createResp.text();
+      throw new Error(`Meshy API error (${createResp.status}): ${msg.slice(0, 180)}`);
+    }
+    const created = await createResp.json();
+    const taskId = created.result;
+    if (!taskId) throw new Error('Meshy API did not return a valid task id.');
+
+    for (let poll = 0; poll < 120; poll++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const pollResp = await fetch(`https://api.meshy.ai/openapi/v1/image-to-3d/${encodeURIComponent(taskId)}`, { headers });
+      if (!pollResp.ok) continue;
+      const task = await pollResp.json();
+      const pct = Math.max(12, Math.min(96, Math.round(task.progress || 15)));
+      if (typeof onProgress === 'function') {
+        onProgress(3, pct, `Meshy Cloud Neural Inference (${task.status || 'IN_PROGRESS'})... ${pct}%`);
+      }
+      if (task.status === 'SUCCEEDED' && task.model_urls?.glb) {
+        if (typeof onProgress === 'function') onProgress(5, 98, 'Downloading generated neural .GLB PBR asset...');
+        const glbResp = await fetch(task.model_urls.glb);
+        if (!glbResp.ok) throw new Error(`Failed downloading Meshy GLB (${glbResp.status})`);
+        const glbBuffer = await glbResp.arrayBuffer();
+        if (typeof onProgress === 'function') onProgress(5, 100, 'Meshy Cloud Neural 3D model ready!');
+        return { taskId, glbBuffer, task };
+      }
+      if (task.status === 'FAILED' || task.status === 'EXPIRED') {
+        throw new Error(task.task_error?.message || `Meshy task ${task.status}`);
+      }
+    }
+    throw new Error('Meshy Cloud task timed out after 4 minutes.');
+  }
+
+  static _prepareCanvasAndMask(imgElement, opts) {
+    const { resolution = 160, texSize = 1024, removeBg = true } = opts;
+    const baseRes = Math.max(48, Math.min(512, Math.round(resolution)));
     const iw = imgElement.naturalWidth || imgElement.width || 1;
     const ih = imgElement.naturalHeight || imgElement.height || 1;
     const imgAspect = iw / Math.max(1, ih);
 
-    // Choose adaptive rectangular grid (resX x resY) matching source aspect & lifting High/Ultra detail resolution
+    // Choose adaptive rectangular grid (resX x resY) matching source aspect & High/Flagship quality budget
     let resX = baseRes;
     let resY = baseRes;
     if (baseRes >= 128 || Math.abs(imgAspect - 1.0) >= 0.05) {
       const areaBudget = baseRes * baseRes * (baseRes >= 144 ? 1.65 : 1.45);
-      resX = Math.max(84, Math.min(360, Math.round(Math.sqrt(areaBudget * imgAspect))));
-      resY = Math.max(84, Math.min(360, Math.round(Math.sqrt(areaBudget / imgAspect))));
+      resX = Math.max(84, Math.min(512, Math.round(Math.sqrt(areaBudget * imgAspect))));
+      resY = Math.max(84, Math.min(512, Math.round(Math.sqrt(areaBudget / imgAspect))));
     }
 
     const drawToCanvas = (w, h, sx = 0, sy = 0, sw = iw, sh = ih) => {
@@ -54,211 +183,208 @@ export class Asset3DEngine {
 
     let rgba = drawToCanvas(resX, resY);
     let activeAspect = imgAspect;
-    let srcCropX = 0;
-    let srcCropY = 0;
-    let srcCropW = iw;
-    let srcCropH = ih;
+    let srcCropX = 0, srcCropY = 0, srcCropW = iw, srcCropH = ih;
 
-    // Detect if real browser image has wide uniform studio margins around a narrow subject and tighten crop for 2-3x detail
+    const extractMaskAndStats = (buf, W, H) => {
+      const total = W * H;
+      const rArr = new Float32Array(total);
+      const gArr = new Float32Array(total);
+      const bArr = new Float32Array(total);
+      const luma = new Float32Array(total);
+      const luma255 = new Float32Array(total);
+      const chromaL = new Float32Array(total);
+      const chromaA = new Float32Array(total);
+      const chromaB = new Float32Array(total);
+      const alpha = new Uint8Array(total);
+
+      let hasTransparency = false;
+      for (let i = 0; i < total; i++) {
+        const r = buf[i * 4], g = buf[i * 4 + 1], b = buf[i * 4 + 2], a = buf[i * 4 + 3];
+        rArr[i] = r; gArr[i] = g; bArr[i] = b; alpha[i] = a;
+        if (a < 230) hasTransparency = true;
+        const lv = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+        luma[i] = lv;
+        luma255[i] = lv * 255.0;
+        const [cl, ca, cb] = ImageVectorizer.rgbToLab(r, g, b);
+        chromaL[i] = cl; chromaA[i] = ca; chromaB[i] = cb;
+      }
+
+      const fgMask = Asset3DEngine.extractBorderConnectedForeground(alpha, chromaL, chromaA, chromaB, W, H, { removeBg, hasTransparency });
+      ImageVectorizer.removeCheckerboardPinches(fgMask, W, H, false);
+
+      let minFgX = W - 1, maxFgX = 0, minFgY = H - 1, maxFgY = 0, fgCount = 0;
+      for (let y = 0; y < H; y++) {
+        const row = y * W;
+        for (let x = 0; x < W; x++) {
+          if (!fgMask[row + x]) continue;
+          fgCount++;
+          if (x < minFgX) minFgX = x; if (x > maxFgX) maxFgX = x;
+          if (y < minFgY) minFgY = y; if (y > maxFgY) maxFgY = y;
+        }
+      }
+      if (fgCount === 0) {
+        fgMask.fill(1);
+        minFgX = 0; maxFgX = W - 1; minFgY = 0; maxFgY = H - 1;
+        fgCount = total;
+      }
+
+      const fgBoxW = Math.max(1, maxFgX - minFgX + 1);
+      const fgBoxH = Math.max(1, maxFgY - minFgY + 1);
+      const fillRatio = fgCount / (fgBoxW * fgBoxH);
+      const roi = ImageVectorizer.detectFurnitureROI(rArr, gArr, bArr, luma255, W, H);
+
+      let roiPanelDensity = 0;
+      if (roi && roi.panelMask && roi.w > 0 && roi.h > 0) {
+        let pCnt = 0;
+        for (let y = roi.y0; y <= roi.y1; y++) {
+          const row = y * W;
+          for (let x = roi.x0; x <= roi.x1; x++) {
+            if (roi.panelMask[row + x]) pCnt++;
+          }
+        }
+        roiPanelDensity = pCnt / (roi.w * roi.h);
+      }
+
+      const isRoiWoodPanel = !!(roi && roi.chromaMed >= 11 && roi.w > W * 0.28 && roi.h > H * 0.42 && roiPanelDensity >= 0.56);
+      const isWoodOrArch = !!(roi && roi.chromaMed >= 10 && fillRatio >= 0.78);
+      const isSolidRectPanel = fillRatio >= 0.88 && fgBoxW > W * 0.45 && fgBoxH > H * 0.45;
+      const isPlanarPanel = isRoiWoodPanel || isWoodOrArch || isSolidRectPanel;
+
+      if (isPlanarPanel && roi && roi.chromaMed >= 10 && roi.w > W * 0.28 && roi.h > H * 0.42 && removeBg && !hasTransparency) {
+        for (let y = 0; y < H; y++) {
+          const row = y * W;
+          const inY = y >= roi.y0 && y <= roi.y1;
+          for (let x = 0; x < W; x++) {
+            fgMask[row + x] = (inY && x >= roi.x0 && x <= roi.x1) ? 1 : 0;
+          }
+        }
+        ImageVectorizer.removeCheckerboardPinches(fgMask, W, H, false);
+        minFgX = roi.x0; maxFgX = roi.x1; minFgY = roi.y0; maxFgY = roi.y1;
+        fgCount = roi.w * roi.h;
+      }
+
+      return {
+        resX: W, resY: H, total, rArr, gArr, bArr, luma, luma255, alpha, hasTransparency,
+        fgMask, fgBox: { minX: minFgX, maxX: maxFgX, minY: minFgY, maxY: maxFgY },
+        fgBoxW: maxFgX - minFgX + 1, fgBoxH: maxFgY - minFgY + 1,
+        isPlanarPanel, roi,
+      };
+    };
+
     const isRealDomImage = !!(imgElement && (imgElement.tagName === 'IMG' || imgElement.nodeName === 'IMG' || (typeof HTMLImageElement !== 'undefined' && imgElement instanceof HTMLImageElement)));
-    let analysisData = Asset3DEngine._analyzeBuffer(rgba, resX, resY, { removeBg, delight, invert, edgeStrength });
+    let data = extractMaskAndStats(rgba, resX, resY);
 
-    if (isRealDomImage && removeBg && analysisData.fgBox) {
-      const { minX, maxX, minY, maxY } = analysisData.fgBox;
+    if (isRealDomImage && removeBg && data.fgBox) {
+      const { minX, maxX, minY, maxY } = data.fgBox;
       const bw = maxX - minX + 1;
       const bh = maxY - minY + 1;
       const covX = bw / resX;
       const covY = bh / resY;
-      if ((covX < 0.78 || covY < 0.78) && covX > 0.16 && covY > 0.16) {
-        const padX = Math.max(2, Math.round(bw * 0.025));
-        const padY = Math.max(2, Math.round(bh * 0.025));
+      if ((covX < 0.84 || covY < 0.84) && covX > 0.16 && covY > 0.16) {
+        // Planar panels already include clean inner wood margins from detectFurnitureROI -> zero pad prevents brick/sofa edge bleed
+        const padX = data.isPlanarPanel ? 0 : Math.max(2, Math.round(bw * 0.025));
+        const padY = data.isPlanarPanel ? 0 : Math.max(2, Math.round(bh * 0.025));
         const cx0 = Math.max(0, minX - padX);
         const cy0 = Math.max(0, minY - padY);
         const cx1 = Math.min(resX - 1, maxX + padX);
         const cy1 = Math.min(resY - 1, maxY + padY);
-        srcCropX = (cx0 / (resX - 1)) * iw;
-        srcCropY = (cy0 / (resY - 1)) * ih;
-        srcCropW = Math.max(8, ((cx1 - cx0) / (resX - 1)) * iw);
-        srcCropH = Math.max(8, ((cy1 - cy0) / (resY - 1)) * ih);
+        srcCropX = (cx0 / Math.max(1, resX - 1)) * iw;
+        srcCropY = (cy0 / Math.max(1, resY - 1)) * ih;
+        srcCropW = Math.max(8, ((cx1 - cx0) / Math.max(1, resX - 1)) * iw);
+        srcCropH = Math.max(8, ((cy1 - cy0) / Math.max(1, resY - 1)) * ih);
         activeAspect = srcCropW / Math.max(1, srcCropH);
-        const areaBudget = baseRes * baseRes * 1.5;
-        resX = Math.max(96, Math.min(360, Math.round(Math.sqrt(areaBudget * activeAspect))));
-        resY = Math.max(96, Math.min(360, Math.round(Math.sqrt(areaBudget / activeAspect))));
+        const areaBudget = baseRes * baseRes * (baseRes >= 144 ? 1.65 : 1.5);
+        resX = Math.max(96, Math.min(512, Math.round(Math.sqrt(areaBudget * activeAspect))));
+        resY = Math.max(96, Math.min(512, Math.round(Math.sqrt(areaBudget / activeAspect))));
         rgba = drawToCanvas(resX, resY, srcCropX, srcCropY, srcCropW, srcCropH);
-        analysisData = Asset3DEngine._analyzeBuffer(rgba, resX, resY, { removeBg, delight, invert, edgeStrength });
+        data = extractMaskAndStats(rgba, resX, resY);
       }
     }
 
     const tSize = Math.max(256, Math.min(1024, Math.round(texSize)));
     const texRgba = drawToCanvas(tSize, tSize, srcCropX, srcCropY, srcCropW, srcCropH);
 
-    // Infinite Voronoi edge padding from pure interior foreground seed so zero backdrop white/black halo bleeds into UVs
-    Asset3DEngine.dilateTextureEdges(
-      texRgba,
-      tSize,
-      analysisData.fgMask,
-      resX,
-      resY,
-      removeBg && !analysisData.hasTransparency
-    );
+    // Exact Felzenszwalb L2 Signed Distance Field & Kovesi Gaussian smooth phi for zero-isocontour rim snapping
+    const { phi, dIn: rawDist } = ImageVectorizer.computeSignedDistancePhi(data.fgMask, resX, resY, 1.0);
+    let maxDist = 1.0;
+    for (let i = 0; i < data.total; i++) if (rawDist[i] > maxDist) maxDist = rawDist[i];
 
-    const maps = Asset3DEngine.synthesizePBRMaps(texRgba, tSize, delight, analysisData.fgMask, resX, resY);
+    // Smooth harmonic distance field eliminates diagonal "X" pyramid creases on rectangular silhouettes
+    const smoothDist = new Float32Array(rawDist);
+    ImageVectorizer.gaussianSmooth2D(smoothDist, resX, resY, Math.max(1.4, Math.min(resX, resY) * 0.022));
+    for (let i = 0; i < data.total; i++) if (!data.fgMask[i]) smoothDist[i] = 0;
 
     return {
-      resolution: Math.max(resX, resY),
-      resX,
-      resY,
+      ...data,
       aspect: activeAspect,
-      isPlanarPanel: analysisData.isPlanarPanel,
-      fgMask: analysisData.fgMask,
-      dist: analysisData.smoothDist,
-      rawDist: analysisData.rawDist,
-      maxDist: analysisData.maxDist,
-      depth: analysisData.depth,
-      sculptSignal: analysisData.sculptSignal,
+      phi,
+      rawDist,
+      smoothDist,
+      maxDist,
       texSize: tSize,
-      maps,
-      aspectBox: analysisData.aspectBox,
-      boundsPx: { dx: 0, dy: 0, dw: resX, dh: resY },
+      texRgba,
+      depth: new Float32Array(data.total),
+      sculptSignal: new Float32Array(data.total),
     };
   }
 
-  /**
-   * Analyze a rasterized (resX x resY) RGBA buffer into foreground mask, planar panel classification,
-   * denoised multi-scale depth field, and smoothed distance envelope.
-   */
-  static _analyzeBuffer(rgba, resX, resY, opts) {
-    const { removeBg, delight, invert, edgeStrength } = opts;
-    const total = resX * resY;
-    const rArr = new Float32Array(total);
-    const gArr = new Float32Array(total);
-    const bArr = new Float32Array(total);
-    const luma = new Float32Array(total);
-    const luma255 = new Float32Array(total);
-    const chromaL = new Float32Array(total);
-    const chromaA = new Float32Array(total);
-    const chromaB = new Float32Array(total);
-    const alpha = new Uint8Array(total);
-
-    let hasTransparency = false;
-    for (let i = 0; i < total; i++) {
-      const r = rgba[i * 4];
-      const g = rgba[i * 4 + 1];
-      const b = rgba[i * 4 + 2];
-      const a = rgba[i * 4 + 3];
-      rArr[i] = r;
-      gArr[i] = g;
-      bArr[i] = b;
-      alpha[i] = a;
-      if (a < 230) hasTransparency = true;
-      const lv = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
-      luma[i] = lv;
-      luma255[i] = lv * 255.0;
-      const [cl, ca, cb] = ImageVectorizer.rgbToLab(r, g, b);
-      chromaL[i] = cl;
-      chromaA[i] = ca;
-      chromaB[i] = cb;
-    }
-
-    const fgMask = Asset3DEngine.extractBorderConnectedForeground(
-      alpha,
-      chromaL,
-      chromaA,
-      chromaB,
-      resX,
-      resY,
-      { removeBg, hasTransparency }
-    );
-
-    let minFgX = resX - 1, maxFgX = 0, minFgY = resY - 1, maxFgY = 0, fgCount = 0;
-    for (let y = 0; y < resY; y++) {
-      const row = y * resX;
-      for (let x = 0; x < resX; x++) {
-        if (!fgMask[row + x]) continue;
-        fgCount++;
-        if (x < minFgX) minFgX = x;
-        if (x > maxFgX) maxFgX = x;
-        if (y < minFgY) minFgY = y;
-        if (y > maxFgY) maxFgY = y;
-      }
-    }
-    if (fgCount === 0) {
-      fgMask.fill(1);
-      minFgX = 0; maxFgX = resX - 1; minFgY = 0; maxFgY = resY - 1;
-      fgCount = total;
-    }
-
-    const fgBoxW = Math.max(1, maxFgX - minFgX + 1);
-    const fgBoxH = Math.max(1, maxFgY - minFgY + 1);
-    const fillRatio = fgCount / (fgBoxW * fgBoxH);
-
-    // Check warm/furniture/architectural panel ROI and rectangularity -> prevents bulbous pillow distortion on carved doors & plaques!
-    const roi = ImageVectorizer.detectFurnitureROI(rArr, gArr, bArr, luma255, resX, resY);
-    const isWoodOrArchitectural = roi && roi.chromaMed >= 10 && fillRatio >= 0.78;
-    const isSolidRectPanel = fillRatio >= 0.88 && fgBoxW > resX * 0.45 && fgBoxH > resY * 0.45;
-    const isPlanarPanel = !!(isWoodOrArchitectural || isSolidRectPanel);
-
-    // For carved architectural/wood panels framed near full bleed or tight ROI, align perimeter cleanly along rectangular edges
-    if (isPlanarPanel && roi && roi.chromaMed >= 10 && roi.w > resX * 0.35 && roi.h > resY * 0.35 && removeBg && !hasTransparency) {
-      for (let y = 0; y < resY; y++) {
-        const row = y * resX;
-        const inY = y >= roi.y0 && y <= roi.y1;
-        for (let x = 0; x < resX; x++) {
-          const inX = x >= roi.x0 && x <= roi.x1;
-          fgMask[row + x] = (inX && inY) ? 1 : 0;
-        }
-      }
-      minFgX = roi.x0; maxFgX = roi.x1; minFgY = roi.y0; maxFgY = roi.y1;
-    }
-
-    const rawDist = VectorPuffEngine.computeInteriorDistanceRect(fgMask, resX, resY);
-    let maxDist = 1.0;
-    for (let i = 0; i < total; i++) {
-      if (rawDist[i] > maxDist) maxDist = rawDist[i];
-    }
-
-    // Smooth harmonic distance field eliminates diagonal "X" pyramid creases from rectangular Chamfer distance transforms
-    const distSmoothR = Math.max(3, Math.round(Math.min(resX, resY) * 0.055));
-    const smoothDistBox = ImageVectorizer.maskedBoxMean(rawDist, fgMask, resX, resY, distSmoothR);
-    const smoothDist = new Float32Array(total);
-    for (let i = 0; i < total; i++) {
-      smoothDist[i] = fgMask[i] ? (smoothDistBox[i] * 0.65 + rawDist[i] * 0.35) : 0;
-    }
-
+  static _solveSurfaceDepth(prep, opts) {
+    const { delight = true, invert = false, edgeStrength = 0.36 } = opts;
+    const { resX, resY, total, rArr, gArr, bArr, luma, luma255, fgMask, fgBox, fgBoxW, fgBoxH, isPlanarPanel, roi, smoothDist, maxDist, depth, sculptSignal } = prep;
     const minDim = Math.min(resX, resY);
-    const depth = new Float32Array(total);
-    const sculptSignal = new Float32Array(total);
 
     if (isPlanarPanel) {
-      // Planar Wood / Architectural / 2-Tone Engraved Bas-Relief Pipeline
       const smL = ImageVectorizer.guidedFilter(luma255, resX, resY, 1, 55);
       const validMask = new Uint8Array(total);
       const wmRaw = new Uint8Array(total);
+      const darkWmCand = new Uint8Array(total);
       const hasRoiChroma = roi && roi.chromaMed >= 10;
       const wmTol = hasRoiChroma && roi.chromaMed > 14 ? 12 : 18;
+      let fgActiveCnt = 0;
+      let darkWmCnt = 0;
 
       for (let y = 0; y < resY; y++) {
         const row = y * resX;
         for (let x = 0; x < resX; x++) {
           const i = row + x;
           if (!fgMask[i]) continue;
-          if (hasRoiChroma && roi.L[i] > roi.lMed + 5) {
+          fgActiveCnt++;
+          if (hasRoiChroma) {
             const dc = roi.chromaDiff[i];
             const rgbSat = Math.max(rArr[i], gArr[i], bArr[i]) - Math.min(rArr[i], gArr[i], bArr[i]);
-            const isNeutralOverlay = roi.chromaMed > 14 && roi.L[i] > 76 && rgbSat < 32;
-            const isFringeOverlay = roi.chromaMed > 14 && dc > 9 && rgbSat < 48;
-            if (isNeutralOverlay || isFringeOverlay || dc > wmTol) {
-              wmRaw[i] = 1;
-              continue;
+            if (roi.L[i] > roi.lMed + 5) {
+              const isNeutralOverlay = roi.chromaMed > 14 && roi.L[i] > 76 && rgbSat < 32;
+              const isFringeOverlay = roi.chromaMed > 14 && dc > 9 && rgbSat < 48;
+              if (isNeutralOverlay || isFringeOverlay || dc > wmTol) {
+                wmRaw[i] = 1;
+                continue;
+              }
+            } else if (roi.chromaMed >= 14) {
+              // Printed dark watermark ink (neutral charcoal black with near-zero R-B warmth) & colored logo accents
+              const isNeutralBlackInk = luma255[i] < 40 && Math.abs(rArr[i] - bArr[i]) < 15 && dc > 11;
+              const isLogoAccent = rArr[i] - gArr[i] > 42 && bArr[i] > gArr[i] + 10 && dc > 18;
+              if (isNeutralBlackInk || isLogoAccent) {
+                darkWmCand[i] = 1;
+                darkWmCnt++;
+              }
             }
           }
           validMask[i] = 1;
         }
       }
 
-      // Dilate watermark mask by 2px so Lanczos text anti-aliasing fringes never spike
+      // Only erase dark printed overlay strokes when sparse (< 4.5% of panel) so 2-tone silhouettes stay completely intact
+      if (darkWmCnt > 0 && darkWmCnt < Math.max(24, fgActiveCnt * 0.045)) {
+        for (let i = 0; i < total; i++) {
+          if (darkWmCand[i]) {
+            wmRaw[i] = 1;
+            validMask[i] = 0;
+          }
+        }
+      }
+
       let wmMask = new Uint8Array(wmRaw);
-      for (let dPass = 0; dPass < 2; dPass++) {
+      for (let dPass = 0; dPass < 3; dPass++) {
         const nextWm = new Uint8Array(wmMask);
         for (let y = 1; y < resY - 1; y++) {
           const row = y * resX;
@@ -273,20 +399,14 @@ export class Asset3DEngine {
         wmMask = nextWm;
       }
 
-      // Inpaint watermark regions BEFORE morphology/plane filtering so text bright pixels never leak outward
       const cleanL = new Float32Array(smL);
       let hasWm = false;
-      for (let i = 0; i < total; i++) {
-        if (wmMask[i]) { hasWm = true; break; }
-      }
+      for (let i = 0; i < total; i++) if (wmMask[i]) { hasWm = true; break; }
       if (hasWm) {
         const fillL = ImageVectorizer.maskedBoxMean(smL, validMask, resX, resY, Math.max(5, Math.round(minDim * 0.05)));
-        for (let i = 0; i < total; i++) {
-          if (wmMask[i]) cleanL[i] = fillL[i];
-        }
+        for (let i = 0; i < total; i++) if (wmMask[i]) cleanL[i] = fillL[i];
       }
 
-      // Measure robust tonal range [p10..p92] inside valid wood region so broad carvings stay solid all the way across!
       const vHist = new Uint32Array(256);
       let vCnt = 0;
       for (let i = 0; i < total; i++) {
@@ -306,15 +426,22 @@ export class Asset3DEngine {
       }
       const toneSpan = Math.max(36, p92 - p10);
       const rOtsu = vCnt > 50 ? ImageVectorizer.computeOtsuStats(vHist, vCnt) : { separability: 0, threshold: 128, m1: 100, m2: 120 };
+      const oSpan = Math.abs(rOtsu.m2 - rOtsu.m1);
+      let valleyCnt = 0;
+      if (vCnt > 50 && oSpan >= 44) {
+        const loM = Math.min(rOtsu.m1, rOtsu.m2), hiM = Math.max(rOtsu.m1, rOtsu.m2);
+        const bLo = Math.ceil(loM + oSpan * 0.22), bHi = Math.floor(hiM - oSpan * 0.22);
+        for (let b = Math.max(0, bLo); b <= Math.min(255, bHi); b++) valleyCnt += vHist[b];
+      }
+      const valleyFrac = valleyCnt / Math.max(1, vCnt);
 
-      if (rOtsu.separability >= 0.72 && Math.abs(rOtsu.m2 - rOtsu.m1) >= 44) {
-        // 2-Tone Laser/CNC Engraved Plaque or Solid Sign Logo (e.g. brand marks, typography, stamps):
-        // Fit plane strictly across background pixels so board remains 100% flat without puffy letter halos!
+      if (rOtsu.separability >= 0.80 && oSpan >= 44 && valleyFrac < 0.16) {
+        // 2-Tone Engraved Plaque / Logo Mode using Exact Felzenszwalb L2 SDF Beveling
         const bVals = [];
-        for (let y = minFgY; y <= maxFgY; y++) {
-          const nearY = (y - minFgY) < Math.max(3, Math.round(fgBoxH * 0.04)) || (maxFgY - y) < Math.max(3, Math.round(fgBoxH * 0.04));
-          for (let x = minFgX; x <= maxFgX; x++) {
-            const nearX = (x - minFgX) < Math.max(3, Math.round(fgBoxW * 0.04)) || (maxFgX - x) < Math.max(3, Math.round(fgBoxW * 0.04));
+        for (let y = fgBox.minY; y <= fgBox.maxY; y++) {
+          const nearY = (y - fgBox.minY) < Math.max(3, Math.round(fgBoxH * 0.04)) || (fgBox.maxY - y) < Math.max(3, Math.round(fgBoxH * 0.04));
+          for (let x = fgBox.minX; x <= fgBox.maxX; x++) {
+            const nearX = (x - fgBox.minX) < Math.max(3, Math.round(fgBoxW * 0.04)) || (fgBox.maxX - x) < Math.max(3, Math.round(fgBoxW * 0.04));
             if ((nearY || nearX) && validMask[y * resX + x]) bVals.push(cleanL[y * resX + x]);
           }
         }
@@ -347,170 +474,251 @@ export class Asset3DEngine {
           else bgMask[i] = 1;
         }
 
-        // Euclidean Signed Distance Field (SDF) beveling eliminates staircase jaggies on curves & diagonal typography!
-        const distIn = VectorPuffEngine.computeInteriorDistanceRect(strokeMask, resX, resY);
-        const distOut = VectorPuffEngine.computeInteriorDistanceRect(bgMask, resX, resY);
-        const bevelPx = Math.max(1.8, Math.min(3.6, minDim * 0.015));
+        const distIn = ImageVectorizer.computeL2Distance2D(strokeMask, resX, resY);
+        const distOut = ImageVectorizer.computeL2Distance2D(bgMask, resX, resY);
+        const bevelPx = Math.max(1.8, Math.min(3.8, minDim * 0.014));
 
         for (let i = 0; i < total; i++) {
           if (!fgMask[i]) continue;
           const sdfGeom = strokeMask[i] ? Math.max(0, distIn[i] - 0.5) : -Math.max(0, distOut[i] - 0.5);
-          const subpxOffset = tLinArr[i] - 0.5;
-          const sdf = Math.abs(sdfGeom) <= 1.25 ? (sdfGeom * 0.55 + subpxOffset * 0.9) : sdfGeom;
+          const subpx = tLinArr[i] - 0.5;
+          const sdf = Math.abs(sdfGeom) <= 1.25 ? (sdfGeom * 0.55 + subpx * 0.9) : sdfGeom;
           const uBev = Math.max(0, Math.min(1, 0.5 + sdf / bevelPx));
           const tBevel = uBev * uBev * (3.0 - 2.0 * uBev);
-          const zVal = embossRaised
-            ? (0.24 + tBevel * 0.72)
-            : (0.74 - tBevel * 0.60);
+          const zVal = embossRaised ? (0.24 + tBevel * 0.72) : (0.74 - tBevel * 0.60);
           sculptSignal[i] = zVal;
           depth[i] = zVal;
         }
         const crispEdge = ImageVectorizer.guidedFilter(depth, resX, resY, 1, 0.004);
-        for (let i = 0; i < total; i++) {
-          depth[i] = fgMask[i] ? Math.max(0.10, Math.min(0.98, crispEdge[i])) : 0;
-        }
-      } else {
-        const minR = Math.max(2, Math.min(5, Math.round(minDim * 0.015)));
-        const medR = Math.max(5, Math.min(16, Math.round(minDim * 0.055)));
-        const planeR = Math.max(18, Math.round(minDim * 0.24));
-
-        const openedS = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, minR, false), resX, resY, minR, true);
-        const closedS = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, minR, true), resX, resY, minR, false);
-        const openedM = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, medR, false), resX, resY, medR, true);
-        const closedM = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, medR, true), resX, resY, medR, false);
-        const broadPlane = ImageVectorizer.maskedBoxMean(cleanL, fgMask, resX, resY, planeR);
-
-        const pol = invert ? -1 : 1;
-        for (let i = 0; i < total; i++) {
-          if (!fgMask[i]) continue;
-          // 56% illumination-balanced solid macro elevation + 44% crisp multi-scale detail
-          const deLightedL = cleanL[i] - (broadPlane[i] - (p10 + toneSpan * 0.45)) * 0.32;
-          let macroElev = (deLightedL - p10) / toneSpan;
-          if (invert) macroElev = 1.0 - macroElev;
-          macroElev = Math.max(0.05, Math.min(1.0, macroElev));
-
-          const wh = (Math.max(0, cleanL[i] - openedS[i]) * 0.35 + Math.max(0, cleanL[i] - openedM[i]) * 0.65) / 72.0;
-          const bh = (Math.max(0, closedS[i] - cleanL[i]) * 0.35 + Math.max(0, closedM[i] - cleanL[i]) * 0.65) / 72.0;
-          const microDelta = (wh * 1.15 - bh * 0.90) * pol;
-          const zVal = Math.max(0.10, Math.min(1.0, macroElev * 0.66 + 0.16 + microDelta * 0.38));
-          sculptSignal[i] = zVal;
-          depth[i] = zVal;
-        }
-
-        // Smooth fine wood grain ripples while keeping carved petals, fluted columns & recessed panel steps razor crisp
-        const smoothPlanar = ImageVectorizer.guidedFilter(depth, resX, resY, 2, 0.012);
-        for (let i = 0; i < total; i++) {
-          depth[i] = fgMask[i] ? Math.max(0.10, Math.min(1.0, smoothPlanar[i])) : 0;
-        }
-      }
-    } else {
-      // Organic 3D Cutout Depth Extraction (Smooth Harmonic Volume + Denoised Multi-Scale Surface Detail)
-      const lumaSmooth = ImageVectorizer.guidedFilter(luma, resX, resY, 2, 0.012);
-      const rMed = Math.max(3, Math.min(9, Math.round(minDim * 0.032)));
-      const openedMed = ImageVectorizer.separableExtrema(
-        ImageVectorizer.separableExtrema(lumaSmooth, resX, resY, rMed, false),
-        resX, resY, rMed, true
-      );
-      const closedMed = ImageVectorizer.separableExtrema(
-        ImageVectorizer.separableExtrema(lumaSmooth, resX, resY, rMed, true),
-        resX, resY, rMed, false
-      );
-
-      const sat = ImageVectorizer.buildIntegralImage(lumaSmooth, resX, resY);
-      const illumR = Math.max(8, Math.round(minDim * 0.14));
-      let sMin = 1e9;
-      let sMax = -1e9;
-      for (let y = 0; y < resY; y++) {
-        for (let x = 0; x < resX; x++) {
-          const i = y * resX + x;
-          if (!fgMask[i]) continue;
-          const localMean = ImageVectorizer.getLocalMean(sat, resX, resY, x, y, illumR);
-          const wh = Math.max(0, lumaSmooth[i] - openedMed[i]);
-          const bh = Math.max(0, closedMed[i] - lumaSmooth[i]);
-          let tone = delight
-            ? lumaSmooth[i] * 0.55 + (lumaSmooth[i] - localMean + 0.5) * 0.45
-            : lumaSmooth[i];
-          if (invert) tone = 1.0 - tone;
-          const sig = tone * 0.54 + (wh * 1.25 - bh * 0.95) * (invert ? -1 : 1) * 0.46;
-          sculptSignal[i] = sig;
-          if (sig < sMin) sMin = sig;
-          if (sig > sMax) sMax = sig;
-        }
+        for (let i = 0; i < total; i++) depth[i] = fgMask[i] ? Math.max(0.10, Math.min(0.98, crispEdge[i])) : 0;
+        return;
       }
 
-      const sSpan = Math.max(0.08, sMax - sMin);
-      const combinedDepth = new Float32Array(total);
-      for (let y = 1; y < resY - 1; y++) {
-        for (let x = 1; x < resX - 1; x++) {
-          const i = y * resX + x;
-          if (!fgMask[i]) continue;
-          const t = Math.min(1.0, smoothDist[i] / Math.max(3.0, maxDist * 0.86));
-          const macroDome = Math.sqrt(Math.max(0.0, 1.0 - (1.0 - t) * (1.0 - t)));
-          const normSculpt = Math.max(0.0, Math.min(1.0, (sculptSignal[i] - sMin) / sSpan));
-          const gx = lumaSmooth[i + 1] - lumaSmooth[i - 1];
-          const gy = lumaSmooth[i + resX] - lumaSmooth[i - resX];
-          const edgeCrest = Math.min(0.14, Math.hypot(gx, gy) * edgeStrength * 0.65);
-          combinedDepth[i] = Math.max(
-            0.08,
-            Math.min(1.0, macroDome * 0.48 + normSculpt * 0.46 + edgeCrest * 0.14)
-          );
-        }
-      }
+      // Multi-Scale Planar Architectural / Carved Wood Door Relief
+      const minR = Math.max(2, Math.min(5, Math.round(minDim * 0.015)));
+      const medR = Math.max(5, Math.min(18, Math.round(minDim * 0.055)));
+      const planeR = Math.max(18, Math.round(minDim * 0.24));
 
-      // Multi-pass Jacobi Poisson harmonic volume integration + edge-preserving surface fairing inside foreground
-      const jacobiBuf = new Float32Array(combinedDepth);
-      const jacobiNext = new Float32Array(combinedDepth);
-      for (let jPass = 0; jPass < 10; jPass++) {
-        for (let y = 1; y < resY - 1; y++) {
-          const row = y * resX;
-          for (let x = 1; x < resX - 1; x++) {
-            const i = row + x;
-            if (!fgMask[i]) continue;
-            let s = 0, w = 0;
-            const nbs = [i - 1, i + 1, i - resX, i + resX];
-            for (const ni of nbs) {
-              if (!fgMask[ni]) continue;
-              const diff = Math.abs(jacobiBuf[ni] - jacobiBuf[i]);
-              const wt = diff < 0.16 ? 1.0 : 0.28;
-              s += jacobiBuf[ni] * wt;
-              w += wt;
-            }
-            const nbrAvg = w > 0 ? s / w : combinedDepth[i];
-            jacobiNext[i] = Math.max(0.08, Math.min(1.0, combinedDepth[i] * 0.34 + nbrAvg * 0.66));
-          }
-        }
-        jacobiBuf.set(jacobiNext);
-      }
+      const openedS = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, minR, false), resX, resY, minR, true);
+      const closedS = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, minR, true), resX, resY, minR, false);
+      const openedM = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, medR, false), resX, resY, medR, true);
+      const closedM = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, medR, true), resX, resY, medR, false);
+      const broadPlane = ImageVectorizer.maskedBoxMean(cleanL, fgMask, resX, resY, planeR);
+
+      const pol = invert ? -1 : 1;
       for (let i = 0; i < total; i++) {
-        depth[i] = fgMask[i] ? Math.max(0.08, Math.min(1.0, jacobiBuf[i])) : 0;
+        if (!fgMask[i]) continue;
+        const deLightedL = cleanL[i] - (broadPlane[i] - (p10 + toneSpan * 0.45)) * 0.32;
+        let macroElev = (deLightedL - p10) / toneSpan;
+        if (invert) macroElev = 1.0 - macroElev;
+        macroElev = Math.max(0.05, Math.min(1.0, macroElev));
+
+        const wh = (Math.max(0, cleanL[i] - openedS[i]) * 0.35 + Math.max(0, cleanL[i] - openedM[i]) * 0.65) / 72.0;
+        const bh = (Math.max(0, closedS[i] - cleanL[i]) * 0.35 + Math.max(0, closedM[i] - cleanL[i]) * 0.65) / 72.0;
+        const microDelta = (wh * 1.15 - bh * 0.90) * pol;
+        const zVal = Math.max(0.10, Math.min(1.0, macroElev * 0.64 + 0.16 + microDelta * 0.44));
+        sculptSignal[i] = zVal;
+        depth[i] = zVal;
+      }
+
+      const smoothPlanar = ImageVectorizer.guidedFilter(depth, resX, resY, 2, 0.008);
+      for (let i = 0; i < total; i++) depth[i] = fgMask[i] ? Math.max(0.10, Math.min(1.0, smoothPlanar[i])) : 0;
+      return;
+    }
+
+    // Organic 3D Cutout / Sculpture Solver (Exact L2 Harmonic Envelope + Jacobi Poisson Surface Solver)
+    const lumaSmooth = ImageVectorizer.guidedFilter(luma, resX, resY, 2, 0.012);
+    const rMed = Math.max(3, Math.min(10, Math.round(minDim * 0.032)));
+    const openedMed = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(lumaSmooth, resX, resY, rMed, false), resX, resY, rMed, true);
+    const closedMed = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(lumaSmooth, resX, resY, rMed, true), resX, resY, rMed, false);
+
+    const sat = ImageVectorizer.buildIntegralImage(lumaSmooth, resX, resY);
+    const illumR = Math.max(8, Math.round(minDim * 0.14));
+    let sMin = 1e9, sMax = -1e9;
+    for (let y = 0; y < resY; y++) {
+      for (let x = 0; x < resX; x++) {
+        const i = y * resX + x;
+        if (!fgMask[i]) continue;
+        const localMean = ImageVectorizer.getLocalMean(sat, resX, resY, x, y, illumR);
+        const wh = Math.max(0, lumaSmooth[i] - openedMed[i]);
+        const bh = Math.max(0, closedMed[i] - lumaSmooth[i]);
+        let tone = delight ? lumaSmooth[i] * 0.52 + (lumaSmooth[i] - localMean + 0.5) * 0.48 : lumaSmooth[i];
+        if (invert) tone = 1.0 - tone;
+        const sig = tone * 0.54 + (wh * 1.25 - bh * 0.95) * (invert ? -1 : 1) * 0.46;
+        sculptSignal[i] = sig;
+        if (sig < sMin) sMin = sig;
+        if (sig > sMax) sMax = sig;
       }
     }
 
-    const aspectBox = maxFgX > minFgX && maxFgY > minFgY
+    const sSpan = Math.max(0.08, sMax - sMin);
+    const combinedDepth = new Float32Array(total);
+    for (let y = 1; y < resY - 1; y++) {
+      for (let x = 1; x < resX - 1; x++) {
+        const i = y * resX + x;
+        if (!fgMask[i]) continue;
+        const t = Math.min(1.0, smoothDist[i] / Math.max(3.0, maxDist * 0.85));
+        const macroDome = Math.sqrt(Math.max(0.0, 1.0 - (1.0 - t) * (1.0 - t)));
+        const normSculpt = Math.max(0.0, Math.min(1.0, (sculptSignal[i] - sMin) / sSpan));
+        const gx = lumaSmooth[i + 1] - lumaSmooth[i - 1];
+        const gy = lumaSmooth[i + resX] - lumaSmooth[i - resX];
+        const edgeCrest = Math.min(0.14, Math.hypot(gx, gy) * edgeStrength * 0.65);
+        combinedDepth[i] = Math.max(0.08, Math.min(1.0, macroDome * 0.48 + normSculpt * 0.46 + edgeCrest * 0.14));
+      }
+    }
+
+    const jacobiBuf = new Float32Array(combinedDepth);
+    const jacobiNext = new Float32Array(combinedDepth);
+    for (let jPass = 0; jPass < 10; jPass++) {
+      for (let y = 1; y < resY - 1; y++) {
+        const row = y * resX;
+        for (let x = 1; x < resX - 1; x++) {
+          const i = row + x;
+          if (!fgMask[i]) continue;
+          let s = 0, w = 0;
+          const nbs = [i - 1, i + 1, i - resX, i + resX];
+          for (const ni of nbs) {
+            if (!fgMask[ni]) continue;
+            const diff = Math.abs(jacobiBuf[ni] - jacobiBuf[i]);
+            const wt = diff < 0.16 ? 1.0 : 0.28;
+            s += jacobiBuf[ni] * wt;
+            w += wt;
+          }
+          const nbrAvg = w > 0 ? s / w : combinedDepth[i];
+          jacobiNext[i] = Math.max(0.08, Math.min(1.0, combinedDepth[i] * 0.34 + nbrAvg * 0.66));
+        }
+      }
+      jacobiBuf.set(jacobiNext);
+    }
+    for (let i = 0; i < total; i++) depth[i] = fgMask[i] ? Math.max(0.08, Math.min(1.0, jacobiBuf[i])) : 0;
+  }
+
+  /**
+   * Meshy-style [1, 4, 6, 4, 1] Sobel Steep-Slope Detection + 30-deg Normal-Bilateral Rolling-Ball Edge Fillet.
+   * Smoothly rounds jagged cliff shoulders while keeping flat plateaus and textured interiors razor crisp.
+   */
+  static applySlopeAwareFillet(depth, fgMask, W, H, fitW, thicknessMm, filletRatio = 0.012) {
+    if (!filletRatio || filletRatio <= 0.001 || W < 16 || H < 16) return;
+    const total = W * H;
+    const radiusMm = fitW * filletRatio;
+    const spacingMm = fitW / Math.max(1, W - 1);
+    if (radiusMm < spacingMm * 0.8) return;
+
+    const sobelW = [1, 4, 6, 4, 1];
+    const spanStep = Math.max(1, Math.round(W / 1023));
+    const stepMm = 2 * spanStep * spacingMm;
+    const weightNorm = 16 * stepMm;
+    const pad = spanStep * 2;
+
+    const slopeTanLo = Math.tan((54 * Math.PI) / 180);
+    const slopeTanHi = Math.tan((68 * Math.PI) / 180);
+    const heightMmArr = new Float32Array(total);
+    for (let i = 0; i < total; i++) heightMmArr[i] = depth[i] * thicknessMm;
+
+    const nx = new Float32Array(total);
+    const ny = new Float32Array(total);
+    const nz = new Float32Array(total);
+    const weight = new Float32Array(total);
+
+    for (let y = pad; y < H - pad; y++) {
+      for (let x = pad; x < W - pad; x++) {
+        const n = y * W + x;
+        if (!fgMask[n]) continue;
+        let gx = 0, gy = 0;
+        for (let k = 0; k < 5; k++) {
+          const rOff = (k - 2) * spanStep;
+          gx += sobelW[k] * (heightMmArr[n + rOff * W + spanStep] - heightMmArr[n + rOff * W - spanStep]);
+          gy += sobelW[k] * (heightMmArr[n + spanStep * W + rOff] - heightMmArr[n - spanStep * W + rOff]);
+        }
+        gx /= weightNorm;
+        gy /= weightNorm;
+        const inv = 1.0 / Math.hypot(gx, gy, 1.0);
+        nx[n] = -gx * inv;
+        ny[n] = -gy * inv;
+        nz[n] = inv;
+        const sl = Math.hypot(gx, gy);
+        if (sl > slopeTanLo) {
+          weight[n] = sl >= slopeTanHi ? 1.0 : (sl - slopeTanLo) / (slopeTanHi - slopeTanLo);
+        }
+      }
+    }
+
+    // 4-pass 30-deg normal-dot bilateral smoothing of steep cliff weights
+    const cos30 = Math.cos((30 * Math.PI) / 180);
+    const nbs = [-W, W, -1, 1];
+    const tmpW = new Float32Array(total);
+    for (let pass = 0; pass < 4; pass++) {
+      tmpW.set(weight);
+      for (let y = pad; y < H - pad; y++) {
+        for (let x = pad; x < W - pad; x++) {
+          const n = y * W + x;
+          if (!fgMask[n]) continue;
+          let sum = tmpW[n];
+          let den = 1.0;
+          for (let d = 0; d < 4; d++) {
+            const ni = n + nbs[d];
+            if (!fgMask[ni]) continue;
+            const dotRatio = (nx[n] * nx[ni] + ny[n] * ny[ni] + nz[n] * nz[ni] - cos30) / (1.0 - cos30);
+            if (dotRatio <= 0) continue;
+            const wt = dotRatio >= 1.0 ? 1.0 : dotRatio;
+            sum += wt * tmpW[ni];
+            den += wt;
+          }
+          weight[n] = sum / den;
+        }
+      }
+    }
+
+    // Circular disk soft shoulder fillet ONLY on cliff crest pixels
+    const rPx = Math.max(1, Math.min(3, Math.round(radiusMm / spacingMm)));
+    const softened = new Float32Array(depth);
+    ImageVectorizer.gaussianSmooth2D(softened, W, H, rPx * 0.72);
+    for (let i = 0; i < total; i++) {
+      if (!fgMask[i] || weight[i] <= 0.01) continue;
+      // Blend toward softly filleted upper/lower shoulder weighted strictly by steep cliff score
+      const w = Math.min(0.82, weight[i]);
+      depth[i] = Math.max(0.08, Math.min(1.0, depth[i] * (1.0 - w) + softened[i] * w));
+    }
+  }
+
+  static _finalizeAnalysis(prep, opts) {
+    const { texSize = 1024, removeBg = true, delight = true } = opts;
+    const { resX, resY, fgMask, fgBox, hasTransparency, isPlanarPanel, aspect, phi, smoothDist, rawDist, maxDist, depth, sculptSignal, texRgba } = prep;
+
+    Asset3DEngine.dilateTextureEdges(texRgba, texSize, fgMask, resX, resY, removeBg && !hasTransparency);
+    const maps = Asset3DEngine.synthesizePBRMaps(texRgba, texSize, delight, fgMask, resX, resY);
+
+    const aspectBox = fgBox.maxX > fgBox.minX && fgBox.maxY > fgBox.minY
       ? {
-          minU: minFgX / Math.max(1, resX - 1),
-          maxU: maxFgX / Math.max(1, resX - 1),
-          minV: 1.0 - maxFgY / Math.max(1, resY - 1),
-          maxV: 1.0 - minFgY / Math.max(1, resY - 1),
+          minU: fgBox.minX / Math.max(1, resX - 1),
+          maxU: fgBox.maxX / Math.max(1, resX - 1),
+          minV: 1.0 - fgBox.maxY / Math.max(1, resY - 1),
+          maxV: 1.0 - fgBox.minY / Math.max(1, resY - 1),
         }
       : { minU: 0, maxU: 1, minV: 0, maxV: 1 };
 
     return {
-      fgMask,
-      fgBox: { minX: minFgX, maxX: maxFgX, minY: minFgY, maxY: maxFgY },
-      hasTransparency,
+      resolution: Math.max(resX, resY),
+      resX,
+      resY,
+      aspect,
       isPlanarPanel,
+      fgMask,
+      phi,
+      dist: smoothDist,
       rawDist,
-      smoothDist,
       maxDist,
       depth,
       sculptSignal,
+      texSize,
+      maps,
       aspectBox,
+      boundsPx: { dx: 0, dy: 0, dw: resX, dh: resY },
     };
   }
 
   /**
-   * Flood-fill outward from border in CIELAB so interior bright highlights never punch holes!
+   * Flood-fill outward from border in CIELAB with uniform backdrop guard so full-bleed wooden doors stay intact.
    */
   static extractBorderConnectedForeground(alpha, L, A, B, W, H, ctxInfo) {
     const total = W * H;
@@ -527,9 +735,7 @@ export class Asset3DEngine {
     fg.fill(1);
     if (!removeBg) return fg;
 
-    const samplesL = [];
-    const samplesA = [];
-    const samplesB = [];
+    const samplesL = [], samplesA = [], samplesB = [];
     for (let x = 0; x < W; x += 2) {
       samplesL.push(L[x], L[(H - 1) * W + x]);
       samplesA.push(A[x], A[(H - 1) * W + x]);
@@ -547,7 +753,6 @@ export class Asset3DEngine {
     const bgA = samplesA[Math.floor(samplesA.length * 0.5)] || 0;
     const bgB = samplesB[Math.floor(samplesB.length * 0.5)] || 0;
 
-    // Guard against flood-eating full-bleed wooden doors, stone slabs, or frames whose border IS the object itself!
     const borderChroma = Math.hypot(bgA, bgB);
     let uniformBorder = 0;
     for (let k = 0; k < samplesL.length; k++) {
@@ -573,8 +778,7 @@ export class Asset3DEngine {
 
     const visited = new Uint8Array(total);
     const queue = new Int32Array(total);
-    let qH = 0;
-    let qT = 0;
+    let qH = 0, qT = 0;
 
     const seedIfBg = (x, y) => {
       const idx = y * W + x;
@@ -593,8 +797,7 @@ export class Asset3DEngine {
     const dirs = [-1, 1, -W, W];
     while (qH < qT) {
       const u = queue[qH++];
-      const ux = u % W;
-      const uy = (u - ux) / W;
+      const ux = u % W, uy = (u - ux) / W;
       for (let d = 0; d < 4; d++) {
         if (d === 0 && ux === 0) continue;
         if (d === 1 && ux === W - 1) continue;
@@ -633,8 +836,7 @@ export class Asset3DEngine {
       queue[qT++] = s;
       while (qH < qT) {
         const u = queue[qH++];
-        const ux = u % W;
-        const uy = (u - ux) / W;
+        const ux = u % W, uy = (u - ux) / W;
         for (let d = 0; d < 4; d++) {
           if (d === 0 && ux === 0) continue;
           if (d === 1 && ux === W - 1) continue;
@@ -698,19 +900,16 @@ export class Asset3DEngine {
     const n = tSize * tSize;
     const filled = new Uint8Array(n);
     const queue = new Int32Array(n);
-    let qH = 0;
-    let qT = 0;
+    let qH = 0, qT = 0;
     const scaleX = (fgW - 1) / Math.max(1, tSize - 1);
     const scaleY = (fgH - 1) / Math.max(1, tSize - 1);
 
     for (let y = 0; y < tSize; y++) {
       const sy = Math.min(fgH - 1, Math.round(y * scaleY));
-      const fRow = sy * fgW;
-      const tRow = y * tSize;
+      const fRow = sy * fgW, tRow = y * tSize;
       for (let x = 0; x < tSize; x++) {
         const sx = Math.min(fgW - 1, Math.round(x * scaleX));
-        const fi = fRow + sx;
-        const idx = tRow + x;
+        const fi = fRow + sx, idx = tRow + x;
         if (!seedMask[fi]) continue;
         const p = idx * 4;
         if (stripBorderBackdrop && safeInnerMask && !safeInnerMask[fi]) {
@@ -729,8 +928,7 @@ export class Asset3DEngine {
     const dirs = [-1, 1, -tSize, tSize];
     while (qH < qT) {
       const u = queue[qH++];
-      const ux = u % tSize;
-      const uy = (u - ux) / tSize;
+      const ux = u % tSize, uy = (u - ux) / tSize;
       const up = u * 4;
       for (let d = 0; d < 4; d++) {
         if (d === 0 && ux === 0) continue;
@@ -763,10 +961,7 @@ export class Asset3DEngine {
 
     const lum = new Float32Array(n);
     for (let i = 0; i < n; i++) {
-      const r = rgba[i * 4];
-      const g = rgba[i * 4 + 1];
-      const b = rgba[i * 4 + 2];
-      lum[i] = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+      lum[i] = (0.2126 * rgba[i * 4] + 0.7152 * rgba[i * 4 + 1] + 0.0722 * rgba[i * 4 + 2]) / 255.0;
     }
 
     const sat = ImageVectorizer.buildIntegralImage(lum, size, size);
@@ -779,12 +974,8 @@ export class Asset3DEngine {
     for (let y = 0; y < size; y++) {
       const sy = fgScaleY ? Math.min(activeFgH - 1, Math.round(y * fgScaleY)) : 0;
       for (let x = 0; x < size; x++) {
-        const i = y * size + x;
-        const p = i * 4;
-        const r = rgba[p];
-        const g = rgba[p + 1];
-        const b = rgba[p + 2];
-        const a = rgba[p + 3];
+        const i = y * size + x, p = i * 4;
+        const r = rgba[p], g = rgba[p + 1], b = rgba[p + 2], a = rgba[p + 3];
         const inFg = !fgMask || !activeFgW || fgMask[sy * activeFgW + Math.min(activeFgW - 1, Math.round(x * fgScaleX))] === 1;
 
         if (delight && a > 16) {
@@ -796,16 +987,12 @@ export class Asset3DEngine {
           baseColor[p + 3] = 255;
         }
 
-        const xl = Math.max(0, x - 1);
-        const xr = Math.min(size - 1, x + 1);
-        const yu = Math.max(0, y - 1);
-        const yd = Math.min(size - 1, y + 1);
+        const xl = Math.max(0, x - 1), xr = Math.min(size - 1, x + 1);
+        const yu = Math.max(0, y - 1), yd = Math.min(size - 1, y + 1);
         const gradGain = inFg ? 3.0 : 0.35;
         const dx = (lum[y * size + xr] - lum[y * size + xl]) * gradGain;
         const dy = (lum[yd * size + x] - lum[yu * size + x]) * gradGain;
-        let nx = -dx;
-        let ny = dy;
-        let nz = 1.0;
+        let nx = -dx, ny = dy, nz = 1.0;
         const inv = 1.0 / Math.hypot(nx, ny, nz);
         nx *= inv; ny *= inv; nz *= inv;
         normal[p] = Math.round((nx * 0.5 + 0.5) * 255);
@@ -813,8 +1000,7 @@ export class Asset3DEngine {
         normal[p + 2] = Math.round((nz * 0.5 + 0.5) * 255);
         normal[p + 3] = 255;
 
-        const mx = Math.max(r, g, b);
-        const mn = Math.min(r, g, b);
+        const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
         const ch = (mx - mn) / 255.0;
         const gradMag = Math.min(1.0, Math.hypot(dx, dy) * 1.35);
         const roughVal = Math.max(0.24, Math.min(0.92, 0.72 - lum[i] * 0.24 + gradMag * 0.20));
@@ -825,7 +1011,6 @@ export class Asset3DEngine {
         const mv = isGoldOrSteel ? Math.round((0.34 + lum[i] * 0.44) * 255) : 18;
         metallic[p] = mv; metallic[p + 1] = mv; metallic[p + 2] = mv; metallic[p + 3] = 255;
 
-        // glTF 2.0 MetallicRoughness texture spec: G = Roughness, B = Metallic
         metallicRoughness[p] = 255;
         metallicRoughness[p + 1] = rv;
         metallicRoughness[p + 2] = mv;
@@ -838,7 +1023,7 @@ export class Asset3DEngine {
 
   static buildAssetMeshData(analysis, options = {}) {
     const {
-      assetMode = 'double-sided', // 'double-sided' | 'inflated' | 'lathe' | 'relief'
+      assetMode = 'double-sided',
       widthMm = 100,
       heightMm = 100,
       thicknessMm = 22,
@@ -855,14 +1040,190 @@ export class Asset3DEngine {
   }
 
   /**
-   * Watertight volumetric/planar shell centered inside (widthMm, heightMm) with exact source aspect (fitW x fitH).
-   * Preserves flat coplanar architectural rails/stiles on planar panels, applies Taubin fairing on curved organic silhouettes,
-   * and uses split rim bevel vertices so side walls never darken front/back normals.
+   * Meshy-style Subpixel Newton-Raphson Zero-Isocontour (phi=0) Perimeter Snapping & Ordered Loop Relaxation.
+   */
+  static snapPerimeterToZeroPhi(gridX, gridY, activeCell, W, H, phi, boundaryEdges) {
+    const CW = W - 1;
+    const CH = H - 1;
+    const hasCell = (ix, iy) => (ix >= 0 && iy >= 0 && ix < CW && iy < CH && activeCell[iy * CW + ix] === 1);
+    const isOuterGridEdge = (vi) => {
+      const ix = vi % W, iy = (vi - ix) / W;
+      return ix === 0 || ix === W - 1 || iy === 0 || iy === H - 1;
+    };
+
+    const nextRim = new Int32Array(W * H).fill(-1);
+    const onRim = new Uint8Array(W * H);
+    let cleanLoop = true;
+    const linkRim = (a, b) => {
+      if (nextRim[a] !== -1) cleanLoop = false;
+      nextRim[a] = b;
+      onRim[a] = 1;
+      onRim[b] = 1;
+    };
+
+    for (let iy = 0; iy < CH; iy++) {
+      for (let ix = 0; ix < CW; ix++) {
+        if (!hasCell(ix, iy)) continue;
+        const i00 = iy * W + ix, i10 = i00 + 1, i01 = i00 + W, i11 = i01 + 1;
+        if (!hasCell(ix, iy - 1)) linkRim(i00, i10);
+        if (!hasCell(ix + 1, iy)) linkRim(i10, i11);
+        if (!hasCell(ix, iy + 1)) linkRim(i11, i01);
+        if (!hasCell(ix - 1, iy)) linkRim(i01, i00);
+      }
+    }
+
+    const samplePhi = (x, y) => {
+      const cx = Math.max(0, Math.min(W - 1.001, x));
+      const cy = Math.max(0, Math.min(H - 1.001, y));
+      const x0 = Math.min(W - 2, Math.floor(cx)), y0 = Math.min(H - 2, Math.floor(cy));
+      const fx = cx - x0, fy = cy - y0;
+      const a = y0 * W + x0;
+      return phi[a] * (1 - fx) * (1 - fy) + phi[a + 1] * fx * (1 - fy) + phi[a + W] * (1 - fx) * fy + phi[a + W + 1] * fx * fy;
+    };
+
+    const clampShift = (origX, origY, tx, ty, maxR) => {
+      const dx = tx - origX, dy = ty - origY;
+      const d = Math.hypot(dx, dy);
+      if (d <= maxR || d < 1e-9) return [tx, ty];
+      return [origX + (dx / d) * maxR, origY + (dy / d) * maxR];
+    };
+
+    if (phi) {
+      for (let vi = 0; vi < W * H; vi++) {
+        if (!onRim[vi] || isOuterGridEdge(vi)) continue;
+        const origX = vi % W, origY = (vi - origX) / W;
+        let rx = gridX[vi], ry = gridY[vi];
+        for (let iter = 0; iter < 3; iter++) {
+          const val = samplePhi(rx, ry);
+          if (Math.abs(val) < 0.02 || Math.abs(val) > 3.0) break;
+          const gx = (samplePhi(rx + 0.5, ry) - samplePhi(rx - 0.5, ry));
+          const gy = (samplePhi(rx, ry + 0.5) - samplePhi(rx, ry - 0.5));
+          const g2 = gx * gx + gy * gy;
+          if (g2 < 1e-6) break;
+          rx -= (val * gx) / g2;
+          ry -= (val * gy) / g2;
+        }
+        const [sx, sy] = clampShift(origX, origY, rx, ry, 1.18);
+        gridX[vi] = sx;
+        gridY[vi] = sy;
+      }
+    }
+
+    // Trace ordered rim loops & run 3 passes of constrained tangential curve relaxation (Meshy method)
+    if (cleanLoop) {
+      const vis = new Uint8Array(W * H);
+      const loops = [];
+      for (let s = 0; s < W * H; s++) {
+        if (nextRim[s] === -1 || vis[s]) continue;
+        const loop = [];
+        let cur = s;
+        while (cur !== -1 && !vis[cur]) {
+          vis[cur] = 1;
+          loop.push(cur);
+          cur = nextRim[cur];
+        }
+        if (cur === s && loop.length >= 8) loops.push(loop);
+      }
+      for (const loop of loops) {
+        const m = loop.length;
+        const baseX = new Float32Array(m), baseY = new Float32Array(m);
+        const nxtX = new Float32Array(m), nxtY = new Float32Array(m);
+        for (let j = 0; j < m; j++) { baseX[j] = gridX[loop[j]]; baseY[j] = gridY[loop[j]]; }
+        for (let pass = 0; pass < 3; pass++) {
+          for (let j = 0; j < m; j++) {
+            const vi = loop[j];
+            if (isOuterGridEdge(vi)) { nxtX[j] = gridX[vi]; nxtY[j] = gridY[vi]; continue; }
+            const vp = loop[(j - 1 + m) % m], vn = loop[(j + 1) % m];
+            nxtX[j] = gridX[vi] + 0.5 * ((gridX[vp] + gridX[vn]) * 0.5 - gridX[vi]);
+            nxtY[j] = gridY[vi] + 0.5 * ((gridY[vp] + gridY[vn]) * 0.5 - gridY[vi]);
+          }
+          for (let j = 0; j < m; j++) {
+            const vi = loop[j];
+            if (isOuterGridEdge(vi)) continue;
+            const [cx, cy] = clampShift(baseX[j], baseY[j], nxtX[j], nxtY[j], 0.75);
+            gridX[vi] = cx;
+            gridY[vi] = cy;
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Enforce strictly 2-manifold boundary topology on active grid cells:
+   * prunes tiny speckle components and eliminates all 2x2 diagonal pinch vertices iteratively.
+   */
+  static sanitizeManifoldActiveCells(activeCell, CW, CH) {
+    const totalCells = CW * CH;
+    let totalOn = 0;
+    for (let i = 0; i < totalCells; i++) totalOn += activeCell[i];
+    if (totalOn === 0) return;
+
+    const minComp = Math.max(8, Math.round(totalOn * 0.002));
+    const vis = new Uint8Array(totalCells);
+    const queue = new Int32Array(totalCells);
+    const comps = [];
+    const dirs = [-1, 1, -CW, CW];
+    for (let s = 0; s < totalCells; s++) {
+      if (!activeCell[s] || vis[s]) continue;
+      let qH = 0, qT = 0;
+      vis[s] = 1;
+      queue[qT++] = s;
+      while (qH < qT) {
+        const u = queue[qH++];
+        const ux = u % CW, uy = (u - ux) / CW;
+        for (let d = 0; d < 4; d++) {
+          if (d === 0 && ux === 0) continue;
+          if (d === 1 && ux === CW - 1) continue;
+          if (d === 2 && uy === 0) continue;
+          if (d === 3 && uy === CH - 1) continue;
+          const v = u + dirs[d];
+          if (activeCell[v] && !vis[v]) {
+            vis[v] = 1;
+            queue[qT++] = v;
+          }
+        }
+      }
+      comps.push({ cells: queue.slice(0, qT), len: qT });
+    }
+    comps.sort((a, b) => b.len - a.len);
+    for (let k = 1; k < comps.length; k++) {
+      if (comps[k].len < minComp) {
+        const cArr = comps[k].cells;
+        for (let i = 0; i < cArr.length; i++) activeCell[cArr[i]] = 0;
+      }
+    }
+
+    // Bridge any 2x2 diagonal cell pinches until zero non-manifold deg=4 vertices remain
+    for (let pass = 0; pass < 8; pass++) {
+      let changed = false;
+      for (let y = 0; y < CH - 1; y++) {
+        const r0 = y * CW, r1 = r0 + CW;
+        for (let x = 0; x < CW - 1; x++) {
+          const i00 = r0 + x, i10 = i00 + 1, i01 = r1 + x, i11 = i01 + 1;
+          const a = activeCell[i00], b = activeCell[i10], c = activeCell[i01], d = activeCell[i11];
+          if (a && d && !b && !c) {
+            activeCell[i10] = 1;
+            changed = true;
+          } else if (!a && !d && b && c) {
+            activeCell[i00] = 1;
+            changed = true;
+          }
+        }
+      }
+      if (!changed) break;
+    }
+  }
+
+  /**
+   * Watertight volumetric/planar shell centered inside stage bounds with Meshy Newton zero-isocontour rims,
+   * height-contour alignment, split bevel normals, & topological manifold verification.
    */
   static buildVolumetricShellMeshData(analysis, assetMode, fitW, fitH, stageW, stageH, thicknessMm) {
     const W = analysis.resX || analysis.resolution;
     const H = analysis.resY || analysis.resolution;
     const fg = analysis.fgMask;
+    const phi = analysis.phi || null;
     const depth = analysis.depth;
     const dist = analysis.dist;
     const maxDist = Math.max(1, analysis.maxDist);
@@ -890,6 +1251,7 @@ export class Asset3DEngine {
         }
       }
     }
+    Asset3DEngine.sanitizeManifoldActiveCells(activeCell, CW, CH);
 
     const hasCell = (ix, iy) => (ix >= 0 && iy >= 0 && ix < CW && iy < CH && activeCell[iy * CW + ix] === 1);
     const activeVert = new Uint8Array(W * H);
@@ -904,25 +1266,15 @@ export class Asset3DEngine {
       }
     }
 
-    const bndNbrs = new Map();
-    const linkBoundary = (a, b) => {
-      if (!bndNbrs.has(a)) bndNbrs.set(a, []);
-      bndNbrs.get(a).push(b);
-      isBoundaryVert[a] = 1;
-    };
-
     const boundaryEdges = [];
     for (let iy = 0; iy < CH; iy++) {
       for (let ix = 0; ix < CW; ix++) {
         if (!hasCell(ix, iy)) continue;
-        const i00 = iy * W + ix;
-        const i10 = i00 + 1;
-        const i01 = i00 + W;
-        const i11 = i01 + 1;
-        if (!hasCell(ix, iy - 1)) { boundaryEdges.push([i10, i00]); linkBoundary(i10, i00); linkBoundary(i00, i10); }
-        if (!hasCell(ix, iy + 1)) { boundaryEdges.push([i01, i11]); linkBoundary(i01, i11); linkBoundary(i11, i01); }
-        if (!hasCell(ix - 1, iy)) { boundaryEdges.push([i00, i01]); linkBoundary(i00, i01); linkBoundary(i01, i00); }
-        if (!hasCell(ix + 1, iy)) { boundaryEdges.push([i11, i10]); linkBoundary(i11, i10); linkBoundary(i10, i11); }
+        const i00 = iy * W + ix, i10 = i00 + 1, i01 = i00 + W, i11 = i01 + 1;
+        if (!hasCell(ix, iy - 1)) { boundaryEdges.push([i10, i00]); isBoundaryVert[i10] = isBoundaryVert[i00] = 1; }
+        if (!hasCell(ix, iy + 1)) { boundaryEdges.push([i01, i11]); isBoundaryVert[i01] = isBoundaryVert[i11] = 1; }
+        if (!hasCell(ix - 1, iy)) { boundaryEdges.push([i00, i01]); isBoundaryVert[i00] = isBoundaryVert[i01] = 1; }
+        if (!hasCell(ix + 1, iy)) { boundaryEdges.push([i11, i10]); isBoundaryVert[i11] = isBoundaryVert[i10] = 1; }
       }
     }
 
@@ -936,31 +1288,11 @@ export class Asset3DEngine {
       }
     }
 
-    // Apply Taubin curve smoothing ONLY on organic silhouettes so rectangular architectural corners remain razor crisp!
     if (!isPlanar) {
-      const maxStep = 0.42;
-      for (let pass = 0; pass < 4; pass++) {
-        const k = (pass & 1) ? -0.45 : 0.48;
-        const nextX = new Float32Array(gridX);
-        const nextY = new Float32Array(gridY);
-        for (const [vi, nbrs] of bndNbrs.entries()) {
-          if (nbrs.length < 2) continue;
-          let sx = 0, sy = 0;
-          for (const nb of nbrs) { sx += gridX[nb]; sy += gridY[nb]; }
-          const avgX = sx / nbrs.length;
-          const avgY = sy / nbrs.length;
-          const ix0 = vi % W;
-          const iy0 = (vi - ix0) / W;
-          nextX[vi] = Math.max(ix0 - maxStep, Math.min(ix0 + maxStep, gridX[vi] + k * (avgX - gridX[vi])));
-          nextY[vi] = Math.max(iy0 - maxStep, Math.min(iy0 + maxStep, gridY[vi] + k * (avgY - gridY[vi])));
-        }
-        gridX.set(nextX);
-        gridY.set(nextY);
-      }
+      Asset3DEngine.snapPerimeterToZeroPhi(gridX, gridY, activeCell, W, H, phi, boundaryEdges);
     }
 
-    // Level-set isocontour vertex alignment: slides interior steep wall vertices along height contours so
-    // diagonal letters, circles, and curved carvings keep clean diagonal edges without pixel sawtooths!
+    // Level-set height-contour vertex alignment on interior steep slope walls
     const isoMaxShift = 0.36;
     for (let pass = 0; pass < 2; pass++) {
       const nextIsoX = new Float32Array(gridX);
@@ -1037,14 +1369,11 @@ export class Asset3DEngine {
         const macroSmooth = fg[vi] ? Math.sqrt(Math.max(0.0, 1.0 - (1.0 - t) * (1.0 - t))) : 0.0;
         const isRim = isBoundaryVert[vi] === 1;
 
-        let zF;
-        let zB;
+        let zF, zB;
         if (isRelief) {
-          // Flat-backed CNC / 3D print relief slab (dead-flat bottom plane at Z=0!)
           zF = isRim ? Math.max(0.6, thicknessMm * 0.18) : (thicknessMm * 0.18 + dNorm * thicknessMm * 0.82);
           zB = 0.0;
         } else if (isPlanar && assetMode !== 'inflated') {
-          // Coplanar architectural/door relief on Front & Back (zero dome pillow warp, sturdy beveled rim)
           const rimChamfer = Math.min(dNorm * 0.88, 0.44);
           zF = isRim ? Math.max(minRimZ, halfT * rimChamfer) : Math.max(minRimZ, halfT * dNorm);
           zB = isRim ? -Math.max(minRimZ * 0.85, halfT * rimChamfer * backScale) : -Math.max(minRimZ * 0.85, halfT * backScale * dNorm);
@@ -1068,14 +1397,9 @@ export class Asset3DEngine {
     for (let iy = 0; iy < CH; iy++) {
       for (let ix = 0; ix < CW; ix++) {
         if (!hasCell(ix, iy)) continue;
-        const i00 = iy * W + ix;
-        const i10 = i00 + 1;
-        const i01 = i00 + W;
-        const i11 = i01 + 1;
-
+        const i00 = iy * W + ix, i10 = i00 + 1, i01 = i00 + W, i11 = i01 + 1;
         const f00 = frontMap[i00], f10 = frontMap[i10], f01 = frontMap[i01], f11 = frontMap[i11];
         frontIndices.push(f00, f01, f10, f10, f01, f11);
-
         const b00 = backMap[i00], b10 = backMap[i10], b01 = backMap[i01], b11 = backMap[i11];
         backIndices.push(b00, b10, b01, b10, b11, b01);
       }
@@ -1085,16 +1409,12 @@ export class Asset3DEngine {
       const fa = sideFrontMap[va], fb = sideFrontMap[vb];
       const ba = sideBackMap[va], bb = sideBackMap[vb];
       if (fa >= 0 && fb >= 0 && ba >= 0 && bb >= 0) {
-        sideIndices.push(fa, fb, bb, fa, bb, ba);
+        // Outward-facing CCW winding around closed rim loop: (fa -> ba -> bb), (fa -> bb -> fb)
+        sideIndices.push(fa, ba, bb, fa, bb, fb);
       }
     }
 
-    return Asset3DEngine.finalizeSplitNormalsMesh(
-      positions,
-      uvs,
-      [frontIndices, backIndices, sideIndices],
-      'Triangle'
-    );
+    return Asset3DEngine.finalizeSplitNormalsMesh(positions, uvs, [frontIndices, backIndices, sideIndices], 'Triangle');
   }
 
   /**
@@ -1141,8 +1461,7 @@ export class Asset3DEngine {
       for (let k = -2; k <= 2; k++) {
         const j = Math.max(0, Math.min(rowData.length - 1, i + k));
         const wt = k === 0 ? 4 : Math.abs(k) === 1 ? 2 : 1;
-        s += rowData[j].rad * wt;
-        w += wt;
+        s += rowData[j].rad * wt; w += wt;
       }
       return s / w;
     });
@@ -1151,14 +1470,13 @@ export class Asset3DEngine {
       for (let k = -2; k <= 2; k++) {
         const j = Math.max(0, Math.min(rowData.length - 1, i + k));
         const wt = k === 0 ? 4 : Math.abs(k) === 1 ? 2 : 1;
-        s += rowData[j].cx * wt;
-        w += wt;
+        s += rowData[j].cx * wt; w += wt;
       }
       return s / w;
     });
 
     const rows = rowData.length;
-    const segTheta = 72;
+    const segTheta = W >= 240 ? 96 : 72;
     const cxWorld = stageW * 0.5;
     const offY = (stageH - fitH) * 0.5;
     const positions = [];
@@ -1184,25 +1502,20 @@ export class Asset3DEngine {
       for (let si = 0; si <= segTheta; si++) {
         const uFrac = si / segTheta;
         const theta = uFrac * Math.PI * 2 - Math.PI * 0.5;
-        const dirX = Math.cos(theta);
-        const dirZ = Math.sin(theta);
+        const dirX = Math.cos(theta), dirZ = Math.sin(theta);
         const sampleXf = Math.max(0, Math.min(W - 1, smoothCx[ri] + dirX * smoothRad[ri]));
         const dMod = (sampleBilinearDepth(sampleXf, rInfo.y) - 0.5) * (thicknessMm * 0.06);
         const rFinal = Math.max(0.4, baseR + dMod);
 
         positions.push(cxWorld + dirX * rFinal, worldY, dirZ * rFinal);
-        const texU = Math.max(0, Math.min(1, sampleXf / Math.max(1, W - 1)));
-        uvs.push(texU, vCoord);
+        uvs.push(Math.max(0, Math.min(1, sampleXf / Math.max(1, W - 1))), vCoord);
       }
     }
 
     const stride = segTheta + 1;
     for (let ri = 0; ri < rows - 1; ri++) {
       for (let si = 0; si < segTheta; si++) {
-        const a = ri * stride + si;
-        const b = a + 1;
-        const c = a + stride;
-        const d = c + 1;
+        const a = ri * stride + si, b = a + 1, c = a + stride, d = c + 1;
         bodyIndices.push(a, b, c, b, d, c);
       }
     }
@@ -1219,9 +1532,7 @@ export class Asset3DEngine {
     const topCenterIdx = positions.length / 3;
     positions.push(cxWorld, topY, 0);
     uvs.push(smoothCx[Math.min(rows - 1, 2)] / Math.max(1, W - 1), topCapV);
-    for (let si = 0; si < segTheta; si++) {
-      capIndices.push(topCenterIdx, topRingBase + si + 1, topRingBase + si);
-    }
+    for (let si = 0; si < segTheta; si++) capIndices.push(topCenterIdx, topRingBase + si + 1, topRingBase + si);
 
     const lastRowOrig = (rows - 1) * stride;
     const botRingBase = positions.length / 3;
@@ -1236,14 +1547,11 @@ export class Asset3DEngine {
     const botCenterIdx = positions.length / 3;
     positions.push(cxWorld, botY, 0);
     uvs.push(smoothCx[Math.max(0, rows - 3)] / Math.max(1, W - 1), botCapV);
-    for (let si = 0; si < segTheta; si++) {
-      capIndices.push(botCenterIdx, botRingBase + si, botRingBase + si + 1);
-    }
+    for (let si = 0; si < segTheta; si++) capIndices.push(botCenterIdx, botRingBase + si, botRingBase + si + 1);
 
     const result = Asset3DEngine.finalizeSplitNormalsMesh(positions, uvs, [bodyIndices, capIndices], 'Triangle');
     for (let ri = 0; ri < rows; ri++) {
-      const iStart = (ri * stride) * 3;
-      const iEnd = (ri * stride + segTheta) * 3;
+      const iStart = (ri * stride) * 3, iEnd = (ri * stride + segTheta) * 3;
       const nx = result.normals[iStart] + result.normals[iEnd];
       const ny = result.normals[iStart + 1] + result.normals[iEnd + 1];
       const nz = result.normals[iStart + 2] + result.normals[iEnd + 2];
@@ -1256,8 +1564,38 @@ export class Asset3DEngine {
   }
 
   /**
-   * Compute clean normals separately per triangle group (prevents side-wall creases on Front/Back shells),
-   * filter zero-area degenerate triangles, and return indexed BufferData.
+   * Union-Find manifold connected-component check (matching Meshy module 148102 integrity telemetry).
+   */
+  static countManifoldComponents(vCount, indices) {
+    const parent = new Int32Array(vCount);
+    const active = new Uint8Array(vCount);
+    for (let i = 0; i < vCount; i++) parent[i] = i;
+    const find = (x) => {
+      while (parent[x] !== x) {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+      }
+      return x;
+    };
+    const unite = (a, b) => {
+      const ra = find(a), rb = find(b);
+      if (ra !== rb) parent[ra] = rb;
+    };
+    for (let i = 0; i < indices.length; i += 3) {
+      const a = indices[i], b = indices[i + 1], c = indices[i + 2];
+      active[a] = active[b] = active[c] = 1;
+      unite(a, b);
+      unite(b, c);
+    }
+    let comps = 0;
+    for (let i = 0; i < vCount; i++) {
+      if (active[i] && find(i) === i) comps++;
+    }
+    return comps;
+  }
+
+  /**
+   * Compute clean normals separately per triangle group, prune degenerate triangles, and return indexed BufferData.
    */
   static finalizeSplitNormalsMesh(positions, uvs, indexGroups, topology = 'Triangle') {
     const posArr = new Float32Array(positions);
@@ -1269,13 +1607,14 @@ export class Asset3DEngine {
     for (const grp of indexGroups) {
       for (let i = 0; i < grp.length; i += 3) {
         const a = grp[i], b = grp[i + 1], c = grp[i + 2];
+        if (a === b || b === c || a === c) continue;
         const i0 = a * 3, i1 = b * 3, i2 = c * 3;
         const ax = posArr[i1] - posArr[i0], ay = posArr[i1 + 1] - posArr[i0 + 1], az = posArr[i1 + 2] - posArr[i0 + 2];
         const bx = posArr[i2] - posArr[i0], by = posArr[i2 + 1] - posArr[i0 + 1], bz = posArr[i2 + 2] - posArr[i0 + 2];
         const nx = ay * bz - az * by;
         const ny = az * bx - ax * bz;
         const nz = ax * by - ay * bx;
-        if (nx * nx + ny * ny + nz * nz < 1e-12) continue;
+        if (nx * nx + ny * ny + nz * nz < 1e-18) continue;
         validIndices.push(a, b, c);
         normals[i0] += nx; normals[i0 + 1] += ny; normals[i0 + 2] += nz;
         normals[i1] += nx; normals[i1 + 1] += ny; normals[i1 + 2] += nz;
@@ -1299,6 +1638,7 @@ export class Asset3DEngine {
         topology,
         faces: Math.floor(idxArr.length / 3),
         vertices: vCount,
+        components: Asset3DEngine.countManifoldComponents(vCount, idxArr),
       },
     };
   }

@@ -226,26 +226,36 @@ export class StlExporter {
     const zShift = isFinite(minZ) ? -minZ : 0;
 
     const numTriangles = Math.floor(idx.length / 3);
-    const buffer = new ArrayBuffer(84 + numTriangles * 50);
-    const view = new DataView(buffer);
+    const hdrBuf = new ArrayBuffer(84);
+    const hdrView = new DataView(hdrBuf);
     const headerStr = 'JDPaint 3D Asset Studio Watertight Binary STL';
-    for (let i = 0; i < 80; i++) view.setUint8(i, i < headerStr.length ? headerStr.charCodeAt(i) : 0);
-    view.setUint32(80, numTriangles, true);
+    for (let i = 0; i < 80; i++) hdrView.setUint8(i, i < headerStr.length ? headerStr.charCodeAt(i) : 0);
+    hdrView.setUint32(80, numTriangles, true);
 
-    let offset = 84;
-    for (let t = 0; t < numTriangles; t++) {
-      const i0 = idx[t * 3] * 3;
-      const i1 = idx[t * 3 + 1] * 3;
-      const i2 = idx[t * 3 + 2] * 3;
-      offset = StlExporter.writeTriangle(
-        view,
-        offset,
-        pos[i0] - cx, pos[i0 + 1] - cy, pos[i0 + 2] + zShift,
-        pos[i1] - cx, pos[i1 + 1] - cy, pos[i1 + 2] + zShift,
-        pos[i2] - cx, pos[i2 + 1] - cy, pos[i2 + 2] + zShift
-      );
+    // Chunk binary STL slices (100k triangles = 5MB/chunk, Meshy 207912 pattern) so 500k-1M+ face exports never overflow single TypedArrays
+    const blobParts = [hdrBuf];
+    const batchTris = 100000;
+    for (let start = 0; start < numTriangles; start += batchTris) {
+      const count = Math.min(batchTris, numTriangles - start);
+      const chunkBuf = new ArrayBuffer(count * 50);
+      const view = new DataView(chunkBuf);
+      let offset = 0;
+      for (let k = 0; k < count; k++) {
+        const t = start + k;
+        const i0 = idx[t * 3] * 3;
+        const i1 = idx[t * 3 + 1] * 3;
+        const i2 = idx[t * 3 + 2] * 3;
+        offset = StlExporter.writeTriangle(
+          view,
+          offset,
+          pos[i0] - cx, pos[i0 + 1] - cy, pos[i0 + 2] + zShift,
+          pos[i1] - cx, pos[i1 + 1] - cy, pos[i1 + 2] + zShift,
+          pos[i2] - cx, pos[i2 + 1] - cy, pos[i2 + 2] + zShift
+        );
+      }
+      blobParts.push(chunkBuf);
     }
-    return new Blob([buffer], { type: 'application/octet-stream' });
+    return new Blob(blobParts, { type: 'application/octet-stream' });
   }
 
   /**

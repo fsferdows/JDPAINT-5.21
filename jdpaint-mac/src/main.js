@@ -1185,6 +1185,19 @@ document.addEventListener('DOMContentLoaded', () => {
     return { roughness: r, metalness: m, contrast: c, intensity: i };
   }
 
+  const assetKeyInput = document.getElementById('asset-meshy-key');
+  if (assetKeyInput) {
+    try {
+      const savedKey = localStorage.getItem('jdpaint_meshy_api_key');
+      if (savedKey) assetKeyInput.value = savedKey;
+    } catch (_err) {}
+    assetKeyInput.addEventListener('change', () => {
+      try {
+        localStorage.setItem('jdpaint_meshy_api_key', assetKeyInput.value.trim());
+      } catch (_err) {}
+    });
+  }
+
   async function generateVolumetric3DAsset() {
     if (!loadedImageElement) {
       alert('Please load a picture first using "🖼️ Load Picture...".');
@@ -1192,51 +1205,86 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     const assetMode = document.getElementById('asset-mode-select')?.value || 'double-sided';
-    const resolution = parseInt(document.getElementById('asset-res-select')?.value || '160', 10) || 160;
+    const resolution = parseInt(document.getElementById('asset-res-select')?.value || '288', 10) || 288;
     const thicknessMm = Math.max(2, parseFloat(document.getElementById('asset-thickness')?.value || '22') || 22);
+    const filletRatio = Math.max(0, Math.min(0.035, (parseInt(document.getElementById('asset-fillet')?.value || '12', 10) || 0) / 1000));
     const removeBg = document.getElementById('asset-remove-bg')?.checked ?? true;
     const delight = document.getElementById('asset-delight')?.checked ?? true;
     const invert = document.getElementById('relief-invert-check')?.checked || false;
+    const edgeStrength = parseFloat(document.getElementById('relief-edge-strength')?.value || '0.38') || 0.38;
+    const engineMode = document.getElementById('asset-engine-mode')?.value || 'local';
+    const meshyKey = (document.getElementById('asset-meshy-key')?.value || '').trim();
 
-    statusMode.textContent = `Step 1/3: Isolating subject silhouette & synthesizing 1024px PBR maps (${resolution}×${resolution})...`;
-    await new Promise((r) => setTimeout(r, 0));
+    const progWrap = document.getElementById('asset-progress-wrap');
+    const progBar = document.getElementById('asset-progress-bar');
+    const progLbl = document.getElementById('asset-progress-label');
+    const btnGen = document.getElementById('btn-generate-asset');
 
-    const analysis = Asset3DEngine.analyzeImage(loadedImageElement, {
-      resolution,
-      texSize: 1024,
-      removeBg,
-      delight,
-      invert,
-      edgeStrength: parseFloat(document.getElementById('relief-edge-strength')?.value || '0.38') || 0.38,
-    });
+    const updateProgress = (_stage, pct, label) => {
+      if (progWrap) progWrap.style.display = 'block';
+      if (progBar) progBar.style.width = `${Math.max(4, Math.min(100, Math.round(pct)))}%`;
+      if (progLbl) progLbl.textContent = label;
+      statusMode.textContent = label;
+    };
 
-    statusMode.textContent = `Step 2/3: Reconstructing closed ${assetMode.toUpperCase()} volumetric 3D mesh...`;
-    await new Promise((r) => setTimeout(r, 0));
+    if (btnGen) btnGen.disabled = true;
+    try {
+      let meshStats = null;
+      if (engineMode === 'cloud') {
+        if (!meshyKey) {
+          alert('Please enter your Meshy API key (`msy_...`) or switch Engine Mode to Offline 5-Stage Meshy SDF.');
+          return;
+        }
+        const cloudRes = await Asset3DEngine.generateViaMeshyCloudApi(
+          loadedImageElement,
+          meshyKey,
+          {
+            topology: 'triangle',
+            targetPolycount: Math.min(250000, resolution * 350),
+            enablePbr: true,
+          },
+          updateProgress
+        );
+        const assetData = await viewport3D.loadExternalGLBBuffer(cloudRes.glbBuffer);
+        meshStats = assetData.stats;
+      } else {
+        const { analysis, meshData } = await Asset3DEngine.generateAssetProgressiveAsync(
+          loadedImageElement,
+          {
+            assetMode,
+            resolution,
+            texSize: 1024,
+            removeBg,
+            delight,
+            invert,
+            edgeStrength,
+            filletRatio,
+            widthMm: reliefEngine.width || 100,
+            heightMm: reliefEngine.height || 100,
+            thicknessMm,
+          },
+          updateProgress
+        );
+        viewport3D.setMaterialAdjustment(readAssetMaterialAdjustment());
+        viewport3D.setAssetMesh(meshData, analysis.maps);
+        meshStats = meshData.stats;
+      }
 
-    const meshData = Asset3DEngine.buildAssetMeshData(analysis, {
-      assetMode,
-      widthMm: reliefEngine.width || 100,
-      heightMm: reliefEngine.height || 100,
-      thicknessMm,
-    });
+      const btnBackRel = document.getElementById('btn-back-relief');
+      if (btnBackRel) btnBackRel.style.display = 'inline-block';
+      const assetTabBtn = document.getElementById('tab-btn-asset');
+      if (assetTabBtn) assetTabBtn.click();
+      if (panel3D.style.display === 'none') setViewMode('split');
 
-    statusMode.textContent = 'Step 3/3: Uploading PBR Base Color, Normal, Roughness & Metallic maps to WebGL...';
-    await new Promise((r) => setTimeout(r, 0));
-
-    viewport3D.setMaterialAdjustment(readAssetMaterialAdjustment());
-    viewport3D.setAssetMesh(meshData, analysis.maps);
-
-    const btnBackRel = document.getElementById('btn-back-relief');
-    if (btnBackRel) btnBackRel.style.display = 'inline-block';
-    const assetTabBtn = document.getElementById('tab-btn-asset');
-    if (assetTabBtn) assetTabBtn.click();
-    if (panel3D.style.display === 'none') setViewMode('split');
-
-    viewport3D.target.set((reliefEngine.width || 100) * 0.5, (reliefEngine.height || 100) * 0.5, 0);
-    viewport3D.updateCameraPosition();
-
-    const { faces, vertices } = meshData.stats;
-    statusMode.textContent = `3D Asset ready (${assetMode}) — ${faces.toLocaleString()} triangles, ${vertices.toLocaleString()} vertices! Export .GLB / .STL / .OBJ anytime.`;
+      const { faces, vertices } = meshStats;
+      statusMode.textContent = `3D Asset ready (${engineMode === 'cloud' ? 'Meshy Cloud' : assetMode}) — ${faces.toLocaleString()} triangles, ${vertices.toLocaleString()} vertices! Export .GLB / .STL / .OBJ anytime.`;
+    } catch (err) {
+      console.error('3D Asset generation failed:', err);
+      updateProgress(0, 100, `Error: ${err.message || err}`);
+      alert(`3D Asset generation failed: ${err.message || err}`);
+    } finally {
+      if (btnGen) btnGen.disabled = false;
+    }
   }
 
   document.getElementById('btn-img-to-asset')?.addEventListener('click', generateVolumetric3DAsset);
@@ -1627,6 +1675,15 @@ document.addEventListener('DOMContentLoaded', () => {
   bindAssetSlider('asset-contrast', 'lbl-asset-contrast', 'contrast');
   bindAssetSlider('asset-intensity', 'lbl-asset-intensity', 'intensity');
 
+  const assetFilletEl = document.getElementById('asset-fillet');
+  const assetFilletLbl = document.getElementById('lbl-asset-fillet');
+  if (assetFilletEl) {
+    assetFilletEl.addEventListener('input', () => {
+      const val = (parseInt(assetFilletEl.value, 10) || 0) / 1000;
+      if (assetFilletLbl) assetFilletLbl.textContent = val.toFixed(3);
+    });
+  }
+
   // ============================================================
   // CNC CAM Toolpath Calculations
   // ============================================================
@@ -1762,6 +1819,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // 3D Asset & Relief Exports (.GLB Full PBR, Centered Binary .STL, Wavefront .OBJ)
   async function exportGLB() {
+    if (viewport3D._externalGlbBytes && viewport3D._externalGlbBytes.length > 0) {
+      const glbBlob = new Blob([viewport3D._externalGlbBytes], { type: 'model/gltf-binary' });
+      StlExporter.downloadBlob('jdpaint-3d-asset.glb', glbBlob);
+      statusMode.textContent = `Exported Cloud Neural .GLB (${(glbBlob.size / 1024).toFixed(1)} KB).`;
+      return;
+    }
     statusMode.textContent = 'Exporting Binary glTF 2.0 (.glb) 3D Asset with BaseColor + Normal + ORM PBR Textures...';
     const meshData = (viewport3D.assetMesh && viewport3D.assetData)
       ? viewport3D.assetData

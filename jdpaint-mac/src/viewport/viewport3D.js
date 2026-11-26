@@ -1,6 +1,7 @@
 // 3D WebGL Viewport using Three.js for JDPaint Mac
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
 export class Viewport3D {
   constructor(containerElement, reliefEngine) {
@@ -15,6 +16,7 @@ export class Viewport3D {
     this.assetMesh = null;
     this.assetData = null;
     this.assetMaps = null;
+    this._externalGlbBytes = null;
     this._assetTextures = {};
     this.gridHelper = null;
     this.axesHelper = null;
@@ -580,8 +582,13 @@ export class Viewport3D {
     if (this.mesh && this.mesh.material) {
       this.mesh.material.wireframe = enabled;
     }
-    if (this.assetMesh && this.assetMesh.material) {
-      this.assetMesh.material.wireframe = enabled;
+    if (this.assetMesh) {
+      this.assetMesh.traverse((child) => {
+        if (child.isMesh && child.material) {
+          const mats = Array.isArray(child.material) ? child.material : [child.material];
+          mats.forEach((m) => { if (m) m.wireframe = enabled; });
+        }
+      });
     }
   }
 
@@ -616,18 +623,32 @@ export class Viewport3D {
     this._assetTextures = {};
   }
 
+  _disposeAssetObject() {
+    if (!this.assetMesh) return;
+    this.scene.remove(this.assetMesh);
+    this.assetMesh.traverse((child) => {
+      if (child.isMesh) {
+        child.geometry?.dispose();
+        const mats = Array.isArray(child.material) ? child.material : [child.material];
+        mats.forEach((m) => m?.dispose());
+        if (child.userData?._origMat && child.userData._origMat !== child.material) {
+          child.userData._origMat.dispose?.();
+        }
+        if (child.userData?._solidMat && child.userData._solidMat !== child.material) {
+          child.userData._solidMat.dispose?.();
+        }
+      }
+    });
+    this.assetMesh = null;
+    this._externalGlbBytes = null;
+  }
+
   setAssetMesh(meshData, pbrMaps = null) {
     if (!meshData || !meshData.positions) return;
+    this._disposeAssetObject();
     this.assetData = meshData;
     this.assetMaps = pbrMaps;
     this._disposeAssetTextures();
-
-    if (this.assetMesh) {
-      this.scene.remove(this.assetMesh);
-      this.assetMesh.geometry.dispose();
-      this.assetMesh.material.dispose();
-      this.assetMesh = null;
-    }
 
     if (pbrMaps && pbrMaps.size) {
       this._assetTextures.baseColor = this._buildCanvasTextureFromRgba(pbrMaps.baseColor, pbrMaps.size, true);
@@ -672,18 +693,163 @@ export class Viewport3D {
     this._emitStats();
   }
 
+  /**
+   * Load an external Binary glTF 2.0 (.glb) buffer (e.g. from Meshy Cloud API v1) into the stage.
+   */
+  loadExternalGLBBuffer(arrayBuffer) {
+    if (!arrayBuffer) return Promise.reject(new Error('Missing GLB buffer'));
+    const loader = new GLTFLoader();
+    return new Promise((resolve, reject) => {
+      loader.parse(
+        arrayBuffer,
+        '',
+        (gltf) => {
+          this._disposeAssetObject();
+          this._disposeAssetTextures();
+          this._externalGlbBytes = new Uint8Array(arrayBuffer);
+          this.assetMaps = null;
+
+          const root = gltf.scene || new THREE.Group();
+          root.rotation.x = Math.PI / 2; // Convert glTF Y-up convention to JDPaint Z-up stage
+          root.updateMatrixWorld(true);
+
+          const rawBox = new THREE.Box3().setFromObject(root);
+          const rawSize = new THREE.Vector3();
+          rawBox.getSize(rawSize);
+          const maxSpan = Math.max(1e-4, rawSize.x, rawSize.y, rawSize.z);
+          const normScale = 90 / maxSpan;
+          root.scale.multiplyScalar(normScale);
+          root.updateMatrixWorld(true);
+
+          const scaledBox = new THREE.Box3().setFromObject(root);
+          const scaledCenter = new THREE.Vector3();
+          scaledBox.getCenter(scaledCenter);
+          const stageW = this.relief.width || 100;
+          const stageH = this.relief.height || 100;
+          root.position.x += stageW * 0.5 - scaledCenter.x;
+          root.position.y += stageH * 0.5 - scaledCenter.y;
+          root.position.z += 0.5 - scaledBox.min.z;
+          root.updateMatrixWorld(true);
+
+          // Collect merged geometry buffers so .STL / .OBJ export also works on loaded neural GLBs
+          const posChunks = [];
+          const normChunks = [];
+          const uvChunks = [];
+          const idxChunks = [];
+          let vOffset = 0;
+          const normalMat = new THREE.Matrix3();
+          const tmpPos = new THREE.Vector3();
+          const tmpNorm = new THREE.Vector3();
+
+          root.traverse((child) => {
+            if (!child.isMesh || !child.geometry) return;
+            child.castShadow = true;
+            child.receiveShadow = true;
+            child.userData._origMat = child.material;
+            if (child.material && !Array.isArray(child.material)) {
+              child.material.wireframe = this.wireframe;
+            }
+            const posAttr = child.geometry.getAttribute('position');
+            if (!posAttr) return;
+            const normAttr = child.geometry.getAttribute('normal');
+            const uvAttr = child.geometry.getAttribute('uv');
+            const idxAttr = child.geometry.getIndex();
+            normalMat.getNormalMatrix(child.matrixWorld);
+
+            const nVert = posAttr.count;
+            const pArr = new Float32Array(nVert * 3);
+            const nArr = new Float32Array(nVert * 3);
+            const uArr = new Float32Array(nVert * 2);
+            for (let i = 0; i < nVert; i++) {
+              tmpPos.fromBufferAttribute(posAttr, i).applyMatrix4(child.matrixWorld);
+              pArr[i * 3] = tmpPos.x;
+              pArr[i * 3 + 1] = tmpPos.y;
+              pArr[i * 3 + 2] = tmpPos.z;
+              if (normAttr) {
+                tmpNorm.fromBufferAttribute(normAttr, i).applyMatrix3(normalMat).normalize();
+              } else {
+                tmpNorm.set(0, 0, 1);
+              }
+              nArr[i * 3] = tmpNorm.x;
+              nArr[i * 3 + 1] = tmpNorm.y;
+              nArr[i * 3 + 2] = tmpNorm.z;
+              if (uvAttr) {
+                uArr[i * 2] = uvAttr.getX(i);
+                uArr[i * 2 + 1] = uvAttr.getY(i);
+              }
+            }
+            posChunks.push(pArr);
+            normChunks.push(nArr);
+            uvChunks.push(uArr);
+
+            if (idxAttr) {
+              const iArr = new Uint32Array(idxAttr.count);
+              for (let i = 0; i < idxAttr.count; i++) iArr[i] = idxAttr.getX(i) + vOffset;
+              idxChunks.push(iArr);
+            } else {
+              const iArr = new Uint32Array(nVert);
+              for (let i = 0; i < nVert; i++) iArr[i] = i + vOffset;
+              idxChunks.push(iArr);
+            }
+            vOffset += nVert;
+          });
+
+          const totalIdx = idxChunks.reduce((s, c) => s + c.length, 0);
+          const positions = new Float32Array(vOffset * 3);
+          const normals = new Float32Array(vOffset * 3);
+          const uvs = new Float32Array(vOffset * 2);
+          const indices = new Uint32Array(totalIdx);
+          let pOff = 0, uOff = 0, iOff = 0;
+          for (let c = 0; c < posChunks.length; c++) {
+            positions.set(posChunks[c], pOff);
+            normals.set(normChunks[c], pOff);
+            pOff += posChunks[c].length;
+            uvs.set(uvChunks[c], uOff);
+            uOff += uvChunks[c].length;
+            indices.set(idxChunks[c], iOff);
+            iOff += idxChunks[c].length;
+          }
+
+          this.assetMesh = root;
+          this.scene.add(root);
+          const faces = Math.floor(indices.length / 3);
+          this.assetData = {
+            positions,
+            normals,
+            uvs,
+            indices,
+            stats: { topology: 'Triangle (Meshy Cloud)', faces, vertices: vOffset, components: 1 },
+          };
+
+          const finalBox = new THREE.Box3().setFromObject(root);
+          const fCenter = new THREE.Vector3();
+          const fSize = new THREE.Vector3();
+          finalBox.getCenter(fCenter);
+          finalBox.getSize(fSize);
+          this.target.copy(fCenter);
+          this.spherical.radius = Math.max(70, Math.min(260, Math.max(fSize.x, fSize.y, fSize.z) * 1.5));
+          this.updateCameraPosition();
+
+          if (this.mesh) this.mesh.visible = false;
+          if (this.baseSlab) this.baseSlab.visible = false;
+          this._emitStats();
+          resolve(this.assetData);
+        },
+        (err) => reject(err || new Error('Failed parsing GLB asset'))
+      );
+    });
+  }
+
   clearAssetMesh() {
-    if (this.assetMesh) {
-      this.scene.remove(this.assetMesh);
-      this.assetMesh.geometry.dispose();
-      this.assetMesh.material.dispose();
-      this.assetMesh = null;
-    }
+    this._disposeAssetObject();
     this.assetData = null;
     this.assetMaps = null;
     this._disposeAssetTextures();
     if (this.mesh) this.mesh.visible = true;
     if (this.baseSlab) this.baseSlab.visible = true;
+    this.target.set((this.relief.width || 100) * 0.5, (this.relief.height || 100) * 0.5, 0);
+    this.spherical.radius = 175;
+    this.updateCameraPosition();
     this._emitStats();
   }
 
@@ -738,8 +904,34 @@ export class Viewport3D {
 
   _refreshAssetMaterial() {
     if (!this.assetMesh) return;
-    this.assetMesh.material.dispose();
-    this.assetMesh.material = this._createAssetMaterial();
+    if (this.assetMesh.isMesh) {
+      this.assetMesh.material.dispose();
+      this.assetMesh.material = this._createAssetMaterial();
+      return;
+    }
+    const mode = this.shadingMode || 'standard';
+    const adj = this.materialAdjust || { roughness: 0.55, metalness: 0.08, contrast: 1.0, intensity: 1.0 };
+    this.assetMesh.traverse((child) => {
+      if (!child.isMesh) return;
+      const orig = child.userData?._origMat;
+      if (mode === 'solid') {
+        if (!child.userData._solidMat) {
+          child.userData._solidMat = new THREE.MeshStandardMaterial({
+            color: 0xe2ddd5,
+            roughness: Math.max(0.18, Math.min(0.92, adj.roughness)),
+            metalness: 0.05,
+            envMapIntensity: 0.72,
+            side: THREE.DoubleSide,
+          });
+        }
+        child.userData._solidMat.wireframe = this.wireframe;
+        child.material = child.userData._solidMat;
+      } else if (orig) {
+        child.material = orig;
+        const mats = Array.isArray(orig) ? orig : [orig];
+        mats.forEach((m) => { if (m) m.wireframe = this.wireframe; });
+      }
+    });
   }
 
   setShadingMode(mode) {
