@@ -161,6 +161,29 @@ export class VectorPuffEngine {
       appliedCount++;
     }
 
+    // Light bilateral smoothing strictly on active non-hole interior pixels so overlapping shapes blend smoothly without ragged step edges
+    if (appliedCount > 0 && N >= 64) {
+      const src = new Float32Array(reliefEngine.data);
+      for (let y = 1; y < N - 1; y++) {
+        const row = y * N;
+        for (let x = 1; x < N - 1; x++) {
+          const i = row + x;
+          const zc = src[i];
+          if (zc <= 0.002) continue;
+          const zL = src[i - 1], zR = src[i + 1], zU = src[i - N], zD = src[i + N];
+          if (zL <= 0.001 || zR <= 0.001 || zU <= 0.001 || zD <= 0.001) continue;
+          let sum = zc * 2.5, wSum = 2.5;
+          for (const zn of [zL, zR, zU, zD]) {
+            const dz = zn - zc;
+            const wt = Math.exp(-(dz * dz) * 32.0);
+            sum += zn * wt;
+            wSum += wt;
+          }
+          reliefEngine.data[i] = sum / wSum;
+        }
+      }
+    }
+
     reliefEngine.notify();
     return appliedCount;
   }
@@ -343,13 +366,18 @@ export class VectorPuffEngine {
     const imgData = ctx.getImageData(box.x0, box.y0, box.bw, box.bh);
     const tileLen = box.bw * box.bh;
     const mask = new Uint8Array(tileLen);
+    const rawAlpha = new Float32Array(tileLen);
     const alphaCov = new Float32Array(tileLen);
     let anyPixel = false;
     for (let i = 0; i < tileLen; i++) {
       const a = imgData.data[i * 4 + 3];
-      if (a > 64) {
-        mask[i] = 1;
-        alphaCov[i] = Math.min(1.0, a / 200.0);
+      if (a > 10) {
+        const af = a / 255.0;
+        rawAlpha[i] = af;
+        // Hermite S-curve subpixel coverage removes 1px diagonal sawtooth stairs along angled vectors & curved arcs
+        const ramp = Math.max(0.0, Math.min(1.0, (af - 0.04) / 0.84));
+        alphaCov[i] = ramp * ramp * (3.0 - 2.0 * ramp);
+        if (a >= 96) mask[i] = 1;
         anyPixel = true;
       }
     }
@@ -380,8 +408,11 @@ export class VectorPuffEngine {
       const localRow = ly * box.bw;
       for (let lx = 0; lx < box.bw; lx++) {
         const lIdx = localRow + lx;
-        if (mask[lIdx] === 1) {
-          const d = distField[lIdx];
+        const cov = alphaCov[lIdx];
+        if (cov > 0.005) {
+          const baseD = mask[lIdx] === 1 ? distField[lIdx] : 0.0;
+          const af = rawAlpha[lIdx];
+          const d = af < 0.98 ? Math.max(0.08, baseD + (af - 0.5) * 0.78) : baseD;
           const t = Math.min(1.0, d / targetRadiusPixels);
 
           let profileZ = 0;
@@ -409,7 +440,7 @@ export class VectorPuffEngine {
             profileZ = tb * tb * (3.0 - 2.0 * tb);
           }
 
-          const zVal = profileZ * normHeight * alphaCov[lIdx];
+          const zVal = profileZ * normHeight * cov;
           const gIdx = globalRow + (box.x0 + lx);
 
           if (mode === 'add') {

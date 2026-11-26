@@ -416,6 +416,18 @@
             <div id="cad-floating-bar" class="cad-floating-bar" style="display:none;"></div>
           </div>
         </div>
+        <!-- Unified Non-Blocking Multi-Stage Pipeline Progress HUD -->
+        <div id="pipeline-progress-hud" class="pipeline-progress-hud" style="display:none;">
+          <div class="pph-head">
+            <span id="pipeline-progress-title">Processing CAD Pipeline...</span>
+            <span id="pipeline-progress-pct">0%</span>
+          </div>
+          <div class="pph-track"><div id="pipeline-progress-bar" class="pph-bar"></div></div>
+          <div class="pph-foot">
+            <span id="pipeline-progress-stage">Initializing...</span>
+            <span id="pipeline-progress-timer">0.0s</span>
+          </div>
+        </div>
 
         <!-- Draggable Split Resizer between 2D & 3D Views -->
         <div class="split-resizer" id="split-resizer" title="Drag to resize 2D CAD & 3D Relief panels"></div>
@@ -724,6 +736,7 @@
                 <option value="256">256 × 256 (Standard Fine)</option>
                 <option value="384" selected>384 × 384 (Crisp CAD Recommended)</option>
                 <option value="512">512 × 512 (Ultra High Detail)</option>
+                <option value="640">640 × 640 (Studio CNC Precision)</option>
               </select>
             </div>
           </fieldset>

@@ -453,17 +453,18 @@ export class ImageVectorizer {
    * 4=Fit CAD Lines & Smooth Beziers, 5=Finalize Layered Entities.
    */
   static async traceImageToVectorsAsync(img, widthMm = 100, heightMm = 100, options = {}, onProgress = null) {
-    const yieldFrame = () => new Promise((resolve) => setTimeout(resolve, 0));
-    const report = async (step, total, label) => {
-      if (typeof onProgress === 'function') onProgress({ step, total, label });
+    const yieldFrame = () => new Promise((resolve) => setTimeout(resolve, 16));
+    const report = async (step, total, label, pct = null) => {
+      const resolvedPct = pct ?? Math.round((step / total) * 100);
+      if (typeof onProgress === 'function') onProgress({ step, total, pct: resolvedPct, label });
       await yieldFrame();
     };
 
-    await report(1, 5, 'Step 1/5: Preparing high-res buffer & isolating furniture design ROI...');
+    await report(1, 5, 'Step 1/5 (12%): High-Res Supersampling & Illumination Normalization...', 12);
     const iw = img.naturalWidth || img.width || 1;
     const ih = img.naturalHeight || img.height || 1;
     const detailHint = typeof options === 'object' && typeof options.detail === 'number' ? options.detail : 0.7;
-    const maxDimension = (typeof options === 'object' && options.maxDimension) || Math.min(1152, Math.round(840 + detailHint * 312));
+    const maxDimension = (typeof options === 'object' && options.maxDimension) || Math.min(1408, Math.round(920 + detailHint * 488));
 
     let scaleW = maxDimension;
     let scaleH = Math.round((ih / iw) * maxDimension);
@@ -471,8 +472,8 @@ export class ImageVectorizer {
       scaleH = maxDimension;
       scaleW = Math.round((iw / ih) * maxDimension);
     }
-    scaleW = Math.max(120, Math.min(1152, scaleW));
-    scaleH = Math.max(120, Math.min(1152, scaleH));
+    scaleW = Math.max(120, Math.min(1408, scaleW));
+    scaleH = Math.max(120, Math.min(1408, scaleH));
 
     const canvas = document.createElement('canvas');
     canvas.width = scaleW;
@@ -486,11 +487,11 @@ export class ImageVectorizer {
     const pixels = ctx.getImageData(0, 0, scaleW, scaleH).data;
     const bounds = ImageVectorizer.getImageFitBounds(img, widthMm, heightMm);
 
-    await report(2, 5, 'Step 2/5: Denoising wood grain & separating raised/recessed channels...');
+    await report(2, 5, 'Step 2/5 (34%): Edge-Preserving Denoise & Relief Channel Separation...', 34);
     const vectors = ImageVectorizer.traceFromImageData(pixels, scaleW, scaleH, bounds, options);
 
-    await report(3, 5, 'Step 3/5: Nesting holes & pruning background noise...');
-    await report(4, 5, 'Step 4/5: Fitting smooth Cubic Beziers & straight CAD frames...');
+    await report(3, 5, `Step 3/5 (62%): Subpixel Contour Extraction & Nested Hole Hierarchy (${vectors.length} regions)...`, 62);
+    await report(4, 5, 'Step 4/5 (84%): Fitting Corner-Exact Cubic Beziers & Eliminating Self-Intersections...', 84);
 
     // Sort clean architectural layout order: larger borders/grooves before interior sculpted petals
     const sorted = [...vectors].sort((a, b) => {
@@ -500,7 +501,7 @@ export class ImageVectorizer {
       return (b.points?.length || 0) - (a.points?.length || 0);
     });
 
-    await report(5, 5, `Step 5/5: Finalized ${sorted.length} customizable vector layer(s)!`);
+    await report(5, 5, `Step 5/5 (100%): Finalized ${sorted.length} precision 2D CAD vector layer(s)!`, 100);
     return sorted;
   }
 
@@ -2404,7 +2405,7 @@ export class ImageVectorizer {
         4
       );
       const midInSmoothed = (splitPair[1] - splitPair[0]);
-      const errSq = Math.pow(Math.max(0.52, (1.12 - opts.detailFactor) * 1.45 * scaleRatio), 2);
+      const errSq = Math.pow(Math.max(0.36, (1.08 - opts.detailFactor) * 1.15 * scaleRatio), 2);
 
       const fitHalf = (subPts) => {
         const len = subPts.length;
@@ -2537,7 +2538,7 @@ export class ImageVectorizer {
       snappedCorners.push(X || pc);
     }
 
-    const fitErrSq = Math.pow(Math.max(0.52, (1.12 - opts.detailFactor) * 1.45 * scaleRatio), 2);
+    const fitErrSq = Math.pow(Math.max(0.36, (1.08 - opts.detailFactor) * 1.15 * scaleRatio), 2);
     const segmentsList = [];
 
     for (let j = 0; j < mFinal; j++) {
@@ -2620,6 +2621,58 @@ export class ImageVectorizer {
       }
     }
     return anchors.length >= 2 ? anchors : null;
+  }
+
+  /**
+   * Prevent tight Bezier handle overshoot loops that create self-intersections along thin petals or tight curves.
+   */
+  static sanitizeBezierAnchors(anchors) {
+    if (!anchors || anchors.length < 2) return anchors;
+    const n = anchors.length;
+    for (let i = 0; i < n; i++) {
+      const a = anchors[i];
+      const b = anchors[(i + 1) % n];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const chord = Math.hypot(dx, dy);
+      if (chord < 1e-4) {
+        a.hOut = null;
+        b.hIn = null;
+        continue;
+      }
+      const maxHandle = chord * 0.45;
+      if (a.hOut) {
+        const hx = a.hOut.x - a.x;
+        const hy = a.hOut.y - a.y;
+        const hLen = Math.hypot(hx, hy);
+        const proj = (hx * dx + hy * dy) / chord;
+        if (hLen > maxHandle || proj < -0.15 * chord) {
+          const clampLen = Math.min(hLen, maxHandle);
+          const ux = proj < 0 ? dx / chord : hx / (hLen || 1);
+          const uy = proj < 0 ? dy / chord : hy / (hLen || 1);
+          a.hOut = {
+            x: Number((a.x + ux * clampLen).toFixed(3)),
+            y: Number((a.y + uy * clampLen).toFixed(3)),
+          };
+        }
+      }
+      if (b.hIn) {
+        const hx = b.hIn.x - b.x;
+        const hy = b.hIn.y - b.y;
+        const hLen = Math.hypot(hx, hy);
+        const proj = (hx * -dx + hy * -dy) / chord;
+        if (hLen > maxHandle || proj < -0.15 * chord) {
+          const clampLen = Math.min(hLen, maxHandle);
+          const ux = proj < 0 ? -dx / chord : hx / (hLen || 1);
+          const uy = proj < 0 ? -dy / chord : hy / (hLen || 1);
+          b.hIn = {
+            x: Number((b.x + ux * clampLen).toFixed(3)),
+            y: Number((b.y + uy * clampLen).toFixed(3)),
+          };
+        }
+      }
+    }
+    return anchors;
   }
 
   /**
@@ -2721,7 +2774,9 @@ export class ImageVectorizer {
       const item = filtered[i];
       const anchorsPx = ImageVectorizer.fitIllustratorCurve(item.L, rawField, w, h, refSign, opts);
       if (!anchorsPx || anchorsPx.length < 2) continue;
-      const mmAnchors = ImageVectorizer.anchorsToMm(anchorsPx, bounds, w, h);
+      const mmAnchors = ImageVectorizer.sanitizeBezierAnchors(
+        ImageVectorizer.anchorsToMm(anchorsPx, bounds, w, h)
+      );
 
       // Estimate true feature half-thickness (2 * Area / Perimeter) in mm for responsive 3D bevel radius
       let perimPx = 0;

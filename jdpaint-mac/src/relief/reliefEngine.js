@@ -238,7 +238,7 @@ export class ReliefEngine {
         const rOtsu = rCnt > 50 ? ImageVectorizer.computeOtsuStats(rHist, rCnt) : { separability: 0, threshold: 128, m1: 100, m2: 120 };
 
         if (rOtsu.separability >= 0.80 && Math.abs(rOtsu.m2 - rOtsu.m1) >= 65) {
-          // Flat engraved wood plaque: cancel background bamboo planks completely & trace crisp relief
+          // Flat engraved wood plaque: use continuous L2 SDF bevel + Taubin fairing so solid edges are razor-smooth
           const isDarkDesign = rOtsu.m2 > rOtsu.m1;
           const bgSeed = new Uint8Array(N * N);
           for (let i = 0; i < N * N; i++) {
@@ -246,26 +246,59 @@ export class ReliefEngine {
           }
           const planeR = Math.max(8, Math.round(Math.min(roi.w, roi.h) * 0.08));
           const bgPlane = ImageVectorizer.maskedBoxMean(smL, bgSeed, N, N, planeR);
+          const rawTLin = new Float32Array(N * N);
+          const cSpan = Math.max(36, Math.abs(rOtsu.m2 - rOtsu.m1) * 0.72);
+          for (let i = 0; i < N * N; i++) {
+            if (roi.chromaDiff[i] > 24) continue;
+            const dVal = isDarkDesign ? Math.max(0, bgPlane[i] - smL[i]) : Math.max(0, smL[i] - bgPlane[i]);
+            rawTLin[i] = Math.max(0, Math.min(1, (dVal - cSpan * 0.16) / (cSpan * 0.70)));
+          }
+          const tLinArr = ImageVectorizer.gaussianBlur3x3(rawTLin, N, N);
+          const strokeMask = new Uint8Array(N * N);
+          const bgMask = new Uint8Array(N * N);
+          for (let i = 0; i < N * N; i++) {
+            if (roi.chromaDiff[i] > 24) { bgMask[i] = 1; continue; }
+            if (tLinArr[i] >= 0.45) strokeMask[i] = 1;
+            else bgMask[i] = 1;
+          }
+          const distIn = ImageVectorizer.computeL2Distance2D(strokeMask, N, N);
+          const distOut = ImageVectorizer.computeL2Distance2D(bgMask, N, N);
+          const bevelPx = Math.max(2.4, Math.min(5.0, N * 0.011));
           for (let i = 0; i < N * N; i++) {
             if (roi.chromaDiff[i] > 24) { this.data[i] = 0; continue; }
-            const dVal = isDarkDesign ? Math.max(0, bgPlane[i] - smL[i]) : Math.max(0, smL[i] - bgPlane[i]);
-            const cleanZ = Math.max(0, Math.min(1, (dVal - 26) / 72.0));
-            this.data[i] = Math.pow(cleanZ, 0.85) * 0.72;
+            const sdfGeom = strokeMask[i] ? Math.max(0, distIn[i] - 0.5) : -Math.max(0, distOut[i] - 0.5);
+            const subpx = tLinArr[i] - 0.5;
+            const blendW = Math.exp(-(sdfGeom * sdfGeom) * 0.45);
+            const sdf = sdfGeom * (1.0 - 0.45 * blendW) + subpx * 0.9 * blendW;
+            const uBev = Math.max(0, Math.min(1, 0.5 + sdf / bevelPx));
+            const tBevel = uBev * uBev * (3.0 - 2.0 * uBev);
+            this.data[i] = Math.pow(tBevel, 0.90) * 0.72;
           }
+          ReliefEngine._taubinFairBuffer(this.data, N, 6, 4.2);
           this.notify();
           return;
         }
 
+        const grainCleanL = ImageVectorizer.guidedFilter(smL, N, N, Math.max(3, Math.round(N * 0.013)), 230);
         const minRoi = Math.min(roi.w, roi.h);
-        const minR = Math.max(2, Math.min(5, Math.round(minRoi * 0.014)));
-        const medR = Math.max(5, Math.min(14, Math.round(minRoi * 0.045)));
-        const openedL = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(smL, N, N, minR, false), N, N, minR, true);
-        const closedL = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(smL, N, N, minR, true), N, N, minR, false);
-        const openedMed = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(smL, N, N, medR, false), N, N, medR, true);
-        const closedMed = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(smL, N, N, medR, true), N, N, medR, false);
+        const minR = Math.max(3, Math.min(7, Math.round(minRoi * 0.020)));
+        const medR = Math.max(6, Math.min(16, Math.round(minRoi * 0.052)));
+        const openedL = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(grainCleanL, N, N, minR, false), N, N, minR, true);
+        const closedL = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(grainCleanL, N, N, minR, true), N, N, minR, false);
+        const openedMed = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(grainCleanL, N, N, medR, false), N, N, medR, true);
+        const closedMed = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(grainCleanL, N, N, medR, true), N, N, medR, false);
         const planeR = Math.max(10, Math.round(minRoi * 0.08));
-        const plane = ImageVectorizer.maskedBoxMean(smL, roiMask, N, N, planeR);
+        const plane = ImageVectorizer.maskedBoxMean(grainCleanL, roiMask, N, N, planeR);
         const baseLevel = invert ? 0.68 : 0.30;
+        const microField = new Float32Array(N * N);
+        for (let i = 0; i < N * N; i++) {
+          if (!roiMask[i] || wmMask[i]) continue;
+          const wh = (Math.max(0, grainCleanL[i] - openedL[i]) * 0.36 + Math.max(0, grainCleanL[i] - openedMed[i]) * 0.64) / 76.0;
+          const bh = (Math.max(0, closedL[i] - grainCleanL[i]) * 0.36 + Math.max(0, closedMed[i] - grainCleanL[i]) * 0.64) / 76.0;
+          const slow = (grainCleanL[i] - plane[i]) / 96.0;
+          microField[i] = (wh * 1.18 - bh * 0.96 + slow * 0.48) * (invert ? -1 : 1);
+        }
+        const softMicro = ImageVectorizer.gaussianBlur3x3(microField, N, N);
         const woodBuf = new Float32Array(N * N);
         for (let i = 0; i < N * N; i++) {
           const inRoiBox = roiMask[i] || wmMask[i];
@@ -277,19 +310,18 @@ export class ReliefEngine {
             woodBuf[i] = Math.pow(baseLevel, gamma);
             continue;
           }
-          const wh = (Math.max(0, smL[i] - openedL[i]) * 0.42 + Math.max(0, smL[i] - openedMed[i]) * 0.58) / 68.0;
-          const bh = (Math.max(0, closedL[i] - smL[i]) * 0.42 + Math.max(0, closedMed[i] - smL[i]) * 0.58) / 68.0;
-          const slow = (smL[i] - plane[i]) / 96.0;
-          const rawDelta = (wh * 1.42 - bh * 1.08 + slow * 0.45) * (invert ? -1 : 1);
+          const rawDelta = Math.tanh(softMicro[i] * 1.12) * 0.60;
           const zNorm = Math.max(0.05, Math.min(1.0, baseLevel + rawDelta));
           woodBuf[i] = Math.pow(zNorm, gamma);
         }
-        // Smooth high-frequency wood grain micro-ripples inside ROI while keeping carved borders crisp
-        const smoothWood = ImageVectorizer.guidedFilter(woodBuf, N, N, 1, 0.006);
+        // Sculpt high-frequency specular grain ripples into fluid carving forms while preserving ROI border walls
+        const guidedWood = ImageVectorizer.guidedFilter(woodBuf, N, N, Math.max(3, Math.round(N * 0.008)), 0.045);
+        const blurredWood = ImageVectorizer.gaussianBlur3x3(guidedWood, N, N);
         for (let i = 0; i < N * N; i++) {
           const inRoiBox = roiMask[i] || wmMask[i];
-          this.data[i] = inRoiBox ? Math.max(0, Math.min(1.0, smoothWood[i])) : 0;
+          this.data[i] = inRoiBox ? Math.max(0, Math.min(1.0, guidedWood[i] * 0.62 + blurredWood[i] * 0.38)) : 0;
         }
+        ReliefEngine._taubinFairBuffer(this.data, N, 7, 3.2);
         this.notify();
         return;
       }
@@ -355,12 +387,15 @@ export class ReliefEngine {
       if (l > maxL) maxL = l;
     }
 
-    // 4. Contrast Normalization + Foreground Mask via Otsu & Chroma
+    // 4. Contrast Normalization + Soft Subpixel Foreground Coverage Mask via Otsu & Chroma
     const otsuNorm = otsuStats.threshold / 255.0;
     const fgThreshold = isLightBg ? 1.0 - otsuNorm : otsuNorm;
     const range = Math.max(0.05, maxL - minL);
     const normalized = new Float32Array(N * N);
     const fgMask = new Uint8Array(N * N);
+    const fgCov = new Float32Array(N * N);
+    const softCut = Math.max(0.12, fgThreshold * 0.42);
+    const softSpan = Math.max(0.08, softCut * 0.48);
 
     for (let i = 0; i < N * N; i++) {
       let val = Math.max(0.0, Math.min(1.0, (heightLuma[i] - minL) / range));
@@ -382,8 +417,14 @@ export class ReliefEngine {
       }
 
       normalized[i] = val;
-      if (inBounds && val > Math.max(0.12, fgThreshold * 0.42)) {
-        fgMask[i] = 1;
+      if (inBounds) {
+        if (val > softCut) {
+          fgMask[i] = 1;
+          fgCov[i] = 1.0;
+        } else if (!removeWhiteBg || val > softCut - softSpan) {
+          const tCov = Math.max(0.0, Math.min(1.0, (val - (softCut - softSpan)) / (softSpan + 1e-5)));
+          fgCov[i] = tCov * tCov * (3.0 - 2.0 * tCov);
+        }
       }
     }
 
@@ -414,27 +455,30 @@ export class ReliefEngine {
       }
     }
 
-    // 7. Combine Volumetric Dome + Surface Luminance Shading + Edge Crispness
+    // 7. Combine Smooth Anti-Aliased Volumetric Dome + Surface Luminance Shading + Edge Crispness
     const blended = new Float32Array(N * N);
     for (let i = 0; i < N * N; i++) {
       const lumaVal = normalized[i];
       const edgeVal = edgeMap[i];
+      const cov = fgCov[i];
       const t = Math.min(1.0, distField[i] / normRadiusPx);
-      const domeVal = fgMask[i] ? Math.sqrt(Math.max(0, 1.0 - Math.pow(1.0 - t, 2))) : 0.0;
+      const domeVal = fgMask[i]
+        ? Math.sqrt(Math.max(0, 1.0 - Math.pow(1.0 - t, 2)))
+        : (cov > 0.01 ? 0.22 * cov : 0.0);
 
       let finalZ = lumaVal;
       if (style === 'sculpted') {
-        const baseVolume = domeVal * 0.55 + lumaVal * 0.45;
-        finalZ = baseVolume * (1.0 - edgeStrength * 0.25) + edgeVal * edgeStrength * 0.35;
+        const baseVolume = domeVal * 0.55 + lumaVal * 0.45 * cov + lumaVal * 0.12 * (1.0 - cov);
+        finalZ = baseVolume * (1.0 - edgeStrength * 0.25) + edgeVal * edgeStrength * 0.35 * cov;
         finalZ = Math.pow(Math.max(0, finalZ), gamma);
       } else if (style === 'organic') {
-        finalZ = Math.pow(domeVal * 0.65 + lumaVal * 0.35, 0.9);
+        finalZ = Math.pow((domeVal * 0.65 + lumaVal * 0.35) * Math.max(cov, 0.25), 0.9);
       }
 
       blended[i] = Math.max(0.0, Math.min(1.0, finalZ));
     }
 
-    // 8. Bilateral Edge-Preserving Denoising
+    // 8. Bilateral Edge-Preserving Denoising + Volume-Preserving Taubin Fairing (eliminates staircase jaggies!)
     if (denoise) {
       for (let y = 1; y < N - 1; y++) {
         for (let x = 1; x < N - 1; x++) {
@@ -456,11 +500,58 @@ export class ReliefEngine {
           this.data[idx] = valSum / (weightSum || 1);
         }
       }
+      ReliefEngine._taubinFairBuffer(this.data, N, 3);
     } else {
       this.data.set(blended);
     }
 
     this.notify();
+  }
+
+  static _taubinFairBuffer(buf, N, passes = 3, dzSharpness = 9.0) {
+    if (!buf || N < 8 || passes <= 0) return;
+    const next = new Float32Array(buf);
+    const ks = [0.46, -0.49];
+    for (let p = 0; p < passes * 2; p++) {
+      const k = ks[p & 1];
+      next.set(buf);
+      for (let y = 1; y < N - 1; y++) {
+        const row = y * N;
+        for (let x = 1; x < N - 1; x++) {
+          const i = row + x;
+          const c = buf[i];
+          if (c <= 0.002) continue;
+          const nbs = [i - 1, i + 1, i - N, i + N];
+          let sum = 0, wSum = 0;
+          for (const ni of nbs) {
+            const nv = buf[ni];
+            const dz = nv - c;
+            const wt = Math.exp(-(dz * dz) * dzSharpness);
+            sum += nv * wt;
+            wSum += wt;
+          }
+          if (wSum > 0.05) {
+            next[i] = Math.max(0.0, Math.min(1.0, c + k * (sum / wSum - c)));
+          }
+        }
+      }
+      buf.set(next);
+    }
+  }
+
+  /**
+   * Asynchronous progressive Picture -> 3D Relief pipeline reporting multi-stage completion percentage.
+   */
+  async loadImageHighAccuracyAsync(imgElement, options = {}, onProgress = null) {
+    const yieldStep = async (pct, label) => {
+      if (typeof onProgress === 'function') onProgress(pct, label);
+      await new Promise((r) => setTimeout(r, 16));
+    };
+    await yieldStep(14, `Stage 1/4 (14%): Rasterizing ${this.resolution}×${this.resolution} high-precision elevation buffer...`);
+    await yieldStep(42, 'Stage 2/4 (42%): Analyzing subject polarity, chrome isolation & signed distance field...');
+    this.loadImageHighAccuracy(imgElement, options);
+    await yieldStep(78, 'Stage 3/4 (78%): Running Taubin bilateral fairing & subpixel contour anti-aliasing...');
+    await yieldStep(100, `Stage 4/4 (100%): Precision ${this.resolution}×${this.resolution} 3D relief surface ready!`);
   }
 
   loadImage(imgElement) {

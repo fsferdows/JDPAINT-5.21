@@ -1139,3 +1139,66 @@ body, html {
   margin: 0 2px;
 }
 
+.pipeline-progress-hud {
+  position: absolute;
+  bottom: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  width: min(440px, 86%);
+  background: rgba(15, 23, 42, 0.92);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  border-radius: 8px;
+  padding: 9px 12px;
+  color: #e2e8f0;
+  box-shadow: 0 10px 26px rgba(2, 6, 23, 0.45);
+  pointer-events: none;
+}
+.pph-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: #f8fafc;
+  margin-bottom: 5px;
+}
+#pipeline-progress-pct {
+  color: #38bdf8;
+  font-variant-numeric: tabular-nums;
+}
+.pph-track {
+  width: 100%;
+  height: 7px;
+  background: rgba(51, 65, 85, 0.85);
+  border-radius: 99px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}
+.pph-bar {
+  width: 0%;
+  height: 100%;
+  background: linear-gradient(90deg, #0284c7, #38bdf8, #34d399);
+  transition: width 0.16s ease-out;
+}
+.pph-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-top: 5px;
+  font-size: 10px;
+  color: #94a3b8;
+}
+#pipeline-progress-stage {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#pipeline-progress-timer {
+  font-variant-numeric: tabular-nums;
+  color: #cbd5e1;
+  flex-shrink: 0;
+}
+

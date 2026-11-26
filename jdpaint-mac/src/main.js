@@ -1001,7 +1001,63 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // ============================================================
-  // AUTO-TRACE PICTURE TO 2D VECTORS (Step-by-Step Instant 2D Conversion!)
+  // UNIFIED NON-BLOCKING PIPELINE PROGRESS HUD
+  // ============================================================
+  const pphEl = document.getElementById('pipeline-progress-hud');
+  const pphTitleEl = document.getElementById('pipeline-progress-title');
+  const pphPctEl = document.getElementById('pipeline-progress-pct');
+  const pphBarEl = document.getElementById('pipeline-progress-bar');
+  const pphStageEl = document.getElementById('pipeline-progress-stage');
+  const pphTimerEl = document.getElementById('pipeline-progress-timer');
+  let _pphActiveId = 0;
+
+  function beginPipelineProgress(title = 'Processing...') {
+    const id = ++_pphActiveId;
+    const tStart = performance.now();
+    let tickTimer = null;
+    if (pphTitleEl) pphTitleEl.textContent = title;
+    if (pphPctEl) pphPctEl.textContent = '4%';
+    if (pphBarEl) pphBarEl.style.width = '4%';
+    if (pphStageEl) pphStageEl.textContent = 'Initializing...';
+    if (pphTimerEl) pphTimerEl.textContent = '0.0s';
+    if (pphEl) pphEl.style.display = 'block';
+    if (typeof setInterval === 'function') {
+      tickTimer = setInterval(() => {
+        if (id !== _pphActiveId) { clearInterval(tickTimer); return; }
+        if (pphTimerEl) pphTimerEl.textContent = `${((performance.now() - tStart) / 1000).toFixed(1)}s`;
+      }, 150);
+    }
+    const update = (pct, stageText) => {
+      if (id !== _pphActiveId) return;
+      const clamped = Math.max(0, Math.min(100, Math.round(pct)));
+      if (pphPctEl) pphPctEl.textContent = `${clamped}%`;
+      if (pphBarEl) pphBarEl.style.width = `${clamped}%`;
+      if (pphStageEl && stageText) pphStageEl.textContent = stageText;
+      if (pphTimerEl) pphTimerEl.textContent = `${((performance.now() - tStart) / 1000).toFixed(1)}s`;
+      if (stageText) statusMode.textContent = stageText;
+    };
+    const finish = (doneText, keepMs = 1900) => {
+      if (id !== _pphActiveId) return;
+      if (tickTimer) clearInterval(tickTimer);
+      update(100, doneText);
+      setTimeout(() => {
+        if (id === _pphActiveId && pphEl) pphEl.style.display = 'none';
+      }, keepMs);
+    };
+    const fail = (errText) => {
+      if (id !== _pphActiveId) return;
+      if (tickTimer) clearInterval(tickTimer);
+      if (pphStageEl) pphStageEl.textContent = errText;
+      statusMode.textContent = errText;
+      setTimeout(() => {
+        if (id === _pphActiveId && pphEl) pphEl.style.display = 'none';
+      }, 2400);
+    };
+    return { update, finish, fail };
+  }
+
+  // ============================================================
+  // AUTO-TRACE PICTURE TO 2D VECTORS (Step-by-Step Deep 2D+3D Conversion!)
   // ============================================================
   async function runAutoTrace2D() {
     if (!loadedImageElement) {
@@ -1010,46 +1066,72 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     const opts = getTraceOptions();
-    statusMode.textContent = `Step 1/5: Initializing (${opts.traceMode.toUpperCase()}, ${Math.round(opts.detail * 100)}% detail)...`;
+    const prog = beginPipelineProgress('Precision 2D Auto-Trace & Contour Fit');
+    prog.update(6, `Stage 1/5 (6%): Calibrating ${opts.traceMode.toUpperCase()} (${Math.round(opts.detail * 100)}% detail) depth field...`);
+    await new Promise((r) => setTimeout(r, 16));
 
-    // Sync clean sculpted base height so 3D view renders coherent carved relief instead of isolated jagged shards
-    reliefEngine.loadImageHighAccuracy(loadedImageElement, {
-      style: document.getElementById('relief-style')?.value || 'sculpted',
-      edgeStrength: parseFloat(document.getElementById('relief-edge-strength')?.value || '0.35') || 0.35,
-      invert: opts.invert,
-      removeWhiteBg: document.getElementById('relief-remove-bg')?.checked ?? true,
-      denoise: true,
-    });
-    basePhotoBuffer = new Float32Array(reliefEngine.data);
+    try {
+      // Sync clean sculpted base height so 3D view renders coherent carved relief instead of isolated jagged shards
+      await reliefEngine.loadImageHighAccuracyAsync(loadedImageElement, {
+        style: document.getElementById('relief-style')?.value || 'sculpted',
+        edgeStrength: parseFloat(document.getElementById('relief-edge-strength')?.value || '0.35') || 0.35,
+        invert: opts.invert,
+        removeWhiteBg: document.getElementById('relief-remove-bg')?.checked ?? true,
+        denoise: true,
+      }, (rPct, rLabel) => {
+        prog.update(6 + Math.round(rPct * 0.14), rLabel);
+      });
+      basePhotoBuffer = new Float32Array(reliefEngine.data);
 
-    const count = await cadCanvas.autoTraceReferenceImageAsync({
-      ...opts,
-      smoothCurves: true,
-      autoEnable3D: true,
-      replacePrevious: true,
-    }, (prog) => {
-      statusMode.textContent = prog.label;
-    });
+      const count = await cadCanvas.autoTraceReferenceImageAsync({
+        ...opts,
+        smoothCurves: true,
+        autoEnable3D: true,
+        replacePrevious: true,
+      }, (p) => {
+        const subPct = p.pct ?? Math.round(((p.step || 1) / (p.total || 5)) * 100);
+        prog.update(20 + Math.round(subPct * 0.65), p.label);
+      });
 
-    // Dim photo underlay cleanly to 16% so extracted 2D CAD contours read clearly rather than a blurry overlay
-    cadCanvas.refImageOpacity = 0.16;
-    if (sliderPicOpacity) sliderPicOpacity.value = '16';
-    if (labelPicOpacity) labelPicOpacity.textContent = '16%';
-    cadCanvas.requestRender();
+      prog.update(88, `Synthesizing smooth subpixel 3D relief & fairing surfaces (${count} layer(s))...`);
+      await new Promise((r) => setTimeout(r, 16));
 
-    const tracedTail = count > 0 ? cadCanvas.entities.slice(-count) : [];
-    const isWoodOrArch = tracedTail.some((e) => e.layerGroup === 'Raised Petals & Motifs' || e.layerGroup === 'Carved Grooves & Panels' || e.layerGroup === 'Architectural Frame');
-    basePhotoEnabled = true;
-    basePhotoWeight = isWoodOrArch ? 0.72 : 0.55;
-    if (chkClipBaseTo2d) chkClipBaseTo2d.checked = !isWoodOrArch;
-    updateBasePhotoBox();
-    rebuild3DFromLayers(true);
-    viewport3D.fitCameraToActive();
+      // Dim photo underlay cleanly to 16% so extracted 2D CAD contours read clearly rather than a blurry overlay
+      cadCanvas.refImageOpacity = 0.16;
+      if (sliderPicOpacity) sliderPicOpacity.value = '16';
+      if (labelPicOpacity) labelPicOpacity.textContent = '16%';
+      cadCanvas.requestRender();
 
-    selectTool('select');
-    renderLayerList();
-    syncSelectedLayerInspector();
-    statusMode.textContent = `Auto-Trace complete! Extracted ${count} clean 2D CAD vector shapes (${opts.traceMode}) + synced 3D relief. Use Opacity slider or Click Pen (Q) to inspect/edit!`;
+      const tracedTail = count > 0 ? cadCanvas.entities.slice(-count) : [];
+      const isWoodOrArch = tracedTail.some((e) => e.layerGroup === 'Raised Petals & Motifs' || e.layerGroup === 'Carved Grooves & Panels' || e.layerGroup === 'Architectural Frame');
+      if (isWoodOrArch) {
+        // Prevent 100+ highlight/groove shards on textured wood photos from spawning raw spikes over base relief
+        for (const ent of tracedTail) {
+          if (ent.relief) {
+            ent.relief.shape = 'smooth';
+            ent.relief.heightMm = Math.min(ent.relief.heightMm || 2.5, 2.2);
+            ent.relief.enabled = false;
+          }
+        }
+        basePhotoEnabled = true;
+        basePhotoWeight = 0.92;
+      } else {
+        basePhotoEnabled = true;
+        basePhotoWeight = 0.55;
+      }
+      if (chkClipBaseTo2d) chkClipBaseTo2d.checked = !isWoodOrArch;
+      updateBasePhotoBox();
+      rebuild3DFromLayers(true);
+      viewport3D.fitCameraToActive();
+
+      selectTool('select');
+      renderLayerList();
+      syncSelectedLayerInspector();
+      prog.finish(`Auto-Trace complete! Extracted ${count} clean 2D CAD vector shapes (${opts.traceMode}) + smooth 3D relief.`);
+    } catch (err) {
+      console.error('Auto-Trace failed:', err);
+      prog.fail(`Auto-Trace failed: ${err.message || err}`);
+    }
   }
 
   document.getElementById('btn-auto-trace-2d').addEventListener('click', runAutoTrace2D);
@@ -1059,7 +1141,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // ============================================================
   // 2D VECTOR TO 3D RELIEF PUFFING (Pen / Curves / Shapes → 3D)
   // ============================================================
-  function runVectorPuff() {
+  async function runVectorPuff() {
     // Automatically finish any in-progress Pen / Polyline draft so user doesn't get stuck!
     if (cadCanvas.currentDraft) {
       cadCanvas.finishCurrentDraft();
@@ -1087,15 +1169,16 @@ document.addEventListener('DOMContentLoaded', () => {
       ent.relief.mode = mode;
     }
 
-    statusMode.textContent = `Converting ${targetList.length} 2D vector(s) to 3D Relief (${shape.toUpperCase()})...`;
-    setTimeout(() => {
-      // Rebuild cleanly from layers so shrinking/reshaping outlines trims old unedited 3D peaks too!
-      rebuild3DFromLayers(false);
-      renderLayerList();
-      syncSelectedLayerInspector();
-      if (panel3D.style.display === 'none') setViewMode('split');
-      statusMode.textContent = `Converted ${targetList.length} 2D layer(s) into 3D Relief (${shape.toUpperCase()} profile, ${heightMm}mm)!`;
-    }, 20);
+    const prog = beginPipelineProgress(`Subpixel 2D → 3D Domain Sculpting (${shape.toUpperCase()})`);
+    prog.update(28, `Computing exact Euclidean distance fields for ${targetList.length} vector layer(s)...`);
+    await new Promise((r) => setTimeout(r, 20));
+    prog.update(72, 'Smoothing contour transitions & updating adaptive 3D mesh...');
+    // Rebuild cleanly from layers so shrinking/reshaping outlines trims old unedited 3D peaks too!
+    rebuild3DFromLayers(false);
+    renderLayerList();
+    syncSelectedLayerInspector();
+    if (panel3D.style.display === 'none') setViewMode('split');
+    prog.finish(`Converted ${targetList.length} 2D layer(s) into smooth 3D Relief (${shape.toUpperCase()}, ${heightMm}mm)!`);
   }
 
   ['btn-puff-3d', 'btn-side-puff', 'btn-do-puff', 'tb-tool-puff'].forEach((id) => {
@@ -1117,16 +1200,19 @@ document.addEventListener('DOMContentLoaded', () => {
     const edgeStrength = parseFloat(document.getElementById('relief-edge-strength')?.value) || 0.35;
     const removeWhiteBg = document.getElementById('relief-remove-bg')?.checked ?? true;
 
-    statusMode.textContent = 'Step 1/5: Preparing relief depth field & image analysis...';
-    await new Promise((r) => setTimeout(r, 0));
+    const prog = beginPipelineProgress('1-Click Precision 2D + 3D Dual Conversion');
+    prog.update(6, 'Step 1/5 (6%): Preparing high-res relief depth field & image analysis...');
+    await new Promise((r) => setTimeout(r, 16));
 
     // 1. Pre-compute high-accuracy relief heightmap buffer
-    reliefEngine.loadImageHighAccuracy(loadedImageElement, {
+    await reliefEngine.loadImageHighAccuracyAsync(loadedImageElement, {
       style,
       edgeStrength,
       invert: opts.invert,
       removeWhiteBg,
       denoise: true,
+    }, (rPct, rLabel) => {
+      prog.update(6 + Math.round(rPct * 0.22), rLabel);
     });
     basePhotoBuffer = new Float32Array(reliefEngine.data);
 
@@ -1135,9 +1221,13 @@ document.addEventListener('DOMContentLoaded', () => {
       ...opts,
       smoothCurves: true,
       autoEnable3D: true,
-    }, (prog) => {
-      statusMode.textContent = prog.label;
+    }, (p) => {
+      const subPct = p.pct ?? Math.round(((p.step || 1) / (p.total || 5)) * 100);
+      prog.update(28 + Math.round(subPct * 0.60), p.label);
     });
+
+    prog.update(92, 'Rebuilding smooth subpixel 3D relief & camera frame...');
+    await new Promise((r) => setTimeout(r, 16));
 
     // 3. Drive 3D Relief cleanly from traced 2D layers (+ sculpted wood slab base on bas-relief doors)
     if (vectorCount > 0) {
@@ -1158,7 +1248,7 @@ document.addEventListener('DOMContentLoaded', () => {
     renderLayerList();
     syncSelectedLayerInspector();
     if (panel3D.style.display === 'none') setViewMode('split');
-    statusMode.textContent = `1-Click Complete! ${vectorCount} compound 2D Layers ↔ 3D Relief synced 100% (${opts.traceMode}). Use Click Pen (Q) to reshape any layer!`;
+    prog.finish(`1-Click Complete! ${vectorCount} compound 2D Layers ↔ 3D Relief synced 100% (${opts.traceMode}).`);
   }
 
   const btnOneClick = document.getElementById('btn-one-click-auto');
@@ -1167,7 +1257,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // ============================================================
   // HIGH-ACCURACY PICTURE TO 3D RELIEF CONVERSION
   // ============================================================
-  function convertPicTo3DRelief() {
+  async function convertPicTo3DRelief() {
     if (!loadedImageElement) {
       alert('Please load a background picture first using "🖼️ Load Picture...".');
       return;
@@ -1178,28 +1268,37 @@ document.addEventListener('DOMContentLoaded', () => {
     const invert = document.getElementById('relief-invert-check')?.checked || false;
     const removeWhiteBg = document.getElementById('relief-remove-bg')?.checked ?? true;
 
-    statusMode.textContent = 'Computing High-Accuracy 3D Relief (Bilateral Denoising & Edge Sharpening)...';
-    setTimeout(() => {
+    const prog = beginPipelineProgress('Deep Picture → 3D Relief Surface');
+    prog.update(8, 'Initializing High-Accuracy 3D Relief Reconstruction...');
+    await new Promise((r) => setTimeout(r, 16));
+
+    try {
       if (viewport3D.assetMesh) {
         viewport3D.clearAssetMesh();
         lastBrepStepBytes = null;
         const btnBackRel = document.getElementById('btn-back-relief');
         if (btnBackRel) btnBackRel.style.display = 'none';
       }
-      reliefEngine.loadImageHighAccuracy(loadedImageElement, {
+      await reliefEngine.loadImageHighAccuracyAsync(loadedImageElement, {
         style,
         edgeStrength,
         invert,
         removeWhiteBg,
         denoise: true,
+      }, (pct, label) => {
+        prog.update(pct, label);
       });
       basePhotoBuffer = new Float32Array(reliefEngine.data);
       basePhotoEnabled = true;
       basePhotoWeight = 1.0;
       updateBasePhotoBox();
       if (panel3D.style.display === 'none') setViewMode('split');
-      statusMode.textContent = 'High-Accuracy 3D Relief generated! Adjust Base Layer or add/edit 2D Vector Layers.';
-    }, 30);
+      viewport3D.fitCameraToActive();
+      prog.finish('High-Accuracy 3D Relief generated! Adjust Base Layer or add/edit 2D Vector Layers.');
+    } catch (err) {
+      console.error('Pic->3D failed:', err);
+      prog.fail(`3D conversion failed: ${err.message || err}`);
+    }
   }
 
   document.getElementById('btn-pic-to-relief').addEventListener('click', convertPicTo3DRelief);
@@ -1252,11 +1351,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const progLbl = document.getElementById('asset-progress-label');
     const btnGen = document.getElementById('btn-generate-asset');
 
+    const prog = beginPipelineProgress('Meshy Volumetric 3D Asset Studio');
     const updateProgress = (_stage, pct, label) => {
       if (progWrap) progWrap.style.display = 'block';
       if (progBar) progBar.style.width = `${Math.max(4, Math.min(100, Math.round(pct)))}%`;
       if (progLbl) progLbl.textContent = label;
-      statusMode.textContent = label;
+      prog.update(pct, label);
     };
 
     if (btnGen) btnGen.disabled = true;
@@ -1314,10 +1414,11 @@ document.addEventListener('DOMContentLoaded', () => {
       viewport3D.fitCameraToActive();
 
       const { faces, vertices } = meshStats;
-      statusMode.textContent = `3D Asset ready (${engineMode === 'cloud' ? 'Meshy Cloud' : assetMode}) — ${faces.toLocaleString()} triangles, ${vertices.toLocaleString()} vertices! Export .GLB / .STL / .OBJ anytime.`;
+      prog.finish(`3D Asset ready (${engineMode === 'cloud' ? 'Meshy Cloud' : assetMode}) — ${faces.toLocaleString()} triangles, ${vertices.toLocaleString()} vertices!`);
     } catch (err) {
       console.error('3D Asset generation failed:', err);
       updateProgress(0, 100, `Error: ${err.message || err}`);
+      prog.fail(`3D Asset generation failed: ${err.message || err}`);
       alert(`3D Asset generation failed: ${err.message || err}`);
     } finally {
       if (btnGen) btnGen.disabled = false;
@@ -1979,7 +2080,8 @@ document.addEventListener('DOMContentLoaded', () => {
       alert('Local OpenCascade CAD Bridge (127.0.0.1:5174) is offline. Launch via "Start JDPaint.command" or run cad-kernel/cad_bridge_server.py.');
       return;
     }
-    statusMode.textContent = 'Building watertight OpenCascade B-Rep Solid & ISO STEP from 2D CAD vectors...';
+    const prog = beginPipelineProgress('OpenCascade NURBS B-Rep Build');
+    prog.update(18, 'Fitting B-Splines & extruding watertight OpenCascade B-Rep Solid from 2D vectors...');
     try {
       const res = await CadKernelBridge.buildFromVectors(cadCanvas.entities, {
         workpieceWidth: reliefEngine.width || 100,
@@ -1988,15 +2090,16 @@ document.addEventListener('DOMContentLoaded', () => {
         extrudeHeightMm: parseFloat(document.getElementById('puff-height')?.value || '5') || 5,
         filletRadiusMm: 0.4,
       });
+      prog.update(86, 'Importing compiled OpenCascade GLB & verifying NURBS STEP...');
       lastBrepStepBytes = res.stepBytes;
       await viewport3D.loadExternalGLBBuffer(res.glbBuffer);
       const btnBackRel = document.getElementById('btn-back-relief');
       if (btnBackRel) btnBackRel.style.display = 'inline-block';
       if (panel3D.style.display === 'none') setViewMode('split');
-      statusMode.textContent = `OpenCascade B-Rep Ready! Volume=${res.metrics.volume_mm3}mm³, Valid=${res.metrics.is_valid}, Features=${res.featuresBuilt}. Export .STEP / .STL / .GLB!`;
+      prog.finish(`OpenCascade B-Rep Ready! Volume=${res.metrics.volume_mm3}mm³, Valid=${res.metrics.is_valid}, Features=${res.featuresBuilt}. Export .STEP / .STL / .GLB!`);
     } catch (err) {
       console.error('OpenCascade 2D->BRep failed:', err);
-      statusMode.textContent = `OpenCascade CAD build error: ${err.message || err}`;
+      prog.fail(`OpenCascade CAD build error: ${err.message || err}`);
       alert(`OpenCascade CAD build error: ${err.message || err}`);
     }
   }
@@ -2011,7 +2114,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const w = parseFloat(document.getElementById('brep-param-w')?.value || '80') || 80;
     const h = parseFloat(document.getElementById('brep-param-h')?.value || '65') || 65;
     const t = parseFloat(document.getElementById('brep-param-t')?.value || '6') || 6;
-    statusMode.textContent = `Compiling parametric build123d ${preset.toUpperCase()} B-Rep solid...`;
+    const prog = beginPipelineProgress(`Parametric build123d ${preset.toUpperCase()} B-Rep`);
+    prog.update(24, `Compiling parametric build123d ${preset.toUpperCase()} B-Rep solid...`);
     try {
       const params = preset === 'flange'
         ? { outerDia: w, height: t, hubHeight: Math.max(6, h * 0.25) }
@@ -2019,15 +2123,16 @@ document.addEventListener('DOMContentLoaded', () => {
           ? { width: w, depth: h, height: Math.max(18, t * 4), wall: Math.max(2, Math.min(6, t * 0.5)) }
           : { width: w, height: h, thickness: t };
       const res = await CadKernelBridge.buildParametricPreset(preset, params);
+      prog.update(86, 'Importing compiled B-Rep GLB & verifying ISO STEP...');
       lastBrepStepBytes = res.stepBytes;
       await viewport3D.loadExternalGLBBuffer(res.glbBuffer);
       const btnBackRel = document.getElementById('btn-back-relief');
       if (btnBackRel) btnBackRel.style.display = 'inline-block';
       if (panel3D.style.display === 'none') setViewMode('split');
-      statusMode.textContent = `Parametric ${preset} B-Rep Ready! Vol=${res.metrics.volume_mm3}mm³, Faces=${res.metrics.brep_faces}, Valid=${res.metrics.is_valid}. Export .STEP anytime!`;
+      prog.finish(`Parametric ${preset} B-Rep Ready! Vol=${res.metrics.volume_mm3}mm³, Faces=${res.metrics.brep_faces}, Valid=${res.metrics.is_valid}. Export .STEP anytime!`);
     } catch (err) {
       console.error('Parametric CAD preset failed:', err);
-      statusMode.textContent = `Parametric B-Rep build failed: ${err.message || err}`;
+      prog.fail(`Parametric B-Rep build failed: ${err.message || err}`);
       alert(`Parametric B-Rep build failed: ${err.message || err}`);
     }
   }

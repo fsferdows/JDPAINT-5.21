@@ -16,9 +16,19 @@ from OCP.BRepBuilderAPI import (
     BRepBuilderAPI_MakeFace,
     BRepBuilderAPI_MakeWire,
 )
+from OCP.BRep import BRep_Tool
 from OCP.BRepCheck import BRepCheck_Analyzer
-from OCP.gp import gp_Dir, gp_Pln, gp_Pnt
+from OCP.BRepGProp import BRepGProp_Face
+from OCP.BRepMesh import BRepMesh_IncrementalMesh
+from OCP.GeomAbs import GeomAbs_C2
+from OCP.GeomAPI import GeomAPI_PointsToBSpline
+from OCP.gp import gp_Dir, gp_Pln, gp_Pnt, gp_Vec
 from OCP.ShapeFix import ShapeFix_Face
+from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED
+from OCP.TopExp import TopExp_Explorer
+from OCP.TopLoc import TopLoc_Location
+from OCP.TopoDS import TopoDS
+from OCP.TColgp import TColgp_Array1OfPnt
 
 try:
     from shapely.geometry import Polygon as ShapelyPolygon
@@ -104,18 +114,104 @@ def _orient_ring(raw_pts: list[tuple[float, float]], ccw: bool, min_area: float 
     return pts if (area > 0.0) == ccw else list(reversed(pts))
 
 
+def _fit_bspline_span(pts: list[tuple[float, float]]) -> Any:
+    """Fit an analytical C2 OpenCascade B-Spline edge across smooth sampled curve points."""
+    n = len(pts)
+    arr = TColgp_Array1OfPnt(1, n)
+    for idx, (x, y) in enumerate(pts, start=1):
+        arr.SetValue(idx, gp_Pnt(x, y, 0.0))
+    curve = GeomAPI_PointsToBSpline(arr, 3, 6, GeomAbs_C2, 2e-3).Curve()
+    return BRepBuilderAPI_MakeEdge(curve).Edge()
+
+
 def _ring_to_ocp_wire(ring: list[tuple[float, float]]) -> Any:
+    """Convert a closed 2D ring into an OpenCascade wire with analytical C2 B-Splines on curves & crisp lines on sharp corners."""
+    n = len(ring)
+    if n < 3:
+        return None
     mw = BRepBuilderAPI_MakeWire()
     edges_added = 0
-    n = len(ring)
+
+    # Detect sharp CAD corner indices (turn > ~34 deg) so rectangles/emblems stay sharp while ovals/petals become smooth C2 splines
+    corners: list[int] = []
+    cos_thresh = math.cos(math.radians(34.0))
     for i in range(n):
-        x1, y1 = ring[i]
-        x2, y2 = ring[(i + 1) % n]
-        if math.hypot(x2 - x1, y2 - y1) > 1e-4:
-            mw.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(x1, y1, 0.0), gp_Pnt(x2, y2, 0.0)).Edge())
-            edges_added += 1
-    if edges_added < 3:
-        return None
+        ax, ay = ring[(i - 1) % n]
+        bx, by = ring[i]
+        cx, cy = ring[(i + 1) % n]
+        u1x, u1y = bx - ax, by - ay
+        u2x, u2y = cx - bx, cy - by
+        l1, l2 = math.hypot(u1x, u1y), math.hypot(u2x, u2y)
+        if l1 > 1e-4 and l2 > 1e-4:
+            dot = (u1x * u2x + u1y * u2y) / (l1 * l2)
+            if dot < cos_thresh:
+                corners.append(i)
+
+    def _add_polyline_span(span: list[tuple[float, float]]) -> None:
+        nonlocal edges_added
+        for k in range(len(span) - 1):
+            x1, y1 = span[k]
+            x2, y2 = span[k + 1]
+            if math.hypot(x2 - x1, y2 - y1) > 1e-4:
+                mw.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(x1, y1, 0.0), gp_Pnt(x2, y2, 0.0)).Edge())
+                edges_added += 1
+
+    if not corners and n >= 8:
+        # Fully smooth closed loop -> split into 2 continuous C2 B-Spline halves to eliminate faceting cleanly
+        half = n // 2
+        for span in (ring[: half + 1], ring[half:] + [ring[0]]):
+            try:
+                mw.Add(_fit_bspline_span(span))
+                edges_added += 1
+            except Exception:
+                _add_polyline_span(span)
+    elif corners:
+        m = len(corners)
+        for ci in range(m):
+            a_idx = corners[ci]
+            b_idx = corners[(ci + 1) % m]
+            span = [ring[a_idx]]
+            cur = a_idx
+            guard = 0
+            while cur != b_idx and guard < n + 2:
+                cur = (cur + 1) % n
+                span.append(ring[cur])
+                guard += 1
+            chord = 0.0
+            max_dev = 1.0
+            if len(span) >= 5:
+                # Check if span deviates noticeably from a straight line before fitting B-Spline
+                p0, p1 = span[0], span[-1]
+                chord = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+                max_dev = 0.0
+                if chord > 1e-4:
+                    dx, dy = (p1[0] - p0[0]) / chord, (p1[1] - p0[1]) / chord
+                    for px, py in span[1:-1]:
+                        dev = abs(-(px - p0[0]) * dy + (py - p0[1]) * dx)
+                        if dev > max_dev:
+                            max_dev = dev
+                if max_dev > 0.02:
+                    try:
+                        mw.Add(_fit_bspline_span(span))
+                        edges_added += 1
+                        continue
+                    except Exception:
+                        pass
+            _add_polyline_span([span[0], span[-1]] if len(span) >= 5 and chord > 1e-4 and max_dev <= 0.015 else span)
+    else:
+        _add_polyline_span(ring + [ring[0]])
+
+    if edges_added < 2 or not mw.IsDone():
+        # Clean fallback straight-edge wire if spline chaining reported tolerance edge error
+        mw_fb = BRepBuilderAPI_MakeWire()
+        cnt = 0
+        for i in range(n):
+            x1, y1 = ring[i]
+            x2, y2 = ring[(i + 1) % n]
+            if math.hypot(x2 - x1, y2 - y1) > 1e-4:
+                mw_fb.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(x1, y1, 0.0), gp_Pnt(x2, y2, 0.0)).Edge())
+                cnt += 1
+        return mw_fb.Wire() if cnt >= 3 and mw_fb.IsDone() else None
     return mw.Wire()
 
 
@@ -146,7 +242,47 @@ def _make_ocp_face(outer: list[tuple[float, float]], holes: list[list[tuple[floa
     return b3d.Face(raw_face), len(eo)
 
 
-def _build_entity_faces(ent: dict[str, Any], work_h: float) -> list[tuple[b3d.Face, int]]:
+def _polygon_to_faces_with_insets(
+    outer: list[tuple[float, float]],
+    holes: list[list[tuple[float, float]]],
+    insets_mm: list[float] | None = None,
+) -> dict[float, list[tuple[b3d.Face, int]]]:
+    """Repair polygon topology via Shapely and generate optional inset tier faces for sculpted 3D crown bevels."""
+    tiers: dict[float, list[tuple[b3d.Face, int]]] = {}
+    if ShapelyPolygon is not None and shapely_make_valid is not None:
+        try:
+            repaired = shapely_make_valid(ShapelyPolygon(outer, holes))
+            base_polys = [
+                g for g in ([repaired] if isinstance(repaired, ShapelyPolygon) else list(getattr(repaired, "geoms", [])))
+                if isinstance(g, ShapelyPolygon) and g.area >= 0.08
+            ]
+            for inset in (insets_mm or [0.0]):
+                face_items: list[tuple[b3d.Face, int]] = []
+                for bp in base_polys:
+                    poly = bp if inset <= 0.01 else bp.buffer(-inset, join_style="round")
+                    geoms = [poly] if isinstance(poly, ShapelyPolygon) else list(getattr(poly, "geoms", []))
+                    for g in geoms:
+                        if not isinstance(g, ShapelyPolygon) or g.area < 0.08:
+                            continue
+                        ext = list(g.exterior.coords)[:-1]
+                        inners = [list(ring.coords)[:-1] for ring in g.interiors]
+                        face, vc = _make_ocp_face(ext, inners)
+                        if face is not None:
+                            face_items.append((face, vc))
+                if face_items:
+                    tiers[inset] = face_items
+            if 0.0 in tiers:
+                return tiers
+        except Exception:
+            pass
+    face, vc = _make_ocp_face(outer, holes)
+    if face is not None:
+        tiers[0.0] = [(face, vc)]
+    return tiers
+
+
+def _build_entity_faces(ent: dict[str, Any], work_h: float, profile: str = "flat", h_mm: float = 4.0) -> list[tuple[b3d.Face, int, float, float]]:
+    """Return list of (Face, vertex_count, z_offset_ratio, height_ratio) supporting curved B-Splines & sculpted crown tiers."""
     etype = ent.get("type")
     if etype == "circle":
         r = float(ent.get("r", 0))
@@ -157,7 +293,7 @@ def _build_entity_faces(ent: dict[str, Any], work_h: float) -> list[tuple[b3d.Fa
         with b3d.BuildSketch() as sk:
             with b3d.Locations((cx, cy)):
                 b3d.Circle(r)
-        return [(sk.sketch.faces()[0], 8)] if sk.sketch.faces() else []
+        return [(sk.sketch.faces()[0], 8, 0.0, 1.0)] if sk.sketch.faces() else []
 
     if etype == "rect":
         rw = abs(float(ent.get("w", 0)))
@@ -175,49 +311,43 @@ def _build_entity_faces(ent: dict[str, Any], work_h: float) -> list[tuple[b3d.Fa
                     b3d.RectangleRounded(rw, rh, cr)
                 else:
                     b3d.Rectangle(rw, rh)
-        return [(sk.sketch.faces()[0], 8 if cr > 0.15 else 4)] if sk.sketch.faces() else []
+        return [(sk.sketch.faces()[0], 8 if cr > 0.15 else 4, 0.0, 1.0)] if sk.sketch.faces() else []
 
     if etype in ("polyline", "curve") and ent.get("isClosed", True):
-        outer = _sample_entity_ring(ent.get("points") or [], work_h, samples_per_seg=4)
+        outer = _sample_entity_ring(ent.get("points") or [], work_h, samples_per_seg=6)
         if len(outer) < 3 or abs(_signed_area(outer)) < 0.08:
             return []
         valid_holes: list[list[tuple[float, float]]] = []
         for hole_pts in ent.get("holes") or []:
-            h_ring = _sample_entity_ring(hole_pts, work_h, samples_per_seg=4)
+            h_ring = _sample_entity_ring(hole_pts, work_h, samples_per_seg=6)
             if len(h_ring) >= 3 and abs(_signed_area(h_ring)) >= 0.05:
                 valid_holes.append(h_ring)
 
-        out_faces: list[tuple[b3d.Face, int]] = []
-        if ShapelyPolygon is not None and shapely_make_valid is not None:
-            try:
-                repaired = shapely_make_valid(ShapelyPolygon(outer, valid_holes))
-                geoms = [repaired] if isinstance(repaired, ShapelyPolygon) else list(getattr(repaired, "geoms", []))
-                for g in geoms:
-                    if not isinstance(g, ShapelyPolygon) or g.area < 0.08:
-                        continue
-                    ext = list(g.exterior.coords)[:-1]
-                    inners = [list(ring.coords)[:-1] for ring in g.interiors]
-                    face, vc = _make_ocp_face(ext, inners)
-                    if face is not None:
-                        out_faces.append((face, vc))
-            except Exception:
-                out_faces = []
-        if not out_faces:
-            face, vc = _make_ocp_face(outer, valid_holes)
-            if face is not None:
-                out_faces.append((face, vc))
-        return out_faces
+        # Build smooth beveled/domed B-Rep relief tiers when shape is sculptural (dome/smooth/cone/ogee/vcarve)
+        sculpted = profile in ("dome", "smooth", "cone", "ogee", "vcarve") and h_mm >= 0.9
+        insets = [0.0, 0.28, 0.65] if sculpted else [0.0]
+        tier_map = _polygon_to_faces_with_insets(outer, valid_holes, insets)
+        results: list[tuple[b3d.Face, int, float, float]] = []
+        if sculpted and len(tier_map) >= 2:
+            tier_specs = [(0.0, 0.0, 0.50), (0.28, 0.50, 0.30), (0.65, 0.80, 0.20)]
+            for inset_key, z_frac, h_frac in tier_specs:
+                for face, vc in tier_map.get(inset_key, []):
+                    results.append((face, vc, z_frac, h_frac))
+        else:
+            for face, vc in tier_map.get(0.0, []):
+                results.append((face, vc, 0.0, 1.0))
+        return results
 
     return []
 
 
-def export_solid_artifacts(shape: b3d.Shape, tol: float = 0.05) -> dict[str, Any]:
+def export_solid_artifacts(shape: b3d.Shape, tol: float = 0.045) -> dict[str, Any]:
     """Validate OpenCascade B-Rep shape and encode STEP, Watertight GLB (Y-up), & Binary STL."""
     with tempfile.TemporaryDirectory() as tmpdir:
         step_path = pathlib.Path(tmpdir) / "cad_solid.step"
         stl_path = pathlib.Path(tmpdir) / "cad_solid.stl"
         b3d.export_step(shape, str(step_path))
-        b3d.export_stl(shape, str(stl_path), tolerance=tol, angular_tolerance=0.15)
+        b3d.export_stl(shape, str(stl_path), tolerance=tol, angular_tolerance=0.12)
         step_bytes = step_path.read_bytes()
         mesh_stl = trimesh.load_mesh(str(stl_path), process=True)
         mesh_stl.merge_vertices(digits_vertex=4)
@@ -227,21 +357,89 @@ def export_solid_artifacts(shape: b3d.Shape, tol: float = 0.05) -> dict[str, Any
             pass
         stl_bytes = mesh_stl.export(file_type="stl")
 
-    # Convert OpenCascade Z-up (x, y, z) -> glTF 2.0 Y-up (x, z, -y) so GLB renders upright everywhere
-    np_verts_zup = mesh_stl.vertices
-    np_verts_yup = np.column_stack([np_verts_zup[:, 0], np_verts_zup[:, 2], -np_verts_zup[:, 1]])
+    # Extract analytical per-face B-Rep triangulations + NURBS surface normals directly from OpenCascade
+    # so planar caps keep exact flat normals (zero diagonal corner shading) and C2 splines render smooth.
+    BRepMesh_IncrementalMesh(shape.wrapped, tol, False, 0.12, True)
+    verts_chunks: list[np.ndarray] = []
+    faces_chunks: list[np.ndarray] = []
+    norms_chunks: list[np.ndarray] = []
+    v_offset = 0
+    exp = TopExp_Explorer(shape.wrapped, TopAbs_FACE)
+    p_tmp = gp_Pnt()
+    n_tmp = gp_Vec()
+    while exp.More():
+        face = TopoDS.Face_s(exp.Current())
+        loc = TopLoc_Location()
+        tri = BRep_Tool.Triangulation_s(face, loc)
+        if tri is not None and tri.NbNodes() > 0 and tri.NbTriangles() > 0:
+            trsf = loc.Transformation()
+            is_rev = face.Orientation() == TopAbs_REVERSED
+            is_neg = bool(trsf.IsNegative())
+            flip_wind = is_rev != is_neg
+            n_nodes = tri.NbNodes()
+            n_tris = tri.NbTriangles()
+            f_verts = np.empty((n_nodes, 3), dtype=np.float64)
+            f_norms = np.zeros((n_nodes, 3), dtype=np.float64)
+            valid_n = np.zeros(n_nodes, dtype=bool)
+            has_uv = tri.HasUVNodes()
+            prop = BRepGProp_Face(face) if has_uv else None
+            for idx_node in range(1, n_nodes + 1):
+                pt = tri.Node(idx_node).Transformed(trsf)
+                f_verts[idx_node - 1] = (pt.X(), pt.Z(), -pt.Y())
+                if prop is not None:
+                    uv = tri.UVNode(idx_node)
+                    prop.Normal(uv.X(), uv.Y(), p_tmp, n_tmp)
+                    mag = n_tmp.Magnitude()
+                    if mag > 1e-12:
+                        nt = gp_Vec(n_tmp.X(), n_tmp.Y(), n_tmp.Z()).Transformed(trsf)
+                        if is_neg:
+                            nt.Reverse()
+                        f_norms[idx_node - 1] = (nt.X() / mag, nt.Z() / mag, -nt.Y() / mag)
+                        valid_n[idx_node - 1] = True
+            f_tris = np.empty((n_tris, 3), dtype=np.int32)
+            for idx_tri in range(1, n_tris + 1):
+                n1, n2, n3 = tri.Triangle(idx_tri).Get()
+                if flip_wind:
+                    f_tris[idx_tri - 1] = (n1 - 1, n3 - 1, n2 - 1)
+                else:
+                    f_tris[idx_tri - 1] = (n1 - 1, n2 - 1, n3 - 1)
+            if not np.all(valid_n):
+                tri_pts = f_verts[f_tris]
+                geo_fn = np.cross(tri_pts[:, 1] - tri_pts[:, 0], tri_pts[:, 2] - tri_pts[:, 0])
+                fallback = np.zeros_like(f_verts)
+                np.add.at(fallback, f_tris.ravel(), np.repeat(geo_fn, 3, axis=0))
+                fb_lens = np.linalg.norm(fallback, axis=1, keepdims=True)
+                fallback = np.where(fb_lens > 1e-12, fallback / np.maximum(fb_lens, 1e-12), np.array([[0.0, 1.0, 0.0]]))
+                f_norms[~valid_n] = fallback[~valid_n]
+            verts_chunks.append(f_verts)
+            faces_chunks.append(f_tris + v_offset)
+            norms_chunks.append(f_norms)
+            v_offset += n_nodes
+        exp.Next()
+
+    if verts_chunks:
+        split_verts = np.vstack(verts_chunks)
+        split_faces = np.vstack(faces_chunks)
+        split_normals = np.vstack(norms_chunks)
+    else:
+        np_verts_zup = mesh_stl.vertices
+        split_verts = np.column_stack([np_verts_zup[:, 0], np_verts_zup[:, 2], -np_verts_zup[:, 1]])
+        split_faces = np.asarray(mesh_stl.faces, dtype=np.int32)
+        fn_zup = np.asarray(mesh_stl.face_normals, dtype=np.float64)
+        split_normals = np.column_stack([fn_zup[:, 0], fn_zup[:, 2], -fn_zup[:, 1]])
     mat = trimesh.visual.material.PBRMaterial(
         baseColorFactor=[188, 202, 220, 255],
         roughnessFactor=0.38,
         metallicFactor=0.22,
     )
     mesh_glb = trimesh.Trimesh(
-        vertices=np_verts_yup,
-        faces=mesh_stl.faces,
+        vertices=split_verts,
+        faces=split_faces,
+        vertex_normals=split_normals,
         visual=trimesh.visual.TextureVisuals(material=mat),
-        process=True,
+        process=False,
     )
-    glb_bytes = trimesh.Scene([mesh_glb]).export(file_type="glb")
+    glb_bytes = trimesh.Scene([mesh_glb]).export(file_type="glb", include_normals=True)
 
     is_valid = bool(BRepCheck_Analyzer(shape.wrapped).IsValid())
     bb = shape.bounding_box()
@@ -277,8 +475,8 @@ def build_solid_from_vectors(payload: dict[str, Any]) -> dict[str, Any]:
     fillet_mm = max(0.0, float(payload.get("filletRadiusMm", 0.0)))
     entities = payload.get("entities") or []
 
-    # Batch entities by (is_cut, rounded height) to avoid N slow 3D boolean fuse/cut passes
-    groups: dict[tuple[bool, float], list[tuple[b3d.Face, int]]] = {}
+    # Batch entities by (is_cut, z_offset, extrude_amount) to avoid N slow 3D boolean fuse/cut passes
+    groups: dict[tuple[bool, float, float], list[tuple[b3d.Face, int]]] = {}
     built_features = 0
     for ent in entities[:160]:
         if ent.get("visible", True) is False:
@@ -286,13 +484,17 @@ def build_solid_from_vectors(payload: dict[str, Any]) -> dict[str, Any]:
         relief = ent.get("relief") or {}
         if relief.get("enabled") is False:
             continue
-        entity_faces = _build_entity_faces(ent, work_h)
-        if not entity_faces:
-            continue
         h_mm = round(max(0.25, float(relief.get("heightMm") or default_h)), 2)
         mode_str = str(relief.get("mode", "add")).lower()
         is_cut = base_mm > 0.2 and mode_str in ("subtract", "carve", "min", "cut")
-        groups.setdefault((is_cut, h_mm), []).extend(entity_faces)
+        profile = str(relief.get("shape", "flat")).lower()
+        entity_faces = _build_entity_faces(ent, work_h, profile="flat" if is_cut else profile, h_mm=h_mm)
+        if not entity_faces:
+            continue
+        for face, vc, z_frac, h_frac in entity_faces:
+            z_off = round(h_mm * z_frac, 2)
+            ext_h = round(max(0.18, h_mm * h_frac), 2)
+            groups.setdefault((is_cut, z_off, ext_h), []).append((face, vc))
         built_features += 1
 
     if base_mm <= 0.05 and built_features == 0:
@@ -303,25 +505,24 @@ def build_solid_from_vectors(payload: dict[str, Any]) -> dict[str, Any]:
             with b3d.Locations((work_w * 0.5, work_h * 0.5, base_mm * 0.5)):
                 b3d.Box(work_w, work_h, base_mm)
 
-        for (is_cut, h_mm), face_items in groups.items():
+        for (is_cut, z_off, h_seg), face_items in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1])):
             face_list = [f for f, _ in face_items]
             max_verts = max(vc for _, vc in face_items)
             try:
                 if is_cut:
-                    cut_depth = min(base_mm - 0.15, h_mm)
+                    cut_depth = min(base_mm - 0.15, h_seg)
                     if cut_depth > 0.1:
                         solids = [b3d.extrude(f, amount=cut_depth).translate((0, 0, base_mm - cut_depth)) for f in face_list]
                         b3d.add(b3d.Compound(solids) if len(solids) > 1 else solids[0], mode=b3d.Mode.SUBTRACT)
                 else:
-                    z0 = base_mm if base_mm > 0.05 else 0.0
-                    solids = [b3d.extrude(f, amount=h_mm).translate((0, 0, z0)) for f in face_list]
+                    z0 = (base_mm if base_mm > 0.05 else 0.0) + z_off
+                    solids = [b3d.extrude(f, amount=h_seg).translate((0, 0, z0)) for f in face_list]
                     comp = b3d.Compound(solids) if len(solids) > 1 else solids[0]
-                    # Only fillet clean low-vertex geometric contours (skip brittle micro-fillets on dense traced Bezier splines)
-                    if fillet_mm >= 0.1 and max_verts <= 32:
+                    if fillet_mm >= 0.1 and max_verts <= 36:
                         try:
-                            top_edges = comp.edges().filter_by_position(b3d.Axis.Z, z0 + h_mm - 0.02, z0 + h_mm + 0.02)
+                            top_edges = comp.edges().filter_by_position(b3d.Axis.Z, z0 + h_seg - 0.02, z0 + h_seg + 0.02)
                             if top_edges:
-                                comp = comp.fillet(min(fillet_mm, h_mm * 0.42), edge_list=top_edges)
+                                comp = comp.fillet(min(fillet_mm, h_seg * 0.40), edge_list=top_edges)
                         except Exception:
                             pass
                     b3d.add(comp, mode=b3d.Mode.ADD)
@@ -330,7 +531,7 @@ def build_solid_from_vectors(payload: dict[str, Any]) -> dict[str, Any]:
 
         part = bp.part if hasattr(bp, "part") and bp.part is not None else b3d.Compound(bp.solids())
 
-    result = export_solid_artifacts(part, tol=0.06)
+    result = export_solid_artifacts(part, tol=0.052)
     result["features_built"] = built_features
     return result
 

@@ -85,7 +85,7 @@ export class Asset3DEngine {
     Asset3DEngine._solveSurfaceDepth(prep, { delight, invert, edgeStrength });
 
     await emit(3, 64, `Stage 3/5: Applying Volume-Preserving Taubin Fairing & Sobel Rolling-Ball Fillet (r=${filletRatio.toFixed(3)})...`);
-    Asset3DEngine.taubinSmoothDepth(prep.depth, prep.fgMask, prep.resX, prep.resY, prep.isPlanarPanel ? 3 : 4);
+    Asset3DEngine.taubinSmoothDepth(prep.depth, prep.fgMask, prep.resX, prep.resY, prep.isPlanarPanel ? 6 : 5);
     Asset3DEngine.applySlopeAwareFillet(prep.depth, prep.fgMask, prep.resX, prep.resY, prep.aspect >= 1 ? widthMm : widthMm * prep.aspect, thicknessMm, filletRatio);
 
     await emit(4, 82, `Stage 4/5: Newton-Raphson zero-isocontour rim snapping & watertight manifold ${assetMode.toUpperCase()} mesh (${prep.resX}×${prep.resY})...`);
@@ -562,27 +562,28 @@ export class Asset3DEngine {
       }
 
       // Multi-Scale Planar Architectural / Carved Wood Door Relief
+      const cleanGrainL = ImageVectorizer.guidedFilter(cleanL, resX, resY, Math.max(2, Math.round(minDim * 0.011)), 145);
       const minR = Math.max(2, Math.min(5, Math.round(minDim * 0.015)));
       const medR = Math.max(5, Math.min(18, Math.round(minDim * 0.055)));
       const planeR = Math.max(18, Math.round(minDim * 0.24));
 
-      const openedS = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, minR, false), resX, resY, minR, true);
-      const closedS = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, minR, true), resX, resY, minR, false);
-      const openedM = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, medR, false), resX, resY, medR, true);
-      const closedM = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanL, resX, resY, medR, true), resX, resY, medR, false);
-      const broadPlane = ImageVectorizer.maskedBoxMean(cleanL, fgMask, resX, resY, planeR);
+      const openedS = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanGrainL, resX, resY, minR, false), resX, resY, minR, true);
+      const closedS = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanGrainL, resX, resY, minR, true), resX, resY, minR, false);
+      const openedM = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanGrainL, resX, resY, medR, false), resX, resY, medR, true);
+      const closedM = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanGrainL, resX, resY, medR, true), resX, resY, medR, false);
+      const broadPlane = ImageVectorizer.maskedBoxMean(cleanGrainL, fgMask, resX, resY, planeR);
 
       const pol = invert ? -1 : 1;
       const nDepth = prep.neuralDepth || null;
       for (let i = 0; i < total; i++) {
         if (!fgMask[i]) continue;
-        const deLightedL = cleanL[i] - (broadPlane[i] - (p10 + toneSpan * 0.45)) * 0.32;
+        const deLightedL = cleanGrainL[i] - (broadPlane[i] - (p10 + toneSpan * 0.45)) * 0.32;
         let macroElev = (deLightedL - p10) / toneSpan;
         if (invert) macroElev = 1.0 - macroElev;
         macroElev = Math.max(0.05, Math.min(1.0, macroElev));
 
-        const wh = (Math.max(0, cleanL[i] - openedS[i]) * 0.35 + Math.max(0, cleanL[i] - openedM[i]) * 0.65) / 76.0;
-        const bh = (Math.max(0, closedS[i] - cleanL[i]) * 0.35 + Math.max(0, closedM[i] - cleanL[i]) * 0.65) / 76.0;
+        const wh = (Math.max(0, cleanGrainL[i] - openedS[i]) * 0.35 + Math.max(0, cleanGrainL[i] - openedM[i]) * 0.65) / 76.0;
+        const bh = (Math.max(0, closedS[i] - cleanGrainL[i]) * 0.35 + Math.max(0, closedM[i] - cleanGrainL[i]) * 0.65) / 76.0;
         // Soft-compress peak extremes so grain & specular highlights never become spikes in Solid Clay view
         const rawMicro = (wh * 0.92 - bh * 0.80) * pol;
         const microDelta = Math.tanh(rawMicro * 1.45) * 0.68;
@@ -594,7 +595,7 @@ export class Asset3DEngine {
         depth[i] = zVal;
       }
 
-      const smoothPlanar = ImageVectorizer.guidedFilter(depth, resX, resY, 2, 0.012);
+      const smoothPlanar = ImageVectorizer.guidedFilter(depth, resX, resY, 2, 0.018);
       for (let i = 0; i < total; i++) depth[i] = fgMask[i] ? Math.max(0.10, Math.min(1.0, smoothPlanar[i])) : 0;
       return;
     }
@@ -1467,9 +1468,7 @@ export class Asset3DEngine {
       }
     }
 
-    if (!isPlanar) {
-      Asset3DEngine.snapPerimeterToZeroPhi(gridX, gridY, activeCell, W, H, phi, boundaryEdges);
-    }
+    Asset3DEngine.snapPerimeterToZeroPhi(gridX, gridY, activeCell, W, H, phi, boundaryEdges);
 
     // Level-set height-contour vertex alignment on interior steep slope walls
     const isoMaxShift = 0.36;
@@ -1578,9 +1577,17 @@ export class Asset3DEngine {
         if (!hasCell(ix, iy)) continue;
         const i00 = iy * W + ix, i10 = i00 + 1, i01 = i00 + W, i11 = i01 + 1;
         const f00 = frontMap[i00], f10 = frontMap[i10], f01 = frontMap[i01], f11 = frontMap[i11];
-        frontIndices.push(f00, f01, f10, f10, f01, f11);
         const b00 = backMap[i00], b10 = backMap[i10], b01 = backMap[i01], b11 = backMap[i11];
-        backIndices.push(b00, b10, b01, b10, b11, b01);
+        const z00 = positions[f00 * 3 + 2], z10 = positions[f10 * 3 + 2];
+        const z01 = positions[f01 * 3 + 2], z11 = positions[f11 * 3 + 2];
+        // Choose iso-height quad diagonal (f00-f11 vs f10-f01) to prevent 45-degree sawtooth zipper artifacts
+        if (Math.abs(z00 - z11) <= Math.abs(z10 - z01)) {
+          frontIndices.push(f00, f01, f11, f00, f11, f10);
+          backIndices.push(b00, b11, b01, b00, b10, b11);
+        } else {
+          frontIndices.push(f00, f01, f10, f10, f01, f11);
+          backIndices.push(b00, b10, b01, b10, b11, b01);
+        }
       }
     }
 

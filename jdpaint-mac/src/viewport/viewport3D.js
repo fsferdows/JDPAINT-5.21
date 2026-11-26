@@ -472,6 +472,34 @@ export class Viewport3D {
     }
 
     pos.needsUpdate = true;
+
+    // Adaptive height-aligned quad diagonal split eliminates 45-degree sawtooth triangles in Solid zoom-in view
+    const indexAttr = this.geometry.getIndex();
+    if (indexAttr && res >= 4) {
+      const arr = indexAttr.array;
+      const quads = res - 1;
+      let k = 0;
+      for (let iy = 0; iy < quads; iy++) {
+        const row0 = iy * res;
+        const row1 = row0 + res;
+        for (let ix = 0; ix < quads; ix++) {
+          const a = row0 + ix;
+          const b = a + 1;
+          const c = row1 + ix;
+          const d = c + 1;
+          const za = data[a], zb = data[b], zc = data[c], zd = data[d];
+          if (Math.abs(za - zd) <= Math.abs(zb - zc)) {
+            arr[k++] = a; arr[k++] = c; arr[k++] = d;
+            arr[k++] = a; arr[k++] = d; arr[k++] = b;
+          } else {
+            arr[k++] = a; arr[k++] = c; arr[k++] = b;
+            arr[k++] = c; arr[k++] = d; arr[k++] = b;
+          }
+        }
+      }
+      indexAttr.needsUpdate = true;
+    }
+
     this.geometry.computeVertexNormals();
     this.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     this._dirty = true;
@@ -782,6 +810,9 @@ export class Viewport3D {
             }
             const posAttr = child.geometry.getAttribute('position');
             if (!posAttr) return;
+            if (!child.geometry.getAttribute('normal')) {
+              child.geometry.computeVertexNormals();
+            }
             const normAttr = child.geometry.getAttribute('normal');
             const uvAttr = child.geometry.getAttribute('uv');
             const idxAttr = child.geometry.getIndex();
@@ -892,10 +923,10 @@ export class Viewport3D {
 
     if (mode === 'solid') {
       return new THREE.MeshStandardMaterial({
-        color: 0xd6cfc7,
-        roughness: Math.max(0.22, Math.min(0.88, adj.roughness * 0.86)),
-        metalness: 0.04,
-        envMapIntensity: 0.58,
+        color: 0xa6adb8,
+        roughness: Math.max(0.36, Math.min(0.88, adj.roughness * 0.92)),
+        metalness: 0.03,
+        envMapIntensity: 0.36,
         wireframe: this.wireframe,
         side: THREE.DoubleSide,
       });
@@ -942,10 +973,10 @@ export class Viewport3D {
       if (mode === 'solid') {
         if (!child.userData._solidMat) {
           child.userData._solidMat = new THREE.MeshStandardMaterial({
-            color: 0xd6cfc7,
-            roughness: Math.max(0.22, Math.min(0.88, adj.roughness * 0.86)),
-            metalness: 0.04,
-            envMapIntensity: 0.58,
+            color: 0xa6adb8,
+            roughness: Math.max(0.36, Math.min(0.88, adj.roughness * 0.92)),
+            metalness: 0.03,
+            envMapIntensity: 0.36,
             side: THREE.DoubleSide,
           });
         }
@@ -968,9 +999,10 @@ export class Viewport3D {
       if (mode === 'solid') {
         this.mesh.material.dispose();
         this.mesh.material = new THREE.MeshStandardMaterial({
-          color: 0xd1d5db,
-          roughness: this.materialAdjust.roughness,
-          metalness: 0.04,
+          color: 0xa6adb8,
+          roughness: Math.max(0.42, Math.min(0.86, this.materialAdjust.roughness * 0.92)),
+          metalness: 0.03,
+          envMapIntensity: 0.36,
           wireframe: this.wireframe,
         });
       } else if (mode === 'unlit') {
