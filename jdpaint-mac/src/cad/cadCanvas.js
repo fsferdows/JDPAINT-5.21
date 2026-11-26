@@ -2,6 +2,7 @@
 // Features: rAF-decoupled rendering, 8-handle Resize & Rotate, Freehand Brush, Pen Bezier,
 // Node Edit, Knife/Scissors Split, Ellipse, Polygon/Star, 3-Point Arc, Polygon Offset, and ResizeObserver
 import { ImageVectorizer } from './imageVectorizer.js';
+import { CadKernelBridge } from './cadKernelBridge.js';
 
 export class CadCanvas {
   constructor(canvasElement, onCoordinateChange, callbacks = {}) {
@@ -898,13 +899,39 @@ export class CadCanvas {
     if (replacePrevious) {
       this.entities = this.entities.filter((e) => e.source !== 'trace');
     }
-    const traced = await ImageVectorizer.traceImageToVectorsAsync(
-      this.refImage,
-      this.workpieceWidth,
-      this.workpieceHeight,
-      traceOpts,
-      onProgress
-    );
+
+    let traced = null;
+    if (typeof window !== 'undefined' && traceOpts.useVisionBridge !== false) {
+      try {
+        if (typeof onProgress === 'function') {
+          onProgress({ step: 1, total: 5, pct: 18, label: 'Step 1/5 (18%): Checking Local OpenCV + VTracer Vision Engine...' });
+        }
+        const visionEnts = await CadKernelBridge.vectorizeViaVision(
+          this.refImage,
+          this.workpieceWidth,
+          this.workpieceHeight,
+          traceOpts
+        );
+        if (visionEnts && visionEnts.length > 0) {
+          traced = visionEnts;
+          if (typeof onProgress === 'function') {
+            onProgress({ step: 5, total: 5, pct: 95, label: `Step 5/5 (95%): Vision AI + VTracer extracted ${visionEnts.length} precision CAD contours!` });
+          }
+        }
+      } catch (_err) {
+        // Fall back transparently to pure-JS ImageVectorizer
+      }
+    }
+
+    if (!traced) {
+      traced = await ImageVectorizer.traceImageToVectorsAsync(
+        this.refImage,
+        this.workpieceWidth,
+        this.workpieceHeight,
+        traceOpts,
+        onProgress
+      );
+    }
     const vectors = traced.map((e) => {
       const ent = this.ensureEntityMetadata(e);
       ent.source = 'trace';

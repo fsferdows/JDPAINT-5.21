@@ -66,6 +66,7 @@ def _sample_entity_ring(
         return []
 
     has_cubic = any("hOut" in p or "hIn" in p for p in ring_pts)
+    eff_samples = 2 if m > 120 else (3 if m > 55 else samples_per_seg)
     sampled: list[tuple[float, float]] = []
     if has_cubic:
         for i in range(m):
@@ -80,8 +81,8 @@ def _sample_entity_ring(
                 c1 = (c1_raw["x"], work_h - c1_raw["y"])
                 c2 = (c2_raw["x"], work_h - c2_raw["y"])
                 p3 = (b["x"], work_h - b["y"])
-                for s in range(samples_per_seg):
-                    t = s / samples_per_seg
+                for s in range(eff_samples):
+                    t = s / eff_samples
                     mt = 1.0 - t
                     mt2, t2 = mt * mt, t * t
                     bx = mt2 * mt * p0[0] + 3 * mt2 * t * c1[0] + 3 * mt * t2 * c2[0] + t2 * t * p3[0]
@@ -90,7 +91,7 @@ def _sample_entity_ring(
     else:
         for p in ring_pts:
             sampled.append((p["x"], work_h - p["y"]))
-    return _clean_ring(sampled, tol=0.05)
+    return _clean_ring(sampled, tol=0.09 if m > 120 else 0.05)
 
 
 def _signed_area(ring: list[tuple[float, float]]) -> float:
@@ -252,9 +253,14 @@ def _polygon_to_faces_with_insets(
     if ShapelyPolygon is not None and shapely_make_valid is not None:
         try:
             repaired = shapely_make_valid(ShapelyPolygon(outer, holes))
-            base_polys = [
+            raw_polys = [
                 g for g in ([repaired] if isinstance(repaired, ShapelyPolygon) else list(getattr(repaired, "geoms", [])))
                 if isinstance(g, ShapelyPolygon) and g.area >= 0.08
+            ]
+            simp_tol = 0.09 if len(outer) > 120 else 0.02
+            base_polys = [
+                g.simplify(simp_tol, preserve_topology=True) if len(g.exterior.coords) > 90 else g
+                for g in raw_polys
             ]
             for inset in (insets_mm or [0.0]):
                 face_items: list[tuple[b3d.Face, int]] = []
@@ -323,8 +329,8 @@ def _build_entity_faces(ent: dict[str, Any], work_h: float, profile: str = "flat
             if len(h_ring) >= 3 and abs(_signed_area(h_ring)) >= 0.05:
                 valid_holes.append(h_ring)
 
-        # Build smooth beveled/domed B-Rep relief tiers when shape is sculptural (dome/smooth/cone/ogee/vcarve)
-        sculpted = profile in ("dome", "smooth", "cone", "ogee", "vcarve") and h_mm >= 0.9
+        # Build smooth beveled/domed B-Rep relief tiers when shape is sculptural (skip slow multi-tier boolean fuse on ultra-dense contours)
+        sculpted = profile in ("dome", "smooth", "cone", "ogee", "vcarve") and h_mm >= 0.9 and len(outer) <= 140
         insets = [0.0, 0.28, 0.65] if sculpted else [0.0]
         tier_map = _polygon_to_faces_with_insets(outer, valid_holes, insets)
         results: list[tuple[b3d.Face, int, float, float]] = []

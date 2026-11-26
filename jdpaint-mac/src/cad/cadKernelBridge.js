@@ -93,4 +93,86 @@ export class CadKernelBridge {
       stlBytes: CadKernelBridge._decodeBase64(data.stl_b64),
     };
   }
+
+  static _encodeImageB64(imgElement, maxEdge = 2048) {
+    if (typeof document === 'undefined') return '';
+    const iw = imgElement?.naturalWidth || imgElement?.width || 1;
+    const ih = imgElement?.naturalHeight || imgElement?.height || 1;
+    const sc = Math.min(1.0, maxEdge / Math.max(1, iw, ih));
+    const c = document.createElement('canvas');
+    c.width = Math.max(32, Math.round(iw * sc));
+    c.height = Math.max(32, Math.round(ih * sc));
+    const ctx = c.getContext('2d');
+    if (ctx) {
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(imgElement, 0, 0, c.width, c.height);
+    }
+    return c.toDataURL('image/png');
+  }
+
+  static _decodeU16Buffer(b64) {
+    const bytes = CadKernelBridge._decodeBase64(b64);
+    const len = bytes.byteLength >> 1;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const out = new Float32Array(len);
+    for (let i = 0; i < len; i++) out[i] = view.getUint16(i * 2, true) / 65535.0;
+    return out;
+  }
+
+  static async vectorizeViaVision(imgElement, widthMm = 100, heightMm = 100, options = {}) {
+    const health = await CadKernelBridge.checkHealth(600, { passive: true });
+    if (!health?.ok || !health?.vision_ai) return null;
+    const imageB64 = CadKernelBridge._encodeImageB64(imgElement, 2048);
+    if (!imageB64) return null;
+    const resp = await fetch(`${CadKernelBridge.BASE_URL}/api/vision/vectorize`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        image_b64: imageB64,
+        trace_mode: options.traceMode || 'auto',
+        detail: options.detail ?? 0.7,
+        corners: options.corners ?? 0.65,
+        color_count: options.colorCount ?? 6,
+        ignore_bg: options.ignoreBg ?? true,
+        width_mm: widthMm,
+        height_mm: heightMm,
+      }),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data?.ok && Array.isArray(data.entities) && data.entities.length > 0 ? data.entities : null;
+  }
+
+  static async reconstruct3DViaVision(imgElement, options = {}) {
+    const health = await CadKernelBridge.checkHealth(600, { passive: true });
+    if (!health?.ok || !health?.vision_ai) return null;
+    const imageB64 = CadKernelBridge._encodeImageB64(imgElement, 1800);
+    if (!imageB64) return null;
+    const resp = await fetch(`${CadKernelBridge.BASE_URL}/api/vision/reconstruct-3d`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        image_b64: imageB64,
+        resolution: options.resolution || 288,
+        remove_bg: options.removeBg ?? true,
+        delight: options.delight ?? true,
+        invert: options.invert ?? false,
+        enhance_image: options.enhanceImage ?? true,
+      }),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    if (!data?.ok) return null;
+    return {
+      width: data.width,
+      height: data.height,
+      aspect: data.aspect,
+      isPlanarPanel: !!data.is_planar_panel,
+      isGraphicLogo: !!data.is_graphic_logo,
+      roiBox: data.roi_box || null,
+      depth: CadKernelBridge._decodeU16Buffer(data.depth_u16_b64),
+      fgMask: CadKernelBridge._decodeBase64(data.fg_u8_b64),
+      cleanedDataUrl: `data:image/png;base64,${data.cleaned_png_b64}`,
+    };
+  }
 }

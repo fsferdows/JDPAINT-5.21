@@ -187,6 +187,62 @@ export class ImageVectorizer {
     return out;
   }
 
+  /**
+   * Fast edge-preserving bilateral filter on RGB/Luma arrays: melts low-res JPEG blocks
+   * and wood grain noise while keeping geometric carving bevels & logo contours razor crisp.
+   */
+  static bilateralDenoise(rArr, gArr, bArr, lumaArr, w, h, radius = 2, sigmaColor = 24) {
+    const n = w * h;
+    const outR = new Float32Array(rArr);
+    const outG = new Float32Array(gArr);
+    const outB = new Float32Array(bArr);
+    const outL = new Float32Array(lumaArr);
+    if (w < 8 || h < 8 || radius < 1) return { r: outR, g: outG, b: outB, luma: outL };
+
+    const inv2SigS2 = 1.0 / (2.0 * Math.max(1.0, radius * radius));
+    const inv2SigC2 = 1.0 / (2.0 * Math.max(25.0, sigmaColor * sigmaColor));
+    const step = radius >= 3 ? 2 : 1;
+
+    for (let y = radius; y < h - radius; y++) {
+      const row = y * w;
+      for (let x = radius; x < w - radius; x++) {
+        const idx = row + x;
+        const cL = lumaArr[idx];
+        const cR = rArr[idx];
+        const cG = gArr[idx];
+        const cB = bArr[idx];
+        let sL = 0, sR = 0, sG = 0, sB = 0, wSum = 0;
+
+        for (let dy = -radius; dy <= radius; dy += step) {
+          const nRow = (y + dy) * w;
+          const dy2 = dy * dy;
+          for (let dx = -radius; dx <= radius; dx += step) {
+            const ni = nRow + (x + dx);
+            const dl = lumaArr[ni] - cL;
+            const dR = rArr[ni] - cR;
+            const dG = gArr[ni] - cG;
+            const dB = bArr[ni] - cB;
+            const dc2 = dl * dl * 0.65 + (dR * dR + dG * dG + dB * dB) * 0.12;
+            const wt = Math.exp(-(dx * dx + dy2) * inv2SigS2 - dc2 * inv2SigC2);
+            sL += lumaArr[ni] * wt;
+            sR += rArr[ni] * wt;
+            sG += gArr[ni] * wt;
+            sB += bArr[ni] * wt;
+            wSum += wt;
+          }
+        }
+        if (wSum > 1e-6) {
+          const invW = 1.0 / wSum;
+          outL[idx] = sL * invW;
+          outR[idx] = sR * invW;
+          outG[idx] = sG * invW;
+          outB[idx] = sB * invW;
+        }
+      }
+    }
+    return { r: outR, g: outG, b: outB, luma: outL };
+  }
+
   static buildIntegralImage(gray, w, h) {
     const sat = new Float64Array((w + 1) * (h + 1));
     const stride = w + 1;
@@ -460,12 +516,17 @@ export class ImageVectorizer {
       await yieldFrame();
     };
 
-    await report(1, 5, 'Step 1/5 (12%): 4K High-Res Supersampling & Illumination Normalization...', 12);
+    await report(1, 5, 'Step 1/5 (12%): High-Res Structure Denoise & Edge Restoration...', 12);
     const iw = img.naturalWidth || img.width || 1;
     const ih = img.naturalHeight || img.height || 1;
+    const srcMax = Math.max(iw, ih);
     const detailHint = typeof options === 'object' && typeof options.detail === 'number' ? options.detail : 0.7;
     const requestedMax = (typeof options === 'object' && (options.maxDimension || options.traceQuality)) || Math.round(1600 + detailHint * 1400);
-    const maxDimension = Math.max(120, Math.min(4096, Math.round(requestedMax)));
+    // For low-res compressed inputs under 950px, avoid tracing magnified JPEG staircases: restore cleanly at 960..1680px while Beziers emit 4K precision
+    const adaptiveCap = requestedMax >= 1400
+      ? (srcMax < 950 ? Math.min(1680, Math.max(960, Math.round(srcMax * 2.4))) : Math.min(2560, Math.round(requestedMax)))
+      : Math.round(requestedMax);
+    const maxDimension = Math.max(120, Math.min(4096, adaptiveCap));
 
     let scaleW = maxDimension;
     let scaleH = Math.round((ih / iw) * maxDimension);
@@ -595,10 +656,17 @@ export class ImageVectorizer {
     const scaleRatio = Math.max(1.0, Math.min(3.2, Math.max(scaleW, scaleH) / 480.0));
     const pxPerMm = Math.max(scaleW / Math.max(1, bounds.w), scaleH / Math.max(1, bounds.h));
 
-    // Smooth edge-preserving Guided Denoise + full-resolution Scharr RGB gradient ridge field for subpixel outline lock
+    // Edge-preserving bilateral denoise (heals low-res JPEG blocks & wood grain on real images >= 640px)
+    // followed by guided filter + Scharr gradient ridge field for subpixel contour lock
+    let cleanR = rArr, cleanG = gArr, cleanB = bArr, cleanL = lumaRaw;
+    if (Math.max(scaleW, scaleH) >= 640 && effectiveMode !== 'edge') {
+      const biRad = scaleRatio > 1.8 ? 3 : 2;
+      const bi = ImageVectorizer.bilateralDenoise(rArr, gArr, bArr, lumaRaw, scaleW, scaleH, biRad, effectiveMode === 'bw-logo' ? 18 : 24);
+      cleanR = bi.r; cleanG = bi.g; cleanB = bi.b; cleanL = bi.luma;
+    }
     const filterRadius = detailFactor >= 0.45 ? 1 : 2;
-    const denoisedLuma = ImageVectorizer.guidedFilter(lumaRaw, scaleW, scaleH, filterRadius, effectiveMode === 'bw-logo' ? 85 : 145);
-    const gradField = ImageVectorizer.computeScharrGradientField(rArr, gArr, bArr, lumaRaw, scaleW, scaleH);
+    const denoisedLuma = ImageVectorizer.guidedFilter(cleanL, scaleW, scaleH, filterRadius, effectiveMode === 'bw-logo' ? 85 : 145);
+    const gradField = ImageVectorizer.computeScharrGradientField(cleanR, cleanG, cleanB, cleanL, scaleW, scaleH);
 
     const commonFitOpts = {
       detailFactor,
@@ -617,7 +685,7 @@ export class ImageVectorizer {
 
     // Dispatch to dedicated Illustrator Preset Pipeline
     if (effectiveMode === 'color') {
-      return ImageVectorizer.traceColorLayers(rArr, gArr, bArr, lumaRaw, denoisedLuma, scaleW, scaleH, {
+      return ImageVectorizer.traceColorLayers(cleanR, cleanG, cleanB, cleanL, denoisedLuma, scaleW, scaleH, {
         ...commonFitOpts,
         colorCount,
         stackMethod,
@@ -627,7 +695,7 @@ export class ImageVectorizer {
     }
 
     if (effectiveMode === 'grayscale') {
-      return ImageVectorizer.traceGrayscaleLayers(lumaRaw, denoisedLuma, scaleW, scaleH, {
+      return ImageVectorizer.traceGrayscaleLayers(cleanL, denoisedLuma, scaleW, scaleH, {
         ...commonFitOpts,
         toneLevels: Math.max(2, Math.min(12, colorCount)),
         ignoreBg,
@@ -644,7 +712,7 @@ export class ImageVectorizer {
     }
 
     if (effectiveMode === 'wood') {
-      return ImageVectorizer.traceWoodReliefLayers(rArr, gArr, bArr, lumaRaw, denoisedLuma, otsu, scaleW, scaleH, {
+      return ImageVectorizer.traceWoodReliefLayers(cleanR, cleanG, cleanB, cleanL, denoisedLuma, otsu, scaleW, scaleH, {
         ...commonFitOpts,
         threshold,
         invert,
@@ -656,7 +724,7 @@ export class ImageVectorizer {
     }
 
     // Default / 'bw-logo': Sub-pixel Accurate Exact Corners + Smooth Cubic Bézier Logo/Vector Trace
-    return ImageVectorizer.traceBinaryExact(lumaRaw, denoisedLuma, otsu, scaleW, scaleH, {
+    return ImageVectorizer.traceBinaryExact(cleanL, denoisedLuma, otsu, scaleW, scaleH, {
       ...commonFitOpts,
       threshold,
       invert,
@@ -964,7 +1032,8 @@ export class ImageVectorizer {
   }
 
   /**
-   * Automatically isolate the furniture/panel body from exterior walls, studio margins, floors, bricks, plants & corner logos.
+   * Automatically isolate the furniture/panel body from exterior walls, detached furniture/mirrors,
+   * floors, bricks, plants & corner logos using wall-gap-aware center runs + Sobel threshold snapping.
    */
   static detectFurnitureROI(rArr, gArr, bArr, lumaRaw, w, h) {
     const n = w * h;
@@ -972,9 +1041,9 @@ export class ImageVectorizer {
     const A = new Float32Array(n);
     const B = new Float32Array(n);
 
-    // Sample interior central zone [28..72% W, 18..78% H] to learn panel surface tone
-    const cx0 = Math.floor(w * 0.28), cx1 = Math.ceil(w * 0.72);
-    const cy0 = Math.floor(h * 0.18), cy1 = Math.ceil(h * 0.78);
+    // Tight interior central sample [34..66% W, 20..72% H] learns true door tone without wall/floor bleed
+    const cx0 = Math.floor(w * 0.34), cx1 = Math.ceil(w * 0.66);
+    const cy0 = Math.floor(h * 0.20), cy1 = Math.ceil(h * 0.72);
     const aVals = [], bVals = [];
     for (let i = 0; i < n; i++) {
       const [lv, av, bv] = ImageVectorizer.rgbToLab(rArr[i], gArr[i], bArr[i]);
@@ -993,26 +1062,25 @@ export class ImageVectorizer {
     for (let y = cy0; y < cy1; y += 2) {
       for (let x = cx0; x < cx1; x += 2) {
         const i = y * w + x;
-        if (Math.hypot(A[i] - aMed, B[i] - bMed) <= 22) lVals.push(L[i]);
+        if (Math.hypot(A[i] - aMed, B[i] - bMed) <= 20) lVals.push(L[i]);
       }
     }
     lVals.sort((u, v) => u - v);
     const lMed = lVals.length > 0 ? lVals[Math.floor(lVals.length * 0.5)] : 50;
 
-    // Classify pixels consistent with furniture panel tone & carved undercuts
     const panelMask = new Uint8Array(n);
     const chromaDiff = new Float32Array(n);
     for (let i = 0; i < n; i++) {
       const dc = Math.hypot(A[i] - aMed, B[i] - bMed);
       chromaDiff[i] = dc;
       const dl = Math.abs(L[i] - lMed);
-      const tolC = L[i] < 28 ? 34 : 20;
-      if (dc <= tolC && dl <= 36) panelMask[i] = 1;
+      const tolC = L[i] < 28 ? 28 : 18;
+      if (dc <= tolC && dl <= 33) panelMask[i] = 1;
     }
 
-    // Smooth column profile across middle vertical band [15..85% H] and walk outward from center
+    // Build contiguous X intervals in central vertical band [18..76% H] without bridging wide room wall gaps!
     const colFrac = new Float64Array(w);
-    const yStart = Math.floor(h * 0.15), yEnd = Math.ceil(h * 0.85);
+    const yStart = Math.floor(h * 0.18), yEnd = Math.ceil(h * 0.76);
     const ySpan = Math.max(1, yEnd - yStart);
     for (let x = 0; x < w; x++) {
       let c = 0;
@@ -1020,41 +1088,49 @@ export class ImageVectorizer {
       colFrac[x] = c / ySpan;
     }
     const smoothCol = new Float64Array(w);
-    const colRad = Math.max(3, Math.round(w * 0.008));
+    const colRad = Math.max(2, Math.round(w * 0.008));
     const colPref = new Float64Array(w + 1);
     for (let x = 0; x < w; x++) colPref[x + 1] = colPref[x] + colFrac[x];
     for (let x = 0; x < w; x++) {
       const x0 = Math.max(0, x - colRad), x1 = Math.min(w, x + colRad + 1);
       smoothCol[x] = (colPref[x1] - colPref[x0]) / (x1 - x0);
     }
-    const midX = Math.floor(w * 0.5);
-    let rx0 = midX, rx1 = midX;
-    const minRunX = Math.max(3, Math.round(w * 0.022));
-    // Scan inward from left/right outer edges so dark central panels never prematurely truncate outer rails
-    let outerRx0 = -1, outerRx1 = -1;
-    for (let x = 0; x <= midX; x++) {
-      let ok = true;
-      for (let k = 0; k < minRunX && x + k < w; k++) {
-        if (smoothCol[x + k] < 0.34) { ok = false; break; }
-      }
-      if (ok) { outerRx0 = x; break; }
+
+    const xRuns = [];
+    let inRunX = false, runX0 = 0;
+    for (let x = 0; x < w; x++) {
+      if (smoothCol[x] >= 0.30 && !inRunX) { inRunX = true; runX0 = x; }
+      else if (smoothCol[x] < 0.25 && inRunX) { xRuns.push([runX0, x - 1]); inRunX = false; }
     }
-    for (let x = w - 1; x >= midX; x--) {
-      let ok = true;
-      for (let k = 0; k < minRunX && x - k >= 0; k++) {
-        if (smoothCol[x - k] < 0.34) { ok = false; break; }
+    if (inRunX) xRuns.push([runX0, w - 1]);
+
+    const mergedX = [];
+    const maxGapX = Math.max(3, Math.round(w * 0.015));
+    for (const r of xRuns) {
+      if (mergedX.length > 0 && r[0] - mergedX[mergedX.length - 1][1] <= maxGapX) {
+        let minGap = 1.0;
+        for (let x = mergedX[mergedX.length - 1][1]; x <= r[0]; x++) if (smoothCol[x] < minGap) minGap = smoothCol[x];
+        if (minGap >= 0.16) { mergedX[mergedX.length - 1][1] = r[1]; continue; }
       }
-      if (ok) { outerRx1 = x; break; }
-    }
-    if (outerRx0 !== -1 && outerRx1 > outerRx0 + w * 0.25) {
-      rx0 = outerRx0;
-      rx1 = outerRx1;
-    } else {
-      while (rx0 > 0 && smoothCol[rx0 - 1] >= 0.35) rx0--;
-      while (rx1 < w - 1 && smoothCol[rx1 + 1] >= 0.35) rx1++;
+      mergedX.push([r[0], r[1]]);
     }
 
-    // Compute row profile strictly within [rx0..rx1] and scan inward from top/bottom (bridges middle rails cleanly at 4K!)
+    let rx0 = 0, rx1 = w - 1, bestScoreX = -1;
+    const midX = w * 0.5;
+    for (const [a, b] of mergedX) {
+      const rw = b - a + 1;
+      if (rw < w * 0.22) continue;
+      const ov = Math.max(0, Math.min(b, w * 0.72) - Math.max(a, w * 0.28));
+      const sc = ov * 3.0 + rw - Math.abs((a + b) * 0.5 - midX) * 0.8;
+      if (sc > bestScoreX) { bestScoreX = sc; rx0 = a; rx1 = b; }
+    }
+    if (bestScoreX < 0) {
+      rx0 = Math.floor(w * 0.5); rx1 = rx0;
+      while (rx0 > 0 && smoothCol[rx0 - 1] >= 0.32) rx0--;
+      while (rx1 < w - 1 && smoothCol[rx1 + 1] >= 0.32) rx1++;
+    }
+
+    // Build contiguous Y intervals inside [rx0..rx1]
     const rowFrac = new Float64Array(h);
     const xSpan = Math.max(1, rx1 - rx0 + 1);
     for (let y = 0; y < h; y++) {
@@ -1064,48 +1140,106 @@ export class ImageVectorizer {
       rowFrac[y] = c / xSpan;
     }
     const smoothRow = new Float64Array(h);
-    const rowRad = Math.max(3, Math.round(h * 0.008));
+    const rowRad = Math.max(2, Math.round(h * 0.008));
     const rowPref = new Float64Array(h + 1);
     for (let y = 0; y < h; y++) rowPref[y + 1] = rowPref[y] + rowFrac[y];
     for (let y = 0; y < h; y++) {
       const y0 = Math.max(0, y - rowRad), y1 = Math.min(h, y + rowRad + 1);
       smoothRow[y] = (rowPref[y1] - rowPref[y0]) / (y1 - y0);
     }
-    const midY = Math.floor(h * 0.5);
-    let ry0 = midY, ry1 = midY;
-    const minRunY = Math.max(3, Math.round(h * 0.022));
-    let outerRy0 = -1, outerRy1 = -1;
-    for (let y = 0; y <= midY; y++) {
-      let ok = true;
-      for (let k = 0; k < minRunY && y + k < h; k++) {
-        if (smoothRow[y + k] < 0.34) { ok = false; break; }
-      }
-      if (ok) { outerRy0 = y; break; }
+
+    const yRuns = [];
+    let inRunY = false, runY0 = 0;
+    for (let y = 0; y < h; y++) {
+      if (smoothRow[y] >= 0.34 && !inRunY) { inRunY = true; runY0 = y; }
+      else if (smoothRow[y] < 0.28 && inRunY) { yRuns.push([runY0, y - 1]); inRunY = false; }
     }
-    for (let y = h - 1; y >= midY; y--) {
-      let ok = true;
-      for (let k = 0; k < minRunY && y - k >= 0; k++) {
-        if (smoothRow[y - k] < 0.34) { ok = false; break; }
+    if (inRunY) yRuns.push([runY0, h - 1]);
+
+    const mergedY = [];
+    const maxGapY = Math.max(3, Math.round(h * 0.02));
+    for (const r of yRuns) {
+      if (mergedY.length > 0 && r[0] - mergedY[mergedY.length - 1][1] <= maxGapY) {
+        let minGap = 1.0;
+        for (let y = mergedY[mergedY.length - 1][1]; y <= r[0]; y++) if (smoothRow[y] < minGap) minGap = smoothRow[y];
+        if (minGap >= 0.16) { mergedY[mergedY.length - 1][1] = r[1]; continue; }
       }
-      if (ok) { outerRy1 = y; break; }
-    }
-    if (outerRy0 !== -1 && outerRy1 > outerRy0 + h * 0.28) {
-      ry0 = outerRy0;
-      ry1 = outerRy1;
-    } else {
-      while (ry0 > 0 && smoothRow[ry0 - 1] >= 0.35) ry0--;
-      while (ry1 < h - 1 && smoothRow[ry1 + 1] >= 0.35) ry1++;
+      mergedY.push([r[0], r[1]]);
     }
 
-    // Inset minimally ONLY on sides that had detected exterior walls/margins so outer door rails stay intact!
-    const hasLeftBg = rx0 > Math.max(4, w * 0.03);
-    const hasRightBg = rx1 < w - Math.max(5, w * 0.03);
-    const hasTopBg = ry0 > Math.max(4, h * 0.03);
-    const hasBottomBg = ry1 < h - Math.max(5, h * 0.03);
+    let ry0 = 0, ry1 = h - 1, bestScoreY = -1;
+    const midY = h * 0.46;
+    for (const [a, b] of mergedY) {
+      const rh = b - a + 1;
+      if (rh < h * 0.32) continue;
+      const ov = Math.max(0, Math.min(b, h * 0.72) - Math.max(a, h * 0.18));
+      const sc = ov * 3.0 + rh - Math.abs((a + b) * 0.5 - midY) * 0.6;
+      if (sc > bestScoreY) { bestScoreY = sc; ry0 = a; ry1 = b; }
+    }
+    if (bestScoreY < 0) {
+      ry0 = Math.floor(h * 0.5); ry1 = ry0;
+      while (ry0 > 0 && smoothRow[ry0 - 1] >= 0.34) ry0--;
+      while (ry1 < h - 1 && smoothRow[ry1 + 1] >= 0.34) ry1++;
+    }
+
+    // Snap ROI jamb & sill boundaries onto strongest structural vertical/horizontal gradient creases (trims wood floor bleed)
+    const padX = Math.max(4, Math.round(w * 0.032));
+    const padY = Math.max(4, Math.round(h * 0.032));
+    if (rx0 > padX) {
+      let bestX = rx0, bestG = -1;
+      const xLo = Math.max(1, rx0 - padX), xHi = Math.min(w - 2, rx0 + padX);
+      for (let x = xLo; x <= xHi; x++) {
+        let g = 0;
+        for (let y = ry0; y <= ry1; y += 2) g += Math.abs(lumaRaw[y * w + x + 1] - lumaRaw[y * w + x - 1]);
+        if (g > bestG) { bestG = g; bestX = x; }
+      }
+      rx0 = bestX;
+    }
+    if (rx1 < w - padX) {
+      let bestX = rx1, bestG = -1;
+      const xLo = Math.max(1, rx1 - padX), xHi = Math.min(w - 2, rx1 + padX);
+      for (let x = xLo; x <= xHi; x++) {
+        let g = 0;
+        for (let y = ry0; y <= ry1; y += 2) g += Math.abs(lumaRaw[y * w + x + 1] - lumaRaw[y * w + x - 1]);
+        if (g > bestG) { bestG = g; bestX = x; }
+      }
+      rx1 = bestX;
+    }
+    if (ry0 > padY) {
+      let bestY = ry0, bestG = -1;
+      const yLo = Math.max(1, ry0 - padY), yHi = Math.min(h - 2, ry0 + padY);
+      for (let y = yLo; y <= yHi; y++) {
+        let g = 0;
+        for (let x = rx0; x <= rx1; x += 2) g += Math.abs(lumaRaw[(y + 1) * w + x] - lumaRaw[(y - 1) * w + x]);
+        if (g > bestG) { bestG = g; bestY = y; }
+      }
+      ry0 = bestY;
+    }
+    if (ry1 < h - padY) {
+      let bestY = ry1, bestS = -1;
+      const yLo = Math.max(ry0 + Math.round((ry1 - ry0) * 0.70), ry1 - Math.round(h * 0.16));
+      const yHi = Math.min(h - 2, ry1 + padY);
+      for (let y = Math.max(1, yLo); y <= yHi; y++) {
+        let g = 0, dark = 0, cnt = 0;
+        for (let x = rx0; x <= rx1; x += 2) {
+          g += Math.abs(lumaRaw[(y + 1) * w + x] - lumaRaw[(y - 1) * w + x]);
+          if (L[y * w + x] < 24) dark++;
+          cnt++;
+        }
+        const score = g / Math.max(1, cnt) + (dark / Math.max(1, cnt)) * 50.0;
+        if (score > bestS) { bestS = score; bestY = y; }
+      }
+      ry1 = bestY;
+    }
+
+    const hasLeftBg = rx0 > Math.max(4, w * 0.025);
+    const hasRightBg = rx1 < w - Math.max(5, w * 0.025);
+    const hasTopBg = ry0 > Math.max(4, h * 0.025);
+    const hasBottomBg = ry1 < h - Math.max(5, h * 0.025);
     const edgeGuardX = Math.max(4, Math.round(w * 0.010));
     const edgeGuardY = Math.max(4, Math.round(h * 0.010));
-    const insetX = Math.max(4, Math.round((rx1 - rx0) * 0.022));
-    const insetY = Math.max(4, Math.round((ry1 - ry0) * 0.016));
+    const insetX = Math.max(4, Math.round((rx1 - rx0) * 0.020));
+    const insetY = Math.max(4, Math.round((ry1 - ry0) * 0.014));
 
     const ix0 = hasLeftBg ? Math.min(rx1 - 10, rx0 + insetX) : edgeGuardX;
     const ix1 = hasRightBg ? Math.max(ix0 + 10, rx1 - insetX) : w - 1 - edgeGuardX;
@@ -1602,8 +1736,30 @@ export class ImageVectorizer {
       rejectFullFrame: true,
     }));
 
+    // Deduplicate overlapping highlight/shadow groove loops against raised reliefs (eliminates double ghost scribbles)
+    const getEntBox = (ent) => {
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const p of ent.points || []) {
+        if (p.x < x0) x0 = p.x; if (p.x > x1) x1 = p.x;
+        if (p.y < y0) y0 = p.y; if (p.y > y1) y1 = p.y;
+      }
+      return { x0, y0, x1, y1, area: Math.max(1e-4, (x1 - x0) * (y1 - y0)) };
+    };
+    const rBoxes = raisedEnts.map(getEntBox);
+    const dedupGrooves = grooveEnts.filter((gEnt) => {
+      const gb = getEntBox(gEnt);
+      for (const rb of rBoxes) {
+        const ix = Math.max(0, Math.min(gb.x1, rb.x1) - Math.max(gb.x0, rb.x0));
+        const iy = Math.max(0, Math.min(gb.y1, rb.y1) - Math.max(gb.y0, rb.y0));
+        const inter = ix * iy;
+        const union = gb.area + rb.area - inter;
+        if (union > 0 && inter / union >= 0.68) return false;
+      }
+      return true;
+    });
+
     // Include true sampled RGB fill tint & clean Panel Perimeter Frame when external room background was stripped
-    const combined = [...grooveEnts, ...raisedEnts];
+    const combined = [...dedupGrooves, ...raisedEnts];
     for (const ent of combined) {
       const pts = ent.points;
       if (!pts || pts.length < 2) continue;

@@ -1,6 +1,7 @@
 import { ImageVectorizer } from '../cad/imageVectorizer.js';
 import { VectorPuffEngine } from '../cad/vectorPuffEngine.js';
 import { NeuralVision } from '../ai/neuralVision.js';
+import { CadKernelBridge } from '../cad/cadKernelBridge.js';
 
 /**
  * Meshy-Architecture Volumetric Image-to-3D Reconstruction Engine & PBR Synthesizer.
@@ -10,7 +11,7 @@ import { NeuralVision } from '../ai/neuralVision.js';
  * - Diagonal checkerboard pinch cleanup & Union-Find manifold component verification
  * - [1,4,6,4,1] Sobel steep-slope detection + 30-deg normal-bilateral circular rolling-ball filleting
  * - Subpixel Newton-Raphson zero-isocontour (phi=0) rim snapping & ordered boundary loop relaxation
- * - 5-Stage asynchronous progressive pipeline + optional direct api.meshy.ai v1 cloud bridge
+ * - 5-Stage asynchronous progressive pipeline + local M1/OpenCV Vision Bridge + optional Meshy cloud API
  */
 export class Asset3DEngine {
   /**
@@ -40,45 +41,112 @@ export class Asset3DEngine {
     } = options;
 
     await emit(1, 8, `Stage 1/5: Rasterizing high-density aspect grid & isolating subject (${resolution}px / ${texSize}px PBR)...`);
-    const prep = Asset3DEngine._prepareCanvasAndMask(imgElement, { resolution, texSize, removeBg, delight, enhanceImage, invert, edgeStrength });
 
+    let prep = null;
+    let visionRes = null;
     if (useNeuralAI && NeuralVision.isBrowserRuntime()) {
-      const neuralRes = await NeuralVision.analyzeSubjectAsync(
-        imgElement,
-        prep.resX,
-        prep.resY,
-        {
-          enableDepth: true,
-          enableMatte: !prep.isPlanarPanel && removeBg && !prep.hasTransparency,
-          srcCrop: prep.srcCrop,
-        },
-        (_st, pct, label) => {
-          if (typeof onProgress === 'function') onProgress(2, Math.max(12, Math.min(44, pct)), label);
-        }
-      );
-      if (neuralRes?.depth) {
-        prep.neuralDepth = neuralRes.depth;
+      try {
+        visionRes = await CadKernelBridge.reconstruct3DViaVision(imgElement, {
+          resolution,
+          removeBg,
+          delight,
+          invert,
+          enhanceImage,
+        });
+      } catch (_err) {
+        visionRes = null;
       }
-      if (neuralRes?.matte && !prep.isPlanarPanel && removeBg && !prep.hasTransparency) {
-        const refinedFg = new Uint8Array(prep.total);
-        let kept = 0;
-        for (let i = 0; i < prep.total; i++) {
-          const on = neuralRes.matte[i] >= 0.42 || (prep.fgMask[i] && neuralRes.matte[i] >= 0.25);
-          if (on) { refinedFg[i] = 1; kept++; }
+    }
+
+    if (visionRes && visionRes.cleanedDataUrl && typeof Image !== 'undefined') {
+      await emit(1, 20, `Stage 1/5: Loaded M1 AI Depth + GrabCut segmentation (${visionRes.width}×${visionRes.height})...`);
+      const cleanImg = await new Promise((resolve) => {
+        const im = new Image();
+        im.onload = () => resolve(im);
+        im.onerror = () => resolve(null);
+        im.src = visionRes.cleanedDataUrl;
+      });
+      if (cleanImg) {
+        prep = Asset3DEngine._prepareCanvasAndMask(cleanImg, {
+          resolution,
+          texSize,
+          removeBg,
+          delight,
+          enhanceImage,
+          invert,
+          edgeStrength,
+          forceFullRect: true,
+          forcePlanarPanel: visionRes.isPlanarPanel,
+          forceGraphicLogo: visionRes.isGraphicLogo,
+        });
+        prep.neuralDepth = NeuralVision._bilinearResample(visionRes.depth, visionRes.width, visionRes.height, prep.resX, prep.resY);
+        if (!visionRes.isPlanarPanel && removeBg && visionRes.fgMask && visionRes.fgMask.length === visionRes.width * visionRes.height) {
+          const fgFloat = new Float32Array(visionRes.fgMask.length);
+          for (let i = 0; i < fgFloat.length; i++) fgFloat[i] = visionRes.fgMask[i] / 255.0;
+          const resampledFg = NeuralVision._bilinearResample(fgFloat, visionRes.width, visionRes.height, prep.resX, prep.resY);
+          const maskU8 = new Uint8Array(prep.total);
+          let kCnt = 0;
+          for (let i = 0; i < prep.total; i++) {
+            if (resampledFg[i] >= 0.45) { maskU8[i] = 1; kCnt++; }
+          }
+          if (kCnt > prep.total * 0.02) {
+            prep.fgMask = Asset3DEngine.cleanSilhouetteMask(maskU8, prep.resX, prep.resY, visionRes.isGraphicLogo ? 0.00004 : 0.0004);
+            ImageVectorizer.removeCheckerboardPinches(prep.fgMask, prep.resX, prep.resY, false);
+            const { phi, dIn } = ImageVectorizer.computeSignedDistancePhi(prep.fgMask, prep.resX, prep.resY, 1.0);
+            prep.phi = phi;
+            prep.rawDist = dIn;
+            let mDist = 1.0;
+            for (let i = 0; i < prep.total; i++) if (dIn[i] > mDist) mDist = dIn[i];
+            prep.maxDist = mDist;
+            const smD = new Float32Array(dIn);
+            ImageVectorizer.gaussianSmooth2D(smD, prep.resX, prep.resY, Math.max(1.4, Math.min(prep.resX, prep.resY) * 0.022));
+            for (let i = 0; i < prep.total; i++) if (!prep.fgMask[i]) smD[i] = 0;
+            prep.smoothDist = smD;
+          }
         }
-        if (kept > prep.total * 0.05 && kept < prep.total * 0.96) {
-          prep.fgMask = Asset3DEngine.cleanSilhouetteMask(refinedFg, prep.resX, prep.resY);
-          ImageVectorizer.removeCheckerboardPinches(prep.fgMask, prep.resX, prep.resY, false);
-          const { phi, dIn } = ImageVectorizer.computeSignedDistancePhi(prep.fgMask, prep.resX, prep.resY, 1.0);
-          prep.phi = phi;
-          prep.rawDist = dIn;
-          let mDist = 1.0;
-          for (let i = 0; i < prep.total; i++) if (dIn[i] > mDist) mDist = dIn[i];
-          prep.maxDist = mDist;
-          const smD = new Float32Array(dIn);
-          ImageVectorizer.gaussianSmooth2D(smD, prep.resX, prep.resY, Math.max(1.4, Math.min(prep.resX, prep.resY) * 0.022));
-          for (let i = 0; i < prep.total; i++) if (!prep.fgMask[i]) smD[i] = 0;
-          prep.smoothDist = smD;
+      }
+    }
+
+    if (!prep) {
+      prep = Asset3DEngine._prepareCanvasAndMask(imgElement, { resolution, texSize, removeBg, delight, enhanceImage, invert, edgeStrength });
+      if (useNeuralAI && NeuralVision.isBrowserRuntime() && !prep.isGraphicLogo) {
+        const neuralRes = await NeuralVision.analyzeSubjectAsync(
+          imgElement,
+          prep.resX,
+          prep.resY,
+          {
+            enableDepth: true,
+            enableMatte: !prep.isPlanarPanel && !prep.isGraphicLogo && removeBg && !prep.hasTransparency,
+            srcCrop: prep.srcCrop,
+          },
+          (_st, pct, label) => {
+            if (typeof onProgress === 'function') onProgress(2, Math.max(12, Math.min(44, pct)), label);
+          }
+        );
+        if (neuralRes?.depth) {
+          prep.neuralDepth = neuralRes.depth;
+        }
+        if (neuralRes?.matte && !prep.isPlanarPanel && !prep.isGraphicLogo && removeBg && !prep.hasTransparency) {
+          const refinedFg = new Uint8Array(prep.total);
+          let kept = 0;
+          for (let i = 0; i < prep.total; i++) {
+            const on = neuralRes.matte[i] >= 0.44 || (prep.fgMask[i] && neuralRes.matte[i] >= 0.28);
+            if (on) { refinedFg[i] = 1; kept++; }
+          }
+          if (kept > prep.total * 0.04 && kept < prep.total * 0.96) {
+            prep.fgMask = Asset3DEngine.cleanSilhouetteMask(refinedFg, prep.resX, prep.resY, 0.0004);
+            ImageVectorizer.removeCheckerboardPinches(prep.fgMask, prep.resX, prep.resY, false);
+            const { phi, dIn } = ImageVectorizer.computeSignedDistancePhi(prep.fgMask, prep.resX, prep.resY, 1.0);
+            prep.phi = phi;
+            prep.rawDist = dIn;
+            let mDist = 1.0;
+            for (let i = 0; i < prep.total; i++) if (dIn[i] > mDist) mDist = dIn[i];
+            prep.maxDist = mDist;
+            const smD = new Float32Array(dIn);
+            ImageVectorizer.gaussianSmooth2D(smD, prep.resX, prep.resY, Math.max(1.4, Math.min(prep.resX, prep.resY) * 0.022));
+            for (let i = 0; i < prep.total; i++) if (!prep.fgMask[i]) smD[i] = 0;
+            prep.smoothDist = smD;
+          }
         }
       }
     }
@@ -228,8 +296,53 @@ export class Asset3DEngine {
     throw new Error('Meshy Cloud task timed out after 5 minutes.');
   }
 
+  static _detectGraphicLogo(rArr, gArr, bArr, luma255, W, H, hasTransparency) {
+    const total = W * H;
+    if (total < 64) return false;
+    const hist = new Uint32Array(256);
+    let extreme = 0;
+    for (let i = 0; i < total; i++) {
+      const l = Math.max(0, Math.min(255, Math.round(luma255[i])));
+      hist[l]++;
+      if (l < 52 || l > 204) extreme++;
+    }
+    const otsu = ImageVectorizer.computeOtsuStats(hist, total);
+    const oSpan = Math.abs(otsu.m2 - otsu.m1);
+    if (otsu.separability < 0.72 || oSpan < 54 || extreme / total < 0.62) return false;
+
+    let varIn = 0, cntIn = 0;
+    for (let i = 0; i < total; i += 2) {
+      const m = luma255[i] <= otsu.threshold ? otsu.m1 : otsu.m2;
+      const d = luma255[i] - m;
+      varIn += d * d;
+      cntIn++;
+    }
+    const modeStd = Math.sqrt(varIn / Math.max(1, cntIn));
+    if (modeStd > 38) return false;
+
+    if (hasTransparency) return true;
+    let bCnt = 0, bUniform = 0, bChroma = 0;
+    const sampleB = (idx) => {
+      bCnt++;
+      const d = Math.abs(luma255[idx] - luma255[0]);
+      if (d < 28) bUniform++;
+      bChroma += Math.max(rArr[idx], gArr[idx], bArr[idx]) - Math.min(rArr[idx], gArr[idx], bArr[idx]);
+    };
+    for (let x = 0; x < W; x += 2) { sampleB(x); sampleB((H - 1) * W + x); }
+    for (let y = 0; y < H; y += 2) { sampleB(y * W); sampleB(y * W + W - 1); }
+    return (bUniform / Math.max(1, bCnt)) >= 0.68 && (bChroma / Math.max(1, bCnt)) < 26;
+  }
+
   static _prepareCanvasAndMask(imgElement, opts) {
-    const { resolution = 160, texSize = 1024, removeBg = true, enhanceImage = false } = opts;
+    const {
+      resolution = 160,
+      texSize = 1024,
+      removeBg = true,
+      enhanceImage = false,
+      forceFullRect = false,
+      forcePlanarPanel = null,
+      forceGraphicLogo = null,
+    } = opts;
     const baseRes = Math.max(48, Math.min(1024, Math.round(resolution)));
     const iw = imgElement.naturalWidth || imgElement.width || 1;
     const ih = imgElement.naturalHeight || imgElement.height || 1;
@@ -287,9 +400,18 @@ export class Asset3DEngine {
         chromaL[i] = cl; chromaA[i] = ca; chromaB[i] = cb;
       }
 
+      const isGraphicLogo = forceGraphicLogo !== null
+        ? !!forceGraphicLogo
+        : Asset3DEngine._detectGraphicLogo(rArr, gArr, bArr, luma255, W, H, hasTransparency);
+
       const fgMask = keepFullRect
         ? new Uint8Array(total).fill(1)
-        : Asset3DEngine.extractBorderConnectedForeground(alpha, chromaL, chromaA, chromaB, W, H, { removeBg, hasTransparency });
+        : Asset3DEngine.extractBorderConnectedForeground(alpha, chromaL, chromaA, chromaB, W, H, {
+            removeBg,
+            hasTransparency,
+            punchInteriorBg: isGraphicLogo,
+            minAreaRatio: isGraphicLogo ? 0.00004 : 0.0004,
+          });
       if (!keepFullRect) ImageVectorizer.removeCheckerboardPinches(fgMask, W, H, false);
 
       let minFgX = W - 1, maxFgX = 0, minFgY = H - 1, maxFgY = 0, fgCount = 0;
@@ -325,7 +447,6 @@ export class Asset3DEngine {
         roiPanelDensity = pCnt / (roi.w * roi.h);
       }
 
-      // Guard against cropping full-bleed engraved signs/plaques: only snap fgMask to ROI when an exterior wall/frame differs from panel borders
       const hasOuterStripContrast = (() => {
         if (!roi || !roi.panelMask) return false;
         let outerTotal = 0, outerBg = 0;
@@ -342,13 +463,14 @@ export class Asset3DEngine {
         return outerTotal > W * H * 0.06 && (outerBg / Math.max(1, outerTotal)) >= 0.45;
       })();
 
-      const isFullBleedEngravedPlate = fillRatio >= 0.90 && fgBoxW >= W * 0.90 && fgBoxH >= H * 0.90 && !hasOuterStripContrast;
-      const isRoiWoodPanel = !isFullBleedEngravedPlate && !!(roi && roi.chromaMed >= 11 && roi.w > W * 0.28 && roi.h > H * 0.42 && roiPanelDensity >= 0.56);
-      const isWoodOrArch = !!(roi && roi.chromaMed >= 10 && fillRatio >= 0.78);
-      const isSolidRectPanel = fillRatio >= 0.88 && fgBoxW > W * 0.45 && fgBoxH > H * 0.45;
-      const isPlanarPanel = isRoiWoodPanel || isWoodOrArch || isSolidRectPanel;
+      const isFullBleedEngravedPlate = !isGraphicLogo && fillRatio >= 0.90 && fgBoxW >= W * 0.90 && fgBoxH >= H * 0.90 && !hasOuterStripContrast && !!(roi && roi.chromaMed >= 10);
+      const isRoiWoodPanel = !isFullBleedEngravedPlate && !isGraphicLogo && !!(roi && roi.chromaMed >= 10 && roi.w > W * 0.24 && roi.h > H * 0.36 && roiPanelDensity >= 0.50);
+      const isWoodOrArch = !isGraphicLogo && !!(roi && roi.chromaMed >= 10 && fillRatio >= 0.78);
+      const isPlanarPanel = forcePlanarPanel !== null
+        ? !!forcePlanarPanel
+        : (!isGraphicLogo && (!removeBg || isRoiWoodPanel || isWoodOrArch || isFullBleedEngravedPlate));
 
-      if (isPlanarPanel && roi && !isFullBleedEngravedPlate && hasOuterStripContrast && roi.chromaMed >= 10 && roi.w > W * 0.28 && roi.h > H * 0.42 && removeBg && !hasTransparency) {
+      if (isPlanarPanel && roi && !isFullBleedEngravedPlate && hasOuterStripContrast && roi.chromaMed >= 10 && roi.w > W * 0.24 && roi.h > H * 0.36 && removeBg && !hasTransparency) {
         for (let y = 0; y < H; y++) {
           const row = y * W;
           const inY = y >= roi.y0 && y <= roi.y1;
@@ -365,23 +487,22 @@ export class Asset3DEngine {
         resX: W, resY: H, total, rArr, gArr, bArr, luma, luma255, alpha, hasTransparency,
         fgMask, fgBox: { minX: minFgX, maxX: maxFgX, minY: minFgY, maxY: maxFgY },
         fgBoxW: maxFgX - minFgX + 1, fgBoxH: maxFgY - minFgY + 1,
-        isPlanarPanel, roi,
+        isPlanarPanel, isGraphicLogo, roi,
       };
     };
 
     const isRealDomImage = !!(imgElement && (imgElement.tagName === 'IMG' || imgElement.nodeName === 'IMG' || (typeof HTMLImageElement !== 'undefined' && imgElement instanceof HTMLImageElement)));
-    let data = extractMaskAndStats(rgba, resX, resY);
+    let data = extractMaskAndStats(rgba, resX, resY, forceFullRect && !!forcePlanarPanel);
 
-    if (isRealDomImage && removeBg && data.fgBox) {
+    if (!forceFullRect && isRealDomImage && removeBg && data.fgBox) {
       const { minX, maxX, minY, maxY } = data.fgBox;
       const bw = maxX - minX + 1;
       const bh = maxY - minY + 1;
       const covX = bw / resX;
       const covY = bh / resY;
-      if ((covX < 0.84 || covY < 0.84) && covX > 0.16 && covY > 0.16) {
-        // Planar panels already include clean inner wood margins from detectFurnitureROI -> zero pad prevents brick/sofa edge bleed
-        const padX = data.isPlanarPanel ? 0 : Math.max(2, Math.round(bw * 0.025));
-        const padY = data.isPlanarPanel ? 0 : Math.max(2, Math.round(bh * 0.025));
+      if ((covX < 0.84 || covY < 0.84) && covX > 0.14 && covY > 0.14) {
+        const padX = data.isPlanarPanel ? 0 : Math.max(3, Math.round(bw * 0.035));
+        const padY = data.isPlanarPanel ? 0 : Math.max(3, Math.round(bh * 0.035));
         const cx0 = Math.max(0, minX - padX);
         const cy0 = Math.max(0, minY - padY);
         const cx1 = Math.min(resX - 1, maxX + padX);
@@ -444,8 +565,25 @@ export class Asset3DEngine {
 
   static _solveSurfaceDepth(prep, opts) {
     const { delight = true, invert = false, edgeStrength = 0.36 } = opts;
-    const { resX, resY, total, rArr, gArr, bArr, luma, luma255, fgMask, fgBox, fgBoxW, fgBoxH, isPlanarPanel, roi, smoothDist, maxDist, depth, sculptSignal } = prep;
+    const { resX, resY, total, rArr, gArr, bArr, luma, luma255, fgMask, fgBox, fgBoxW, fgBoxH, isPlanarPanel, isGraphicLogo, roi, smoothDist, maxDist, depth, sculptSignal } = prep;
     const minDim = Math.min(resX, resY);
+
+    if (isGraphicLogo) {
+      // Multi-island 2D graphics, typography & logos: smooth isotropic medial-axis dome with crisp chamfered shoulders
+      const strokeRef = Math.max(2.0, Math.min(minDim * 0.048, maxDist * 0.54));
+      for (let i = 0; i < total; i++) {
+        if (!fgMask[i]) {
+          depth[i] = 0;
+          continue;
+        }
+        const u = Math.min(1.0, smoothDist[i] / strokeRef);
+        const profile = Math.sqrt(Math.max(0.0, 1.0 - (1.0 - u) * (1.0 - u)));
+        const zVal = Math.max(0.28, Math.min(0.98, 0.36 + profile * 0.60));
+        sculptSignal[i] = zVal;
+        depth[i] = zVal;
+      }
+      return;
+    }
 
     if (isPlanarPanel) {
       const smL = ImageVectorizer.guidedFilter(luma255, resX, resY, 1, 55);
@@ -610,8 +748,11 @@ export class Asset3DEngine {
         return;
       }
 
-      // Multi-Scale Planar Architectural / Carved Wood Door Relief
-      const cleanGrainL = ImageVectorizer.guidedFilter(cleanL, resX, resY, Math.max(2, Math.round(minDim * 0.011)), 145);
+      // Multi-Scale Planar Architectural / Carved Wood Door Relief with Glare Clamping & Edge-Locked Poisson SFS
+      const glareCeil = Math.max(p10 + 36, p92 * 1.03);
+      const glareSafeL = new Float32Array(total);
+      for (let i = 0; i < total; i++) glareSafeL[i] = Math.min(glareCeil, cleanL[i]);
+      const cleanGrainL = ImageVectorizer.guidedFilter(glareSafeL, resX, resY, Math.max(2, Math.round(minDim * 0.011)), 145);
       const minR = Math.max(2, Math.min(5, Math.round(minDim * 0.015)));
       const medR = Math.max(5, Math.min(18, Math.round(minDim * 0.055)));
       const planeR = Math.max(18, Math.round(minDim * 0.24));
@@ -622,23 +763,29 @@ export class Asset3DEngine {
       const closedM = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(cleanGrainL, resX, resY, medR, true), resX, resY, medR, false);
       const broadPlane = ImageVectorizer.maskedBoxMean(cleanGrainL, fgMask, resX, resY, planeR);
 
+      const grain01 = new Float32Array(total);
+      for (let i = 0; i < total; i++) grain01[i] = cleanGrainL[i] / 255.0;
+      const planarSfs = Asset3DEngine._solvePoissonDepthFromShading(rArr, gArr, bArr, grain01, fgMask, resX, resY);
+
       const pol = invert ? -1 : 1;
       const nDepth = prep.neuralDepth || null;
+      const railMargin = Math.max(4.0, minDim * 0.11);
       for (let i = 0; i < total; i++) {
         if (!fgMask[i]) continue;
-        const deLightedL = cleanGrainL[i] - (broadPlane[i] - (p10 + toneSpan * 0.45)) * 0.32;
+        const deLightedL = cleanGrainL[i] - (broadPlane[i] - (p10 + toneSpan * 0.45)) * 0.36;
         let macroElev = (deLightedL - p10) / toneSpan;
         if (invert) macroElev = 1.0 - macroElev;
         macroElev = Math.max(0.05, Math.min(1.0, macroElev));
 
         const wh = (Math.max(0, cleanGrainL[i] - openedS[i]) * 0.35 + Math.max(0, cleanGrainL[i] - openedM[i]) * 0.65) / 76.0;
         const bh = (Math.max(0, closedS[i] - cleanGrainL[i]) * 0.35 + Math.max(0, closedM[i] - cleanGrainL[i]) * 0.65) / 76.0;
-        // Soft-compress peak extremes so grain & specular highlights never become spikes in Solid Clay view
-        const rawMicro = (wh * 0.92 - bh * 0.80) * pol;
-        const microDelta = Math.tanh(rawMicro * 1.45) * 0.68;
+        const rawMicro = (wh * 0.90 - bh * 0.80) * pol;
+        const microDelta = Math.tanh(rawMicro * 1.40) * 0.66;
+        const pSfs = invert ? 1.0 - planarSfs[i] : planarSfs[i];
+        const railHold = Math.max(0.0, Math.min(1.0, smoothDist[i] / railMargin));
         const macroBase = nDepth
-          ? ((invert ? 1.0 - nDepth[i] : nDepth[i]) * 0.44 + macroElev * 0.56)
-          : macroElev;
+          ? ((invert ? 1.0 - nDepth[i] : nDepth[i]) * 0.48 + macroElev * 0.52)
+          : (macroElev * (1.0 - 0.32 * railHold) + pSfs * (0.32 * railHold));
         const zVal = Math.max(0.10, Math.min(1.0, macroBase * 0.68 + 0.16 + microDelta * 0.28));
         sculptSignal[i] = zVal;
         depth[i] = zVal;
@@ -1052,14 +1199,14 @@ export class Asset3DEngine {
    */
   static extractBorderConnectedForeground(alpha, L, A, B, W, H, ctxInfo) {
     const total = W * H;
-    const { removeBg, hasTransparency } = ctxInfo;
+    const { removeBg, hasTransparency, punchInteriorBg = false, minAreaRatio = 0.0004 } = ctxInfo;
     const fg = new Uint8Array(total);
 
     if (hasTransparency) {
       for (let i = 0; i < total; i++) {
         if (alpha[i] >= 96) fg[i] = 1;
       }
-      return Asset3DEngine.cleanSilhouetteMask(fg, W, H);
+      return Asset3DEngine.cleanSilhouetteMask(fg, W, H, minAreaRatio);
     }
 
     fg.fill(1);
@@ -1145,16 +1292,48 @@ export class Asset3DEngine {
       }
     }
 
+    // Punch enclosed interior background pockets (letters O/D/P/A & feather gaps) on bimodal logos
+    if (punchInteriorBg) {
+      for (let s = 0; s < total; s++) {
+        if (!fg[s] || visited[s]) continue;
+        const de0 = Math.hypot((L[s] - bgL) * 0.85, A[s] - bgA, B[s] - bgB);
+        if (de0 > 16) continue;
+        let kH = 0, kT = 0;
+        visited[s] = 1;
+        queue[kT++] = s;
+        while (kH < kT) {
+          const u = queue[kH++];
+          const ux = u % W, uy = (u - ux) / W;
+          for (let d = 0; d < 4; d++) {
+            if (d === 0 && ux === 0) continue;
+            if (d === 1 && ux === W - 1) continue;
+            if (d === 2 && uy === 0) continue;
+            if (d === 3 && uy === H - 1) continue;
+            const v = u + dirs[d];
+            if (!fg[v] || visited[v]) continue;
+            const deV = Math.hypot((L[v] - bgL) * 0.85, A[v] - bgA, B[v] - bgB);
+            if (deV <= 16) {
+              visited[v] = 1;
+              queue[kT++] = v;
+            }
+          }
+        }
+        if (kT < total * 0.16) {
+          for (let k = 0; k < kT; k++) fg[queue[k]] = 0;
+        }
+      }
+    }
+
     let fgCount = 0;
     for (let i = 0; i < total; i++) fgCount += fg[i];
-    if (fgCount < total * 0.04) fg.fill(1);
-    return Asset3DEngine.cleanSilhouetteMask(fg, W, H);
+    if (fgCount < total * 0.03) fg.fill(1);
+    return Asset3DEngine.cleanSilhouetteMask(fg, W, H, minAreaRatio);
   }
 
-  static cleanSilhouetteMask(fg, W, H) {
-    const closed = ImageVectorizer.morphClose(fg, W, H, 1);
+  static cleanSilhouetteMask(fg, W, H, minAreaRatio = 0.0004) {
+    const closed = ImageVectorizer.morphClose(fg, W, H, minAreaRatio < 0.0001 ? 0 : 1);
     const total = W * H;
-    const minCompPx = Math.max(18, Math.round(total * 0.002));
+    const minCompPx = Math.max(5, Math.round(total * minAreaRatio));
     const vis = new Uint8Array(total);
     const queue = new Int32Array(total);
     const dirs = [-1, 1, -W, W];
