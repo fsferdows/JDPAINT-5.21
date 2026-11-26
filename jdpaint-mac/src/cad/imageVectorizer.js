@@ -421,7 +421,8 @@ export class ImageVectorizer {
   static traceImageToVectors(img, widthMm = 100, heightMm = 100, options = {}) {
     const iw = img.naturalWidth || img.width || 1;
     const ih = img.naturalHeight || img.height || 1;
-    const maxDimension = (typeof options === 'object' && options.maxDimension) || 900;
+    const detailHint = typeof options === 'object' && typeof options.detail === 'number' ? options.detail : 0.7;
+    const maxDimension = (typeof options === 'object' && options.maxDimension) || Math.min(1152, Math.round(820 + detailHint * 332));
 
     let scaleW = maxDimension;
     let scaleH = Math.round((ih / iw) * maxDimension);
@@ -429,8 +430,8 @@ export class ImageVectorizer {
       scaleH = maxDimension;
       scaleW = Math.round((iw / ih) * maxDimension);
     }
-    scaleW = Math.max(120, Math.min(1024, scaleW));
-    scaleH = Math.max(120, Math.min(1024, scaleH));
+    scaleW = Math.max(120, Math.min(1152, scaleW));
+    scaleH = Math.max(120, Math.min(1152, scaleH));
 
     const canvas = document.createElement('canvas');
     canvas.width = scaleW;
@@ -461,7 +462,8 @@ export class ImageVectorizer {
     await report(1, 5, 'Step 1/5: Preparing high-res buffer & isolating furniture design ROI...');
     const iw = img.naturalWidth || img.width || 1;
     const ih = img.naturalHeight || img.height || 1;
-    const maxDimension = (typeof options === 'object' && options.maxDimension) || 960;
+    const detailHint = typeof options === 'object' && typeof options.detail === 'number' ? options.detail : 0.7;
+    const maxDimension = (typeof options === 'object' && options.maxDimension) || Math.min(1152, Math.round(840 + detailHint * 312));
 
     let scaleW = maxDimension;
     let scaleH = Math.round((ih / iw) * maxDimension);
@@ -469,8 +471,8 @@ export class ImageVectorizer {
       scaleH = maxDimension;
       scaleW = Math.round((iw / ih) * maxDimension);
     }
-    scaleW = Math.max(120, Math.min(1024, scaleW));
-    scaleH = Math.max(120, Math.min(1024, scaleH));
+    scaleW = Math.max(120, Math.min(1152, scaleW));
+    scaleH = Math.max(120, Math.min(1152, scaleH));
 
     const canvas = document.createElement('canvas');
     canvas.width = scaleW;
@@ -520,7 +522,7 @@ export class ImageVectorizer {
       localLighting = true,      // Compensate shadows on textured photos / wood
       noisePx = 12,              // Ignore tiny dust speckles < noisePx px^2
       minSpanMm = 0.9,
-      maxContours = 240,
+      maxContours = 480,
       maxDepthMm = 8.0,
     } = opts;
 
@@ -562,15 +564,19 @@ export class ImageVectorizer {
     const chromaSpread = Math.sqrt(varRg + varGb);
     const extremeRatio = extremeCount * invN;
 
-    // Resolve smart auto preset just like Adobe Illustrator + Monochrome Wood Detection
+    // Resolve smart auto preset just like Adobe Illustrator + Monochrome/Architectural Door Wood Detection
     let effectiveMode = traceMode;
     if (effectiveMode === 'auto') {
+      const autoRoi = ignoreBg && Math.min(scaleW, scaleH) >= 96
+        ? ImageVectorizer.detectFurnitureROI(rArr, gArr, bArr, lumaRaw, scaleW, scaleH)
+        : null;
+      const isArchitecturalPanel = !!(autoRoi && autoRoi.hasExternalBg && autoRoi.chromaMed >= 10 && autoRoi.w >= scaleW * 0.25 && autoRoi.h >= scaleH * 0.40);
       if (otsu.separability >= 0.78 && extremeRatio > 0.72 && chromaSpread < 0.12) {
         effectiveMode = 'bw-logo';
+      } else if (isArchitecturalPanel || (meanChroma >= 0.14 && chromaSpread < 0.16)) {
+        effectiveMode = 'wood';
       } else if (chromaSpread >= 0.16) {
         effectiveMode = 'color';
-      } else if (meanChroma >= 0.14) {
-        effectiveMode = 'wood';
       } else if (otsu.separability >= 0.76) {
         effectiveMode = 'bw-logo';
       } else {
@@ -1174,15 +1180,19 @@ export class ImageVectorizer {
     const n = w * h;
     const roi = ImageVectorizer.detectFurnitureROI(rArr, gArr, bArr, lumaRaw, w, h);
 
-    // 1. Suppress exterior background & non-wood colorful/neutral overlay watermarks + inpaint before morphology
+    // 1. Suppress exterior background & light/dark overlay watermarks + inpaint before morphology
     const rawRoiMask = new Uint8Array(n);
     const chromaMask = new Float32Array(n);
     const watermarkTol = roi.chromaMed > 14 ? 15 : 22;
+    const darkInkCand = new Uint8Array(n);
+    let darkInkCnt = 0;
+    let roiPixCnt = 0;
     let suppressedCount = 0;
     for (let y = roi.y0; y <= roi.y1; y++) {
       const row = y * w;
       for (let x = roi.x0; x <= roi.x1; x++) {
         const i = row + x;
+        roiPixCnt++;
         const dc = roi.chromaDiff[i];
         const rgbSat = Math.max(rArr[i], gArr[i], bArr[i]) - Math.min(rArr[i], gArr[i], bArr[i]);
         const isNeutralOverlay = roi.chromaMed > 14 && roi.L[i] > 84 && rgbSat < 18;
@@ -1191,8 +1201,26 @@ export class ImageVectorizer {
           rawRoiMask[i] = chromaMask[i] > 0.25 ? 1 : 0;
           if (!rawRoiMask[i]) suppressedCount++;
         } else {
+          if (roi.chromaMed >= 14) {
+            const isNeutralBlackInk = lumaRaw[i] < 40 && Math.abs(rArr[i] - bArr[i]) < 15 && dc > 11;
+            const isLogoAccent = (rArr[i] - gArr[i] > 42 && bArr[i] > gArr[i] + 10 && dc > 18)
+              || (rArr[i] - gArr[i] > 58 && rArr[i] - bArr[i] > 48 && dc > 22);
+            if (isNeutralBlackInk || isLogoAccent) {
+              darkInkCand[i] = 1;
+              darkInkCnt++;
+            }
+          }
           rawRoiMask[i] = 1;
           chromaMask[i] = 1.0;
+        }
+      }
+    }
+    if (darkInkCnt > 0 && darkInkCnt < Math.max(24, roiPixCnt * 0.045)) {
+      for (let i = 0; i < n; i++) {
+        if (darkInkCand[i]) {
+          rawRoiMask[i] = 0;
+          chromaMask[i] = 0;
+          suppressedCount++;
         }
       }
     }
@@ -1236,6 +1264,8 @@ export class ImageVectorizer {
       if ((minY <= roiEdgeTopMm || maxY >= roiEdgeBotMm) && eh < roi.h * sy * 0.04 && ew > roi.w * sx * 0.35) return false;
       if (filterGrainStreaks && ew >= eh * 3.8 && eh < roi.h * sy * 0.045 && (minX <= opts.bounds.x + 20 * sx || maxX >= opts.bounds.x + (w - 20) * sx)) return false;
       if (filterGrainStreaks && (minX <= opts.bounds.x + (roi.x0 + 48) * sx || maxX >= opts.bounds.x + (roi.x1 - 48) * sx) && ew * eh < opts.bounds.w * opts.bounds.h * 0.0025 && (!ent.holes || ent.holes.length === 0)) return false;
+      const aspectRatio = Math.max(ew, eh) / Math.max(0.25, Math.min(ew, eh));
+      if (!ent.holes?.length && aspectRatio >= 5.2 && Math.min(ew, eh) < Math.min(roi.w * sx, roi.h * sy) * 0.032) return false;
       const isOuterSpeck = (minX <= opts.bounds.x + (roi.x0 + 18) * sx || maxX >= opts.bounds.x + (roi.x1 - 18) * sx || minY <= opts.bounds.y + (roi.y0 + 18) * sy || maxY >= opts.bounds.y + (roi.y1 - 18) * sy)
         && ew * eh < roi.w * sx * roi.h * sy * 0.0022 && (!ent.holes || ent.holes.length === 0);
       if (isOuterSpeck) return false;
@@ -1447,7 +1477,7 @@ export class ImageVectorizer {
       grooveScalar[i] = -smoothGroove[i];
     }
 
-    // Prune isolated single-pixel wood grain nibs while filling 1px pinholes
+    // Prune isolated single-pixel wood grain nibs, run Meshy pinch cleanup & L2 SDF smoothing before marching contours
     const cleanR = ImageVectorizer.morphClose(raisedMask, w, h, 0);
     for (let y = yMin; y < yMax; y++) {
       const row = y * w;
@@ -1458,15 +1488,19 @@ export class ImageVectorizer {
         if (n4 <= 1) cleanR[i] = 0;
       }
     }
-    const rLoops = ImageVectorizer.marchSquares(cleanR, w, h, raisedScalar, -rTh);
+    ImageVectorizer.removeCheckerboardPinches(cleanR, w, h, true);
+    const { phi: phiR } = ImageVectorizer.computeSignedDistancePhi(cleanR, w, h, 0.85);
+    const sdfRaisedScalar = new Float32Array(n);
+    for (let i = 0; i < n; i++) sdfRaisedScalar[i] = raisedScalar[i] * 0.65 - phiR[i] * 24.0;
+    const rLoops = ImageVectorizer.marchSquares(cleanR, w, h, sdfRaisedScalar, -rTh * 0.65);
     const raisedEnts = filterWoodEnts(ImageVectorizer.vectorizeMaskLoops(rLoops, smoothRaised, w, h, -1, {
       ...opts,
       refineEdges: false,
       minAreaPx: minFeatureAreaPx,
       minSpanMm: minWoodSpanMm,
-      maxContours: Math.floor(opts.maxContours * 0.65),
-      fillColor: '#fbbf24',
-      strokeColor: '#fbbf24',
+      maxContours: Math.floor(Math.max(400, opts.maxContours) * 0.68),
+      fillColor: '#d9a45b',
+      strokeColor: '#38bdf8',
       layerGroup: 'Raised Petals & Motifs',
       namePrefix: 'Carved Motif',
       toneLevel: 2,
@@ -1508,15 +1542,19 @@ export class ImageVectorizer {
       }
     }
     const cleanG = ImageVectorizer.morphClose(bridgedG, w, h, 0);
-    const gLoops = ImageVectorizer.marchSquares(cleanG, w, h, grooveScalar, -gTh);
+    ImageVectorizer.removeCheckerboardPinches(cleanG, w, h, true);
+    const { phi: phiG } = ImageVectorizer.computeSignedDistancePhi(cleanG, w, h, 0.85);
+    const sdfGrooveScalar = new Float32Array(n);
+    for (let i = 0; i < n; i++) sdfGrooveScalar[i] = grooveScalar[i] * 0.65 - phiG[i] * 24.0;
+    const gLoops = ImageVectorizer.marchSquares(cleanG, w, h, sdfGrooveScalar, -gTh * 0.65);
     const grooveEnts = filterWoodEnts(ImageVectorizer.vectorizeMaskLoops(gLoops, smoothGroove, w, h, -1, {
       ...opts,
       refineEdges: false,
       minAreaPx: Math.max(8, Math.round(minFeatureAreaPx * 0.65)),
       minSpanMm: Math.max(0.85, minWoodSpanMm * 0.85),
-      maxContours: Math.floor(opts.maxContours * 0.45),
-      fillColor: '#0ea5e9',
-      strokeColor: '#38bdf8',
+      maxContours: Math.floor(Math.max(400, opts.maxContours) * 0.45),
+      fillColor: '#8c5a2b',
+      strokeColor: '#0ea5e9',
       layerGroup: 'Carved Grooves & Panels',
       namePrefix: 'Molding / Groove',
       toneLevel: 1,
@@ -1528,7 +1566,66 @@ export class ImageVectorizer {
       rejectFullFrame: true,
     }));
 
-    return [...grooveEnts, ...raisedEnts].slice(0, opts.maxContours);
+    // Include true sampled RGB fill tint & clean Panel Perimeter Frame when external room background was stripped
+    const combined = [...grooveEnts, ...raisedEnts];
+    for (const ent of combined) {
+      const pts = ent.points;
+      if (!pts || pts.length < 2) continue;
+      let cx = 0, cy = 0;
+      for (const p of pts) { cx += p.x; cy += p.y; }
+      cx /= pts.length; cy /= pts.length;
+      const px = Math.max(0, Math.min(w - 1, Math.round((cx - opts.bounds.x) / sx)));
+      const py = Math.max(0, Math.min(h - 1, Math.round((cy - opts.bounds.y) / sy)));
+      const pi = py * w + px;
+      const rC = Math.max(0, Math.min(255, Math.round(rArr[pi])));
+      const gC = Math.max(0, Math.min(255, Math.round(gArr[pi])));
+      const bC = Math.max(0, Math.min(255, Math.round(bArr[pi])));
+      ent.fillColor = `#${((1 << 24) + (rC << 16) + (gC << 8) + bC).toString(16).slice(1)}`;
+    }
+
+    // Fallback architectural edge rails for sleek paneled doors with few small carvings (e.g. modern walnut stile doors)
+    let archEnts = [];
+    if (combined.length < 32) {
+      const edgeOnly = ImageVectorizer.traceEdgeGrooves(rArr, gArr, bArr, lumaRaw, preMorphLuma, w, h, {
+        ...opts,
+        threshold: 0.22,
+        maxContours: 90,
+      }).filter((e) => {
+        if (!e.points || e.points.length === 0) return false;
+        let inRoi = true;
+        for (const p of e.points) {
+          if (p.x < roiEdgeLeftMm - 1 || p.x > roiEdgeRightMm + 1 || p.y < roiEdgeTopMm - 1 || p.y > roiEdgeBotMm + 1) {
+            inRoi = false;
+            break;
+          }
+        }
+        return inRoi;
+      });
+      archEnts = edgeOnly;
+    }
+
+    if (roi.hasExternalBg) {
+      archEnts.unshift({
+        type: 'rect',
+        x: Number((opts.bounds.x + roi.x0 * sx).toFixed(3)),
+        y: Number((opts.bounds.y + roi.y0 * sy).toFixed(3)),
+        w: Number((roi.w * sx).toFixed(3)),
+        h: Number((roi.h * sy).toFixed(3)),
+        cornerRadius: 0,
+        isClosed: true,
+        color: '#22d3ee',
+        fillColor: '#c29258',
+        strokeColor: '#22d3ee',
+        width: 1.4,
+        name: 'Panel Perimeter Frame',
+        layerGroup: 'Architectural Frame',
+        toneLevel: 1,
+        toneTotal: 2,
+        relief: { enabled: false, shape: 'flat', heightMm: 0.4, radiusMm: 1.0, mode: 'max' },
+      });
+    }
+
+    return [...archEnts, ...combined].slice(0, Math.max(opts.maxContours, 520));
   }
 
   /**

@@ -10,6 +10,7 @@
     "start": "vite --open"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.3.2",
     "three": "^0.182.0"
   },
   "devDependencies": {

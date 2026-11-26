@@ -860,8 +860,11 @@ export class CadCanvas {
   // Auto-trace image into SEPARATE editable 2D CAD vector layers
   autoTraceReferenceImage(options = {}) {
     if (!this.refImage) return 0;
-    const { autoEnable3D = true, ...traceOpts } = options;
+    const { autoEnable3D = true, replacePrevious = false, ...traceOpts } = options;
     this.saveState();
+    if (replacePrevious) {
+      this.entities = this.entities.filter((e) => e.source !== 'trace');
+    }
     const vectors = ImageVectorizer.traceImageToVectors(
       this.refImage,
       this.workpieceWidth,
@@ -869,6 +872,7 @@ export class CadCanvas {
       traceOpts
     ).map((e) => {
       const ent = this.ensureEntityMetadata(e);
+      ent.source = 'trace';
       if (!autoEnable3D) ent.relief.enabled = false;
       return ent;
     });
@@ -889,8 +893,11 @@ export class CadCanvas {
    */
   async autoTraceReferenceImageAsync(options = {}, onProgress = null) {
     if (!this.refImage) return 0;
-    const { autoEnable3D = true, ...traceOpts } = options;
+    const { autoEnable3D = true, replacePrevious = false, ...traceOpts } = options;
     this.saveState();
+    if (replacePrevious) {
+      this.entities = this.entities.filter((e) => e.source !== 'trace');
+    }
     const traced = await ImageVectorizer.traceImageToVectorsAsync(
       this.refImage,
       this.workpieceWidth,
@@ -900,6 +907,7 @@ export class CadCanvas {
     );
     const vectors = traced.map((e) => {
       const ent = this.ensureEntityMetadata(e);
+      ent.source = 'trace';
       if (!autoEnable3D) ent.relief.enabled = false;
       return ent;
     });
@@ -4861,7 +4869,7 @@ export class CadCanvas {
   drawEntity(ctx, ent, isSelected) {
     const strokeCol = isSelected ? '#fbbf24' : ent.color || '#38bdf8';
     ctx.strokeStyle = strokeCol;
-    ctx.lineWidth = isSelected ? (ent.width || 1.5) + 0.7 : (ent.width || 1.5);
+    ctx.lineWidth = isSelected ? (ent.width || 1.5) + 0.7 : (ent.source === 'trace' ? 1.1 : (ent.width || 1.5));
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
 
@@ -4870,7 +4878,7 @@ export class CadCanvas {
       if (!useColor && !this.showFills) return;
       ctx.save();
       ctx.fillStyle = useColor ? targetEnt.fillColor : strokeCol;
-      ctx.globalAlpha = useColor ? (isSelected ? 0.36 : 0.22) : (isSelected ? 0.16 : 0.065);
+      ctx.globalAlpha = useColor ? (isSelected ? 0.30 : (targetEnt.source === 'trace' ? 0.14 : 0.22)) : (isSelected ? 0.16 : 0.065);
       ctx.fill('evenodd');
       ctx.restore();
     };

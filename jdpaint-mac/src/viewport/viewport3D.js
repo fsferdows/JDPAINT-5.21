@@ -36,6 +36,7 @@ export class Viewport3D {
     this.wireframe = false;
     this.showToolpaths = true;
     this.turntable = false;
+    this._dirty = true;
     this.onStatsChange = null;
 
     // Sculpting brush state
@@ -90,11 +91,11 @@ export class Viewport3D {
       // Headless fallback safely leaves scene.environment unset
     }
 
-    // 3-Point Studio Raking Lighting with 2048px soft shadows so every 3D petal/groove reads crisply!
-    const hemiLight = new THREE.HemisphereLight(0xf8fafc, 0x3a2a1d, 0.64);
+    // 3-Point Studio Raking Lighting with 2048px soft shadows balanced for clay sculpting & PBR metals
+    const hemiLight = new THREE.HemisphereLight(0xf8fafc, 0x3b2f26, 0.72);
     this.scene.add(hemiLight);
 
-    const dirLight1 = new THREE.DirectionalLight(0xfff7ea, 1.82);
+    const dirLight1 = new THREE.DirectionalLight(0xfff8ed, 1.48);
     dirLight1.position.set(140, -90, 125);
     dirLight1.castShadow = true;
     dirLight1.shadow.mapSize.width = 2048;
@@ -104,11 +105,11 @@ export class Viewport3D {
     this.scene.add(dirLight1);
     this.dirLight1 = dirLight1;
 
-    const dirLight2 = new THREE.DirectionalLight(0xbfdbfe, 0.66);
+    const dirLight2 = new THREE.DirectionalLight(0xc7dcf7, 0.74);
     dirLight2.position.set(-110, 150, 115);
     this.scene.add(dirLight2);
 
-    const rimLight = new THREE.DirectionalLight(0xffffff, 0.35);
+    const rimLight = new THREE.DirectionalLight(0xffffff, 0.32);
     rimLight.position.set(50, 220, 75);
     this.scene.add(rimLight);
 
@@ -292,6 +293,10 @@ export class Viewport3D {
     }
   }
 
+  requestRender() {
+    this._dirty = true;
+  }
+
   updateCameraPosition() {
     const r = this.spherical.radius;
     const phi = this.spherical.phi;
@@ -302,6 +307,7 @@ export class Viewport3D {
     this.camera.position.z = this.target.z + r * Math.cos(phi);
     this.camera.up.set(0, 0, 1);
     this.camera.lookAt(this.target);
+    this._dirty = true;
   }
 
   updateStageGuides() {
@@ -341,12 +347,40 @@ export class Viewport3D {
     }
   }
 
-  resetCamera() {
+  fitCameraToBox(box3, padding = 1.24) {
+    if (!box3 || box3.isEmpty()) return;
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    box3.getSize(size);
+    box3.getCenter(center);
+    this.target.copy(center);
+
+    const vFov = ((this.camera?.fov || 44) * Math.PI) / 180;
+    const aspect = Math.max(0.35, this.camera?.aspect || 1);
+    const hFov = 2 * Math.atan(Math.tan(vFov * 0.5) * aspect);
+    const radius = Math.max(12, 0.5 * Math.hypot(size.x, size.y, size.z));
+    const minSin = Math.sin(Math.min(vFov, hFov) * 0.5);
+    this.spherical.radius = Math.max(55, (radius / Math.max(0.14, minSin)) * padding);
+    this.updateCameraPosition();
+  }
+
+  fitCameraToActive() {
+    if (this.assetMesh) {
+      const box = new THREE.Box3().setFromObject(this.assetMesh);
+      this.fitCameraToBox(box, 1.26);
+      return;
+    }
     const w = this.relief.width || 100;
     const h = this.relief.height || 100;
-    this.target.set(w / 2, h / 2, (this.relief.maxDepth || 8) * 0.25);
-    this.spherical = { radius: Math.max(120, Math.max(w, h) * 1.62), theta: Math.PI / 5, phi: Math.PI / 4.0 };
-    this.updateCameraPosition();
+    const d = this.relief.maxDepth || 8;
+    const box = new THREE.Box3(new THREE.Vector3(0, 0, -4), new THREE.Vector3(w, h, d));
+    this.fitCameraToBox(box, 1.18);
+  }
+
+  resetCamera() {
+    this.spherical.theta = Math.PI / 5;
+    this.spherical.phi = Math.PI / 4.0;
+    this.fitCameraToActive();
   }
 
   buildMesh() {
@@ -440,6 +474,7 @@ export class Viewport3D {
     pos.needsUpdate = true;
     this.geometry.computeVertexNormals();
     this.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    this._dirty = true;
   }
 
   getBaseTint(type) {
@@ -590,6 +625,7 @@ export class Viewport3D {
         }
       });
     }
+    this._dirty = true;
   }
 
   _buildCanvasFromRgba(rgba, size) {
@@ -679,13 +715,8 @@ export class Viewport3D {
     this.scene.add(this.assetMesh);
 
     if (bb) {
-      const cx = (bb.min.x + bb.max.x) * 0.5;
-      const cy = (bb.min.y + bb.max.y) * 0.5;
-      const cz = (bb.min.z + bb.max.z) * 0.5 + this.assetMesh.position.z;
-      const maxSpan = Math.max(bb.max.x - bb.min.x, bb.max.y - bb.min.y, bb.max.z - bb.min.z, 24);
-      this.target.set(cx, cy, cz);
-      this.spherical.radius = Math.max(70, Math.min(260, maxSpan * 1.38));
-      this.updateCameraPosition();
+      const worldBox = bb.clone().translate(this.assetMesh.position);
+      this.fitCameraToBox(worldBox, 1.26);
     }
 
     if (this.mesh) this.mesh.visible = false;
@@ -822,13 +853,7 @@ export class Viewport3D {
           };
 
           const finalBox = new THREE.Box3().setFromObject(root);
-          const fCenter = new THREE.Vector3();
-          const fSize = new THREE.Vector3();
-          finalBox.getCenter(fCenter);
-          finalBox.getSize(fSize);
-          this.target.copy(fCenter);
-          this.spherical.radius = Math.max(70, Math.min(260, Math.max(fSize.x, fSize.y, fSize.z) * 1.5));
-          this.updateCameraPosition();
+          this.fitCameraToBox(finalBox, 1.24);
 
           if (this.mesh) this.mesh.visible = false;
           if (this.baseSlab) this.baseSlab.visible = false;
@@ -847,9 +872,8 @@ export class Viewport3D {
     this._disposeAssetTextures();
     if (this.mesh) this.mesh.visible = true;
     if (this.baseSlab) this.baseSlab.visible = true;
-    this.target.set((this.relief.width || 100) * 0.5, (this.relief.height || 100) * 0.5, 0);
-    this.spherical.radius = 175;
-    this.updateCameraPosition();
+    this.resetCamera();
+    this._dirty = true;
     this._emitStats();
   }
 
@@ -868,10 +892,10 @@ export class Viewport3D {
 
     if (mode === 'solid') {
       return new THREE.MeshStandardMaterial({
-        color: 0xe2ddd5,
-        roughness: Math.max(0.18, Math.min(0.92, adj.roughness)),
-        metalness: 0.05,
-        envMapIntensity: 0.72,
+        color: 0xd6cfc7,
+        roughness: Math.max(0.22, Math.min(0.88, adj.roughness * 0.86)),
+        metalness: 0.04,
+        envMapIntensity: 0.58,
         wireframe: this.wireframe,
         side: THREE.DoubleSide,
       });
@@ -907,6 +931,7 @@ export class Viewport3D {
     if (this.assetMesh.isMesh) {
       this.assetMesh.material.dispose();
       this.assetMesh.material = this._createAssetMaterial();
+      this._dirty = true;
       return;
     }
     const mode = this.shadingMode || 'standard';
@@ -917,10 +942,10 @@ export class Viewport3D {
       if (mode === 'solid') {
         if (!child.userData._solidMat) {
           child.userData._solidMat = new THREE.MeshStandardMaterial({
-            color: 0xe2ddd5,
-            roughness: Math.max(0.18, Math.min(0.92, adj.roughness)),
-            metalness: 0.05,
-            envMapIntensity: 0.72,
+            color: 0xd6cfc7,
+            roughness: Math.max(0.22, Math.min(0.88, adj.roughness * 0.86)),
+            metalness: 0.04,
+            envMapIntensity: 0.58,
             side: THREE.DoubleSide,
           });
         }
@@ -932,6 +957,7 @@ export class Viewport3D {
         mats.forEach((m) => { if (m) m.wireframe = this.wireframe; });
       }
     });
+    this._dirty = true;
   }
 
   setShadingMode(mode) {
@@ -957,6 +983,7 @@ export class Viewport3D {
       } else {
         this.setMaterial(this.currentMaterialType);
       }
+      this._dirty = true;
     }
   }
 
@@ -1141,6 +1168,10 @@ export class Viewport3D {
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height);
+    if (this.assetMesh) {
+      this.fitCameraToActive();
+    }
+    this._dirty = true;
   }
 
   animate() {
@@ -1149,6 +1180,9 @@ export class Viewport3D {
       this.spherical.theta += 0.008;
       this.updateCameraPosition();
     }
-    this.renderer.render(this.scene, this.camera);
+    if (this._dirty || this.isRotating || this.isPanning || this._simTimer !== null) {
+      this.renderer.render(this.scene, this.camera);
+      this._dirty = false;
+    }
   }
 }

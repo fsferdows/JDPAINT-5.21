@@ -885,11 +885,12 @@
               <div id="asset-progress-label" style="font-size:10px;color:#333;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">Preparing 5-stage pipeline...</div>
             </div>
             <details style="margin-top:6px;border-top:1px solid #d4d0c4;padding-top:4px;">
-              <summary style="cursor:pointer;font-size:11px;font-weight:600;color:#1e3a8a;">⚡ Engine Source / Meshy Cloud API (Optional)</summary>
+              <summary style="cursor:pointer;font-size:11px;font-weight:600;color:#1e3a8a;">⚡ Engine Source / Neural AI &amp; Meshy API</summary>
               <div class="row" style="margin-top:4px;">
                 <label>Engine Mode:</label>
                 <select id="asset-engine-mode" class="win-input">
-                  <option value="local" selected>Offline 5-Stage Meshy SDF</option>
+                  <option value="hybrid" selected>Hybrid AI (Depth-Anything V2 + Meshy SDF)</option>
+                  <option value="local">Offline Instant (Meshy SDF + Taubin Fairing)</option>
                   <option value="cloud">Meshy Cloud AI v1 (API Key)</option>
                 </select>
               </div>
@@ -897,7 +898,7 @@
                 <label>Meshy API Key:</label>
                 <input type="password" id="asset-meshy-key" class="win-input" placeholder="msy_... (optional)" style="flex:1;">
               </div>
-              <div style="font-size:10px;color:#555;line-height:1.25;margin-top:3px;">Offline uses L2 SDF, slope-aware rolling-ball fillet &amp; Poisson dome locally. Cloud mode sends to api.meshy.ai for full 360° neural GLB.</div>
+              <div style="font-size:10px;color:#555;line-height:1.25;margin-top:3px;">Hybrid AI runs Depth-Anything V2 + MODNet WebGPU/WASM in browser, fused with Taubin fairing &amp; rolling-ball filleting. Cloud mode uses api.meshy.ai.</div>
             </details>
           </fieldset>
 

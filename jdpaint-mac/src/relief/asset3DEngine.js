@@ -1,5 +1,6 @@
 import { ImageVectorizer } from '../cad/imageVectorizer.js';
 import { VectorPuffEngine } from '../cad/vectorPuffEngine.js';
+import { NeuralVision } from '../ai/neuralVision.js';
 
 /**
  * Meshy-Architecture Volumetric Image-to-3D Reconstruction Engine & PBR Synthesizer.
@@ -33,22 +34,65 @@ export class Asset3DEngine {
       widthMm = 100,
       heightMm = 100,
       thicknessMm = 22,
+      useNeuralAI = true,
     } = options;
 
-    await emit(1, 10, `Stage 1/5: Rasterizing high-density aspect grid & isolating subject (${resolution}px tier)...`);
+    await emit(1, 8, `Stage 1/5: Rasterizing high-density aspect grid & isolating subject (${resolution}px tier)...`);
     const prep = Asset3DEngine._prepareCanvasAndMask(imgElement, { resolution, texSize, removeBg, delight, invert, edgeStrength });
 
-    await emit(2, 32, `Stage 2/5: Computing Felzenszwalb L2 SDF & ${prep.isPlanarPanel ? 'Planar CNC Relief' : 'Jacobi Poisson 3D Volume'}...`);
+    if (useNeuralAI && NeuralVision.isBrowserRuntime()) {
+      const neuralRes = await NeuralVision.analyzeSubjectAsync(
+        imgElement,
+        prep.resX,
+        prep.resY,
+        {
+          enableDepth: true,
+          enableMatte: !prep.isPlanarPanel && removeBg && !prep.hasTransparency,
+          srcCrop: prep.srcCrop,
+        },
+        (_st, pct, label) => {
+          if (typeof onProgress === 'function') onProgress(2, Math.max(12, Math.min(44, pct)), label);
+        }
+      );
+      if (neuralRes?.depth) {
+        prep.neuralDepth = neuralRes.depth;
+      }
+      if (neuralRes?.matte && !prep.isPlanarPanel && removeBg && !prep.hasTransparency) {
+        const refinedFg = new Uint8Array(prep.total);
+        let kept = 0;
+        for (let i = 0; i < prep.total; i++) {
+          const on = neuralRes.matte[i] >= 0.42 || (prep.fgMask[i] && neuralRes.matte[i] >= 0.25);
+          if (on) { refinedFg[i] = 1; kept++; }
+        }
+        if (kept > prep.total * 0.05 && kept < prep.total * 0.96) {
+          prep.fgMask = Asset3DEngine.cleanSilhouetteMask(refinedFg, prep.resX, prep.resY);
+          ImageVectorizer.removeCheckerboardPinches(prep.fgMask, prep.resX, prep.resY, false);
+          const { phi, dIn } = ImageVectorizer.computeSignedDistancePhi(prep.fgMask, prep.resX, prep.resY, 1.0);
+          prep.phi = phi;
+          prep.rawDist = dIn;
+          let mDist = 1.0;
+          for (let i = 0; i < prep.total; i++) if (dIn[i] > mDist) mDist = dIn[i];
+          prep.maxDist = mDist;
+          const smD = new Float32Array(dIn);
+          ImageVectorizer.gaussianSmooth2D(smD, prep.resX, prep.resY, Math.max(1.4, Math.min(prep.resX, prep.resY) * 0.022));
+          for (let i = 0; i < prep.total; i++) if (!prep.fgMask[i]) smD[i] = 0;
+          prep.smoothDist = smD;
+        }
+      }
+    }
+
+    await emit(2, 46, `Stage 2/5: Computing ${prep.neuralDepth ? 'Depth-Anything V2 + ' : ''}Felzenszwalb L2 SDF & ${prep.isPlanarPanel ? 'Planar CNC Relief' : 'Jacobi Poisson 3D Volume'}...`);
     Asset3DEngine._solveSurfaceDepth(prep, { delight, invert, edgeStrength });
 
-    await emit(3, 56, `Stage 3/5: Applying Meshy [1,4,6,4,1] steep-slope rolling-ball edge fillet (r=${filletRatio.toFixed(3)})...`);
+    await emit(3, 64, `Stage 3/5: Applying Volume-Preserving Taubin Fairing & Sobel Rolling-Ball Fillet (r=${filletRatio.toFixed(3)})...`);
+    Asset3DEngine.taubinSmoothDepth(prep.depth, prep.fgMask, prep.resX, prep.resY, prep.isPlanarPanel ? 3 : 4);
     Asset3DEngine.applySlopeAwareFillet(prep.depth, prep.fgMask, prep.resX, prep.resY, prep.aspect >= 1 ? widthMm : widthMm * prep.aspect, thicknessMm, filletRatio);
 
-    await emit(4, 78, `Stage 4/5: Newton-Raphson zero-isocontour rim snapping & manifold ${assetMode.toUpperCase()} mesh (${prep.resX}×${prep.resY})...`);
+    await emit(4, 82, `Stage 4/5: Newton-Raphson zero-isocontour rim snapping & watertight manifold ${assetMode.toUpperCase()} mesh (${prep.resX}×${prep.resY})...`);
     const analysis = Asset3DEngine._finalizeAnalysis(prep, { texSize, removeBg, delight });
     const meshData = Asset3DEngine.buildAssetMeshData(analysis, { assetMode, widthMm, heightMm, thicknessMm });
 
-    await emit(5, 96, 'Stage 5/5: Synthesizing 1024px Voronoi-padded BaseColor, Normal, Roughness & ORM PBR maps...');
+    await emit(5, 96, 'Stage 5/5: Synthesizing 1024px Cavity-AO BaseColor, Normal, Roughness & ORM PBR maps...');
     await emit(5, 100, `Complete: ${meshData.stats.faces.toLocaleString()} watertight faces ready!`);
 
     return { analysis, meshData };
@@ -245,12 +289,30 @@ export class Asset3DEngine {
         roiPanelDensity = pCnt / (roi.w * roi.h);
       }
 
-      const isRoiWoodPanel = !!(roi && roi.chromaMed >= 11 && roi.w > W * 0.28 && roi.h > H * 0.42 && roiPanelDensity >= 0.56);
+      // Guard against cropping full-bleed engraved signs/plaques: only snap fgMask to ROI when an exterior wall/frame differs from panel borders
+      const hasOuterStripContrast = (() => {
+        if (!roi || !roi.panelMask) return false;
+        let outerTotal = 0, outerBg = 0;
+        for (let y = 0; y < H; y++) {
+          const row = y * W;
+          const outY = y < roi.y0 || y > roi.y1;
+          for (let x = 0; x < W; x++) {
+            if (outY || x < roi.x0 || x > roi.x1) {
+              outerTotal++;
+              if (!roi.panelMask[row + x]) outerBg++;
+            }
+          }
+        }
+        return outerTotal > W * H * 0.06 && (outerBg / Math.max(1, outerTotal)) >= 0.45;
+      })();
+
+      const isFullBleedEngravedPlate = fillRatio >= 0.90 && fgBoxW >= W * 0.90 && fgBoxH >= H * 0.90 && !hasOuterStripContrast;
+      const isRoiWoodPanel = !isFullBleedEngravedPlate && !!(roi && roi.chromaMed >= 11 && roi.w > W * 0.28 && roi.h > H * 0.42 && roiPanelDensity >= 0.56);
       const isWoodOrArch = !!(roi && roi.chromaMed >= 10 && fillRatio >= 0.78);
       const isSolidRectPanel = fillRatio >= 0.88 && fgBoxW > W * 0.45 && fgBoxH > H * 0.45;
       const isPlanarPanel = isRoiWoodPanel || isWoodOrArch || isSolidRectPanel;
 
-      if (isPlanarPanel && roi && roi.chromaMed >= 10 && roi.w > W * 0.28 && roi.h > H * 0.42 && removeBg && !hasTransparency) {
+      if (isPlanarPanel && roi && !isFullBleedEngravedPlate && hasOuterStripContrast && roi.chromaMed >= 10 && roi.w > W * 0.28 && roi.h > H * 0.42 && removeBg && !hasTransparency) {
         for (let y = 0; y < H; y++) {
           const row = y * W;
           const inY = y >= roi.y0 && y <= roi.y1;
@@ -317,6 +379,9 @@ export class Asset3DEngine {
     return {
       ...data,
       aspect: activeAspect,
+      srcCrop: { x: srcCropX, y: srcCropY, w: srcCropW, h: srcCropH },
+      neuralDepth: null,
+      _wmMask: null,
       phi,
       rawDist,
       smoothDist,
@@ -362,7 +427,8 @@ export class Asset3DEngine {
             } else if (roi.chromaMed >= 14) {
               // Printed dark watermark ink (neutral charcoal black with near-zero R-B warmth) & colored logo accents
               const isNeutralBlackInk = luma255[i] < 40 && Math.abs(rArr[i] - bArr[i]) < 15 && dc > 11;
-              const isLogoAccent = rArr[i] - gArr[i] > 42 && bArr[i] > gArr[i] + 10 && dc > 18;
+              const isLogoAccent = (rArr[i] - gArr[i] > 42 && bArr[i] > gArr[i] + 10 && dc > 18)
+                || (rArr[i] - gArr[i] > 58 && rArr[i] - bArr[i] > 48 && dc > 22);
               if (isNeutralBlackInk || isLogoAccent) {
                 darkWmCand[i] = 1;
                 darkWmCnt++;
@@ -405,6 +471,7 @@ export class Asset3DEngine {
       if (hasWm) {
         const fillL = ImageVectorizer.maskedBoxMean(smL, validMask, resX, resY, Math.max(5, Math.round(minDim * 0.05)));
         for (let i = 0; i < total; i++) if (wmMask[i]) cleanL[i] = fillL[i];
+        prep._wmMask = wmMask;
       }
 
       const vHist = new Uint32Array(256);
@@ -506,6 +573,7 @@ export class Asset3DEngine {
       const broadPlane = ImageVectorizer.maskedBoxMean(cleanL, fgMask, resX, resY, planeR);
 
       const pol = invert ? -1 : 1;
+      const nDepth = prep.neuralDepth || null;
       for (let i = 0; i < total; i++) {
         if (!fgMask[i]) continue;
         const deLightedL = cleanL[i] - (broadPlane[i] - (p10 + toneSpan * 0.45)) * 0.32;
@@ -513,21 +581,26 @@ export class Asset3DEngine {
         if (invert) macroElev = 1.0 - macroElev;
         macroElev = Math.max(0.05, Math.min(1.0, macroElev));
 
-        const wh = (Math.max(0, cleanL[i] - openedS[i]) * 0.35 + Math.max(0, cleanL[i] - openedM[i]) * 0.65) / 72.0;
-        const bh = (Math.max(0, closedS[i] - cleanL[i]) * 0.35 + Math.max(0, closedM[i] - cleanL[i]) * 0.65) / 72.0;
-        const microDelta = (wh * 1.15 - bh * 0.90) * pol;
-        const zVal = Math.max(0.10, Math.min(1.0, macroElev * 0.64 + 0.16 + microDelta * 0.44));
+        const wh = (Math.max(0, cleanL[i] - openedS[i]) * 0.35 + Math.max(0, cleanL[i] - openedM[i]) * 0.65) / 76.0;
+        const bh = (Math.max(0, closedS[i] - cleanL[i]) * 0.35 + Math.max(0, closedM[i] - cleanL[i]) * 0.65) / 76.0;
+        // Soft-compress peak extremes so grain & specular highlights never become spikes in Solid Clay view
+        const rawMicro = (wh * 0.92 - bh * 0.80) * pol;
+        const microDelta = Math.tanh(rawMicro * 1.45) * 0.68;
+        const macroBase = nDepth
+          ? ((invert ? 1.0 - nDepth[i] : nDepth[i]) * 0.44 + macroElev * 0.56)
+          : macroElev;
+        const zVal = Math.max(0.10, Math.min(1.0, macroBase * 0.68 + 0.16 + microDelta * 0.28));
         sculptSignal[i] = zVal;
         depth[i] = zVal;
       }
 
-      const smoothPlanar = ImageVectorizer.guidedFilter(depth, resX, resY, 2, 0.008);
+      const smoothPlanar = ImageVectorizer.guidedFilter(depth, resX, resY, 2, 0.012);
       for (let i = 0; i < total; i++) depth[i] = fgMask[i] ? Math.max(0.10, Math.min(1.0, smoothPlanar[i])) : 0;
       return;
     }
 
-    // Organic 3D Cutout / Sculpture Solver (Exact L2 Harmonic Envelope + Jacobi Poisson Surface Solver)
-    const lumaSmooth = ImageVectorizer.guidedFilter(luma, resX, resY, 2, 0.012);
+    // Organic 3D Cutout / Sculpture Solver (Neural Depth + L2 Harmonic Envelope + Jacobi Poisson Surface Solver)
+    const lumaSmooth = ImageVectorizer.guidedFilter(luma, resX, resY, 2, 0.016);
     const rMed = Math.max(3, Math.min(10, Math.round(minDim * 0.032)));
     const openedMed = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(lumaSmooth, resX, resY, rMed, false), resX, resY, rMed, true);
     const closedMed = ImageVectorizer.separableExtrema(ImageVectorizer.separableExtrema(lumaSmooth, resX, resY, rMed, true), resX, resY, rMed, false);
@@ -544,7 +617,7 @@ export class Asset3DEngine {
         const bh = Math.max(0, closedMed[i] - lumaSmooth[i]);
         let tone = delight ? lumaSmooth[i] * 0.52 + (lumaSmooth[i] - localMean + 0.5) * 0.48 : lumaSmooth[i];
         if (invert) tone = 1.0 - tone;
-        const sig = tone * 0.54 + (wh * 1.25 - bh * 0.95) * (invert ? -1 : 1) * 0.46;
+        const sig = tone * 0.56 + Math.tanh((wh * 1.1 - bh * 0.85) * 1.5) * 0.30 * (invert ? -1 : 1);
         sculptSignal[i] = sig;
         if (sig < sMin) sMin = sig;
         if (sig > sMax) sMax = sig;
@@ -552,6 +625,7 @@ export class Asset3DEngine {
     }
 
     const sSpan = Math.max(0.08, sMax - sMin);
+    const nDepth = prep.neuralDepth || null;
     const combinedDepth = new Float32Array(total);
     for (let y = 1; y < resY - 1; y++) {
       for (let x = 1; x < resX - 1; x++) {
@@ -562,8 +636,13 @@ export class Asset3DEngine {
         const normSculpt = Math.max(0.0, Math.min(1.0, (sculptSignal[i] - sMin) / sSpan));
         const gx = lumaSmooth[i + 1] - lumaSmooth[i - 1];
         const gy = lumaSmooth[i + resX] - lumaSmooth[i - resX];
-        const edgeCrest = Math.min(0.14, Math.hypot(gx, gy) * edgeStrength * 0.65);
-        combinedDepth[i] = Math.max(0.08, Math.min(1.0, macroDome * 0.48 + normSculpt * 0.46 + edgeCrest * 0.14));
+        const edgeCrest = Math.min(0.10, Math.hypot(gx, gy) * edgeStrength * 0.45);
+        if (nDepth) {
+          const nd = invert ? 1.0 - nDepth[i] : nDepth[i];
+          combinedDepth[i] = Math.max(0.08, Math.min(1.0, nd * 0.62 + macroDome * 0.24 + normSculpt * 0.14 + edgeCrest * 0.08));
+        } else {
+          combinedDepth[i] = Math.max(0.08, Math.min(1.0, macroDome * 0.54 + normSculpt * 0.38 + edgeCrest * 0.10));
+        }
       }
     }
 
@@ -681,10 +760,108 @@ export class Asset3DEngine {
     }
   }
 
+  /**
+   * Volume-preserving Taubin (lambda / mu) bilateral surface fairing: removes high-frequency
+   * photo grain & needle spikes while preserving sculptural ridges without shrinkage.
+   */
+  static taubinSmoothDepth(depth, fgMask, W, H, passes = 4) {
+    if (!depth || !fgMask || W < 8 || H < 8 || passes <= 0) return;
+    const total = W * H;
+    const next = new Float32Array(depth);
+    const lambdas = [0.50, -0.53];
+    for (let p = 0; p < passes * 2; p++) {
+      const k = lambdas[p & 1];
+      next.set(depth);
+      for (let y = 1; y < H - 1; y++) {
+        const row = y * W;
+        for (let x = 1; x < W - 1; x++) {
+          const i = row + x;
+          if (!fgMask[i]) continue;
+          const nbs = [i - 1, i + 1, i - W, i + W];
+          let sum = 0, wSum = 0;
+          for (const ni of nbs) {
+            if (!fgMask[ni]) continue;
+            const dz = depth[ni] - depth[i];
+            const wt = Math.exp(-(dz * dz) * 18.0);
+            sum += depth[ni] * wt;
+            wSum += wt;
+          }
+          if (wSum > 0.1) {
+            const avg = sum / wSum;
+            next[i] = Math.max(0.08, Math.min(1.0, depth[i] + k * (avg - depth[i])));
+          }
+        }
+      }
+      depth.set(next);
+    }
+  }
+
+  /**
+   * Inpaint overlay watermarks cleanly in the 1024px color texture from nearby valid texels.
+   */
+  static inpaintTextureWatermark(texRgba, tSize, wmMask, fgW, fgH) {
+    if (!texRgba || !wmMask || !fgW || !fgH) return;
+    const n = tSize * tSize;
+    const wmTex = new Uint8Array(n);
+    const sxScale = (fgW - 1) / Math.max(1, tSize - 1);
+    const syScale = (fgH - 1) / Math.max(1, tSize - 1);
+    const queue = new Int32Array(n);
+    const filled = new Uint8Array(n);
+    let qH = 0, qT = 0;
+
+    for (let y = 0; y < tSize; y++) {
+      const sy = Math.min(fgH - 1, Math.round(y * syScale));
+      const fRow = sy * fgW, tRow = y * tSize;
+      for (let x = 0; x < tSize; x++) {
+        const sx = Math.min(fgW - 1, Math.round(x * sxScale));
+        const idx = tRow + x;
+        if (wmMask[fRow + sx]) {
+          wmTex[idx] = 1;
+        } else {
+          filled[idx] = 1;
+        }
+      }
+    }
+
+    const dirs = [-1, 1, -tSize, tSize];
+    for (let y = 1; y < tSize - 1; y++) {
+      const row = y * tSize;
+      for (let x = 1; x < tSize - 1; x++) {
+        const idx = row + x;
+        if (!filled[idx]) continue;
+        if (wmTex[idx - 1] || wmTex[idx + 1] || wmTex[idx - tSize] || wmTex[idx + tSize]) {
+          queue[qT++] = idx;
+        }
+      }
+    }
+    while (qH < qT) {
+      const u = queue[qH++];
+      const ux = u % tSize, uy = (u - ux) / tSize;
+      const up = u * 4;
+      for (let d = 0; d < 4; d++) {
+        if (d === 0 && ux === 0) continue;
+        if (d === 1 && ux === tSize - 1) continue;
+        if (d === 2 && uy === 0) continue;
+        if (d === 3 && uy === tSize - 1) continue;
+        const v = u + dirs[d];
+        if (filled[v]) continue;
+        filled[v] = 1;
+        const vp = v * 4;
+        texRgba[vp] = texRgba[up];
+        texRgba[vp + 1] = texRgba[up + 1];
+        texRgba[vp + 2] = texRgba[up + 2];
+        queue[qT++] = v;
+      }
+    }
+  }
+
   static _finalizeAnalysis(prep, opts) {
     const { texSize = 1024, removeBg = true, delight = true } = opts;
-    const { resX, resY, fgMask, fgBox, hasTransparency, isPlanarPanel, aspect, phi, smoothDist, rawDist, maxDist, depth, sculptSignal, texRgba } = prep;
+    const { resX, resY, fgMask, fgBox, hasTransparency, isPlanarPanel, aspect, phi, smoothDist, rawDist, maxDist, depth, sculptSignal, texRgba, _wmMask } = prep;
 
+    if (_wmMask) {
+      Asset3DEngine.inpaintTextureWatermark(texRgba, texSize, _wmMask, resX, resY);
+    }
     Asset3DEngine.dilateTextureEdges(texRgba, texSize, fgMask, resX, resY, removeBg && !hasTransparency);
     const maps = Asset3DEngine.synthesizePBRMaps(texRgba, texSize, delight, fgMask, resX, resY);
 
@@ -981,9 +1158,11 @@ export class Asset3DEngine {
         if (delight && a > 16) {
           const localMean = Math.max(0.18, ImageVectorizer.getLocalMean(sat, size, size, x, y, rIllum));
           const gain = Math.max(0.76, Math.min(1.38, (0.54 / localMean) * 0.42 + 0.58));
-          baseColor[p] = Math.min(255, Math.round(r * gain));
-          baseColor[p + 1] = Math.min(255, Math.round(g * gain));
-          baseColor[p + 2] = Math.min(255, Math.round(b * gain));
+          // Subtle sculpted cavity AO improves depth clarity in both Standard PBR and Unlit modes
+          const cavityAO = Math.max(0.84, 1.0 - Math.max(0, localMean - lum[i]) * 0.42);
+          baseColor[p] = Math.min(255, Math.round(r * gain * cavityAO));
+          baseColor[p + 1] = Math.min(255, Math.round(g * gain * cavityAO));
+          baseColor[p + 2] = Math.min(255, Math.round(b * gain * cavityAO));
           baseColor[p + 3] = 255;
         }
 
@@ -1378,11 +1557,11 @@ export class Asset3DEngine {
           zF = isRim ? Math.max(minRimZ, halfT * rimChamfer) : Math.max(minRimZ, halfT * dNorm);
           zB = isRim ? -Math.max(minRimZ * 0.85, halfT * rimChamfer * backScale) : -Math.max(minRimZ * 0.85, halfT * backScale * dNorm);
         } else if (assetMode === 'inflated') {
-          zF = isRim ? minRimZ : Math.max(minRimZ, halfT * (macroSmooth * 0.56 + dNorm * 0.44));
-          zB = isRim ? -minRimZ : -Math.max(minRimZ, halfT * backScale * (macroSmooth * 0.72 + dNorm * 0.28));
+          zF = isRim ? minRimZ : Math.max(minRimZ, halfT * (macroSmooth * 0.48 + dNorm * 0.52));
+          zB = isRim ? -minRimZ : -Math.max(minRimZ, halfT * backScale * (macroSmooth * 0.78 + dNorm * 0.22));
         } else {
-          zF = isRim ? minRimZ : Math.max(minRimZ, halfT * dNorm);
-          zB = isRim ? -minRimZ : -Math.max(minRimZ, halfT * backScale * (macroSmooth * 0.65 + dNorm * 0.35));
+          zF = isRim ? minRimZ : Math.max(minRimZ, halfT * (macroSmooth * 0.20 + dNorm * 0.80));
+          zB = isRim ? -minRimZ : -Math.max(minRimZ, halfT * backScale * (macroSmooth * 0.72 + dNorm * 0.28));
         }
 
         frontMap[vi] = pushVert(gx, gy, zF);

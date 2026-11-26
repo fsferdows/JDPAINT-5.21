@@ -1008,17 +1008,45 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const opts = getTraceOptions();
     statusMode.textContent = `Step 1/5: Initializing (${opts.traceMode.toUpperCase()}, ${Math.round(opts.detail * 100)}% detail)...`;
+
+    // Sync clean sculpted base height so 3D view renders coherent carved relief instead of isolated jagged shards
+    reliefEngine.loadImageHighAccuracy(loadedImageElement, {
+      style: document.getElementById('relief-style')?.value || 'sculpted',
+      edgeStrength: parseFloat(document.getElementById('relief-edge-strength')?.value || '0.35') || 0.35,
+      invert: opts.invert,
+      removeWhiteBg: document.getElementById('relief-remove-bg')?.checked ?? true,
+      denoise: true,
+    });
+    basePhotoBuffer = new Float32Array(reliefEngine.data);
+
     const count = await cadCanvas.autoTraceReferenceImageAsync({
       ...opts,
       smoothCurves: true,
       autoEnable3D: true,
+      replacePrevious: true,
     }, (prog) => {
       statusMode.textContent = prog.label;
     });
+
+    // Dim photo underlay cleanly to 16% so extracted 2D CAD contours read clearly rather than a blurry overlay
+    cadCanvas.refImageOpacity = 0.16;
+    if (sliderPicOpacity) sliderPicOpacity.value = '16';
+    if (labelPicOpacity) labelPicOpacity.textContent = '16%';
+    cadCanvas.requestRender();
+
+    const tracedTail = count > 0 ? cadCanvas.entities.slice(-count) : [];
+    const isWoodOrArch = tracedTail.some((e) => e.layerGroup === 'Raised Petals & Motifs' || e.layerGroup === 'Carved Grooves & Panels' || e.layerGroup === 'Architectural Frame');
+    basePhotoEnabled = true;
+    basePhotoWeight = isWoodOrArch ? 0.72 : 0.55;
+    if (chkClipBaseTo2d) chkClipBaseTo2d.checked = !isWoodOrArch;
+    updateBasePhotoBox();
+    rebuild3DFromLayers(true);
+    viewport3D.fitCameraToActive();
+
     selectTool('select');
     renderLayerList();
     syncSelectedLayerInspector();
-    statusMode.textContent = `Auto-Trace complete! Generated ${count} accurate 2D layers (${opts.traceMode}). Use Click Pen (Q) or Node Edit (N) to customize any curve!`;
+    statusMode.textContent = `Auto-Trace complete! Extracted ${count} clean 2D CAD vector shapes (${opts.traceMode}) + synced 3D relief. Use Opacity slider or Click Pen (Q) to inspect/edit!`;
   }
 
   document.getElementById('btn-auto-trace-2d').addEventListener('click', runAutoTrace2D);
@@ -1212,7 +1240,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const delight = document.getElementById('asset-delight')?.checked ?? true;
     const invert = document.getElementById('relief-invert-check')?.checked || false;
     const edgeStrength = parseFloat(document.getElementById('relief-edge-strength')?.value || '0.38') || 0.38;
-    const engineMode = document.getElementById('asset-engine-mode')?.value || 'local';
+    const engineMode = document.getElementById('asset-engine-mode')?.value || 'hybrid';
     const meshyKey = (document.getElementById('asset-meshy-key')?.value || '').trim();
 
     const progWrap = document.getElementById('asset-progress-wrap');
@@ -1259,6 +1287,7 @@ document.addEventListener('DOMContentLoaded', () => {
             invert,
             edgeStrength,
             filletRatio,
+            useNeuralAI: engineMode !== 'local',
             widthMm: reliefEngine.width || 100,
             heightMm: reliefEngine.height || 100,
             thicknessMm,
@@ -1275,6 +1304,8 @@ document.addEventListener('DOMContentLoaded', () => {
       const assetTabBtn = document.getElementById('tab-btn-asset');
       if (assetTabBtn) assetTabBtn.click();
       if (panel3D.style.display === 'none') setViewMode('split');
+      viewport3D.onResize();
+      viewport3D.fitCameraToActive();
 
       const { faces, vertices } = meshStats;
       statusMode.textContent = `3D Asset ready (${engineMode === 'cloud' ? 'Meshy Cloud' : assetMode}) — ${faces.toLocaleString()} triangles, ${vertices.toLocaleString()} vertices! Export .GLB / .STL / .OBJ anytime.`;
