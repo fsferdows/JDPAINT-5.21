@@ -10,7 +10,7 @@ function cadKernelHealthPlugin() {
     name: 'cad-kernel-health-proxy',
     configureServer(server) {
       server.middlewares.use('/__cad_health', (_req, res) => {
-        const probe = http.get('http://127.0.0.1:5174/health', { timeout: 600 }, (upstream) => {
+        const probe = http.get('http://127.0.0.1:5174/health', { timeout: 2000 }, (upstream) => {
           let body = '';
           upstream.setEncoding('utf8');
           upstream.on('data', (chunk) => { body += chunk; });

@@ -26,6 +26,7 @@ export class Viewport3D {
     this.cutterMesh = null;
     this.dirLight1 = null;
     this._textures = {};
+    this._designPhotoTex = null;
     this._solidMatCapTex = null;
     this._simTimer = null;
     this._simSegments = [];
@@ -462,7 +463,7 @@ export class Viewport3D {
             avgNbr = (data[idx - 1] + data[idx + 1] + data[idx - res] + data[idx + res]) * 0.25;
           }
           const cavity = Math.max(0, avgNbr - normZ);
-          const shade = Math.max(0.84, Math.min(1.10, 0.94 + normZ * 0.14 - cavity * 0.85));
+          const shade = Math.max(0.74, Math.min(1.12, 0.90 + normZ * 0.18 - cavity * 1.45));
           colors[pIdx * 3] = shade;
           colors[pIdx * 3 + 1] = shade;
           colors[pIdx * 3 + 2] = shade;
@@ -580,6 +581,43 @@ export class Viewport3D {
     return tex;
   }
 
+  /**
+   * Align loaded reference picture onto the relief mesh UVs for true Standard photo-mapped PBR inspection.
+   */
+  setReferenceDesignTexture(imgElement, fitBounds = null) {
+    if (this._designPhotoTex) {
+      this._designPhotoTex.dispose();
+      this._designPhotoTex = null;
+    }
+    if (imgElement && typeof document !== 'undefined') {
+      const S = 1024;
+      const canvas = document.createElement('canvas');
+      canvas.width = S;
+      canvas.height = S;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#8b6a4b';
+      ctx.fillRect(0, 0, S, S);
+      const ww = this.relief.width || 100;
+      const wh = this.relief.height || 100;
+      const b = fitBounds || { x: 0, y: 0, w: ww, h: wh };
+      const dx = (b.x / ww) * S;
+      const dy = (b.y / wh) * S;
+      const dw = (b.w / ww) * S;
+      const dh = (b.h / wh) * S;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(imgElement, dx, dy, dw, dh);
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.wrapS = THREE.ClampToEdgeWrapping;
+      tex.wrapT = THREE.ClampToEdgeWrapping;
+      tex.needsUpdate = true;
+      this._designPhotoTex = tex;
+    }
+    if (this.mesh && !this.assetMesh) {
+      this.setShadingMode(this.shadingMode);
+    }
+  }
+
   setMaterial(type) {
     this.currentMaterialType = type;
     if (this.mesh) {
@@ -596,7 +634,8 @@ export class Viewport3D {
   }
 
   createMaterial(type) {
-    const tex = this.getProceduralTexture(type);
+    const useDesignPhoto = type === 'wood' && this._designPhotoTex && (this.shadingMode === 'standard' || this.shadingMode === 'lit');
+    const tex = useDesignPhoto ? this._designPhotoTex : this.getProceduralTexture(type);
     if (type === 'jade') {
       return new THREE.MeshPhysicalMaterial({
         map: tex,
@@ -613,8 +652,8 @@ export class Viewport3D {
       return new THREE.MeshStandardMaterial({
         map: tex,
         vertexColors: true,
-        color: 0xffffff,
-        roughness: 0.48,
+        color: useDesignPhoto ? 0xf8f3ee : 0xffffff,
+        roughness: useDesignPhoto ? 0.44 : 0.48,
         metalness: 0.04,
       });
     } else if (type === 'brass') {
@@ -720,8 +759,8 @@ export class Viewport3D {
         const fill = Math.max(0, nnx * fx + nny * fy + nnz * fz);
         const hemi = 0.5 + 0.5 * nny;
         const fresnel = Math.pow(Math.max(0, 1.0 - nnz), 2.35);
-        const spec = Math.pow(Math.max(0, nnx * nhx + nny * nhy + nnz * nhz), 28) * 0.20;
-        const lum = Math.max(0.14, Math.min(0.95, 0.34 + hemi * 0.16 + key * 0.36 + fill * 0.12 + fresnel * 0.14 + spec));
+        const spec = Math.pow(Math.max(0, nnx * nhx + nny * nhy + nnz * nhz), 28) * 0.16;
+        const lum = Math.max(0.10, Math.min(0.92, 0.16 + hemi * 0.14 + key * 0.48 + fill * 0.10 + fresnel * 0.12 + spec));
         const rC = Math.round(Math.min(255, lum * 246 + fresnel * 8));
         const gC = Math.round(Math.min(255, lum * 248 + fresnel * 10));
         const bC = Math.round(Math.min(255, lum * 252 + fresnel * 16));
@@ -983,9 +1022,9 @@ export class Viewport3D {
     if (mode === 'solid') {
       return new THREE.MeshMatcapMaterial({
         matcap: this._getMeshyStudioMatCap(),
-        color: 0xf4f6f9,
+        color: 0xeaf0f6,
         normalMap: this._assetTextures.normal || null,
-        normalScale: new THREE.Vector2(0.45 * (adj.contrast || 1.0), 0.45 * (adj.contrast || 1.0)),
+        normalScale: new THREE.Vector2(0.88 * (adj.contrast || 1.0), 0.88 * (adj.contrast || 1.0)),
         wireframe: this.wireframe,
         side: THREE.DoubleSide,
       });
@@ -1077,13 +1116,13 @@ export class Viewport3D {
         this.mesh.material = new THREE.MeshMatcapMaterial({
           matcap: this._getMeshyStudioMatCap(),
           vertexColors: true,
-          color: 0xf4f6f9,
+          color: 0xeaf0f6,
           wireframe: this.wireframe,
         });
       } else if (mode === 'unlit') {
         this.mesh.material.dispose();
         this.mesh.material = new THREE.MeshBasicMaterial({
-          map: this.getProceduralTexture(this.currentMaterialType),
+          map: (this.currentMaterialType === 'wood' && this._designPhotoTex) ? this._designPhotoTex : this.getProceduralTexture(this.currentMaterialType),
           vertexColors: true,
           wireframe: this.wireframe,
         });

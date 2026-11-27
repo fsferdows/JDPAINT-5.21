@@ -120,7 +120,7 @@ export class CadKernelBridge {
   }
 
   static async vectorizeViaVision(imgElement, widthMm = 100, heightMm = 100, options = {}) {
-    const health = await CadKernelBridge.checkHealth(600, { passive: true });
+    const health = await CadKernelBridge.checkHealth(2000, { passive: true });
     if (!health?.ok || !health?.vision_ai) return null;
     const imageB64 = CadKernelBridge._encodeImageB64(imgElement, 2048);
     if (!imageB64) return null;
@@ -144,7 +144,7 @@ export class CadKernelBridge {
   }
 
   static async reconstruct3DViaVision(imgElement, options = {}) {
-    const health = await CadKernelBridge.checkHealth(600, { passive: true });
+    const health = await CadKernelBridge.checkHealth(2000, { passive: true });
     if (!health?.ok || !health?.vision_ai) return null;
     const imageB64 = CadKernelBridge._encodeImageB64(imgElement, 1800);
     if (!imageB64) return null;

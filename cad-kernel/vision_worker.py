@@ -221,13 +221,14 @@ def _inpaint_watermarks(sub_bgr: np.ndarray, dc_sub: np.ndarray, L_sub: np.ndarr
     """Suppress neutral bright overlays, anti-aliased fringe ink text & chromatic stamps."""
     b, g, r = cv2.split(sub_bgr)
     rgb_sat = np.maximum(np.maximum(r, g), b).astype(np.int16) - np.minimum(np.minimum(r, g), b).astype(np.int16)
-    luma_raw = (0.2126 * r + 0.7152 * g + 0.0722 * b)
+    luma_raw = 0.2126 * r + 0.7152 * g + 0.0722 * b
 
-    is_bright_wm = (L_sub > l_med + 12.0) & (rgb_sat < 26) & (dc_sub > 16.0)
-    is_neutral_ink = (luma_raw < 35.0) & (rgb_sat < 14) & (dc_sub > 15.0)
-    is_logo_accent = (r.astype(np.int16) - g.astype(np.int16) > 36) & (dc_sub > 18.0)
+    is_bright_wm = (L_sub > l_med + 14.0) & (rgb_sat < 24) & (dc_sub > 17.0)
+    is_neutral_ink = (luma_raw < 34.0) & (rgb_sat < 14) & (dc_sub > 16.0)
+    is_red_accent = (r.astype(np.int16) - g.astype(np.int16) > 95) & (dc_sub > 32.0)
+    is_blue_accent = (b.astype(np.int16) - r.astype(np.int16) > 28) & (dc_sub > 18.0)
 
-    cand = is_bright_wm | is_neutral_ink | is_logo_accent
+    cand = is_bright_wm | is_neutral_ink | is_red_accent | is_blue_accent
     tot_px = sub_bgr.shape[0] * sub_bgr.shape[1]
     wm_u8 = np.zeros((sub_bgr.shape[0], sub_bgr.shape[1]), dtype=np.uint8)
     if 0 < int(cand.sum()) < int(tot_px * 0.045):
@@ -237,8 +238,8 @@ def _inpaint_watermarks(sub_bgr: np.ndarray, dc_sub: np.ndarray, L_sub: np.ndarr
             if 4 <= int(stats[ci, cv2.CC_STAT_AREA]) <= max_comp:
                 wm_u8[lbls == ci] = 255
     if int(wm_u8.sum()) > 0:
-        wm_u8 = cv2.dilate(wm_u8, np.ones((3, 3), np.uint8), iterations=1)
-        cleaned = cv2.inpaint(sub_bgr, wm_u8, 4, cv2.INPAINT_TELEA)
+        wm_u8 = cv2.dilate(wm_u8, np.ones((4, 4), np.uint8), iterations=1)
+        cleaned = cv2.inpaint(sub_bgr, wm_u8, 5, cv2.INPAINT_TELEA)
         return cleaned, wm_u8
     return sub_bgr, wm_u8
 
@@ -481,6 +482,109 @@ def _parse_svg_paths_to_entities(
     return entities
 
 
+def _solve_planar_relief_heightmap(sub_bgr: np.ndarray) -> np.ndarray:
+    """Compute a de-tilted multi-scale CNC relief heightmap combining SFS, TopHat/BlackHat & local de-lighted tone."""
+    ch, cw = sub_bgr.shape[:2]
+    fg_mask = np.full((ch, cw), 255, dtype=np.uint8)
+    den = cv2.fastNlMeansDenoisingColored(sub_bgr, None, 5, 5, 7, 21)
+    epf_c = cv2.edgePreservingFilter(den, flags=cv2.NORMCONV_FILTER, sigma_s=18, sigma_r=0.20)
+    sfs = _solve_photometric_sfs_fft(epf_c, fg_mask)
+
+    Lc = cv2.bilateralFilter(cv2.cvtColor(epf_c, cv2.COLOR_BGR2LAB)[:, :, 0], 7, 22, 16).astype(np.float32) / 255.0
+    m_dim = min(cw, ch)
+    k_s = max(5, int(round(m_dim * 0.015)) | 1)
+    k_m = max(13, int(round(m_dim * 0.050)) | 1)
+    k_bg = max(31, int(round(m_dim * 0.22)) | 1)
+    bg_l = cv2.GaussianBlur(Lc, (k_bg, k_bg), 0)
+    delight = np.clip((Lc - bg_l) * 1.45 + 0.5, 0.0, 1.0)
+
+    ker_s = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_s, k_s))
+    ker_m = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_m, k_m))
+    wh3 = cv2.morphologyEx(delight, cv2.MORPH_TOPHAT, ker_s) * 0.45 + cv2.morphologyEx(delight, cv2.MORPH_TOPHAT, ker_m) * 0.55
+    bh3 = cv2.morphologyEx(delight, cv2.MORPH_BLACKHAT, ker_s) * 0.45 + cv2.morphologyEx(delight, cv2.MORPH_BLACKHAT, ker_m) * 0.55
+
+    # Soft-core micro plank grain in flat areas while keeping sharp carved steps intact
+    diff_m = wh3 * 2.5 - bh3 * 2.3
+    abs_m = np.abs(diff_m)
+    noise_band = max(0.03, float(np.percentile(abs_m, 45)))
+    grain_gate = np.clip((abs_m - noise_band * 0.55) / max(1e-4, noise_band * 1.6), 0.15, 1.0)
+    morph3 = np.clip(0.5 + diff_m * grain_gate * 0.52, 0.0, 1.0)
+
+    rel = sfs * 0.34 + morph3 * 0.46 + delight * 0.20
+    lo, hi = float(np.percentile(rel, 2)), float(np.percentile(rel, 98))
+    return np.clip((rel - lo) / max(1e-4, hi - lo), 0.04, 0.98).astype(np.float32)
+
+
+def _extract_ai_model_recovery_vectors(
+    sub_bgr: np.ndarray,
+    off_x: float,
+    off_y: float,
+    sx_mm: float,
+    sy_mm: float,
+    corners: float,
+) -> list[dict[str, Any]]:
+    """AI Depth-Anything + Photometric SFS fallback vectorizer when primary contrast tracking is sparse."""
+    import torch
+
+    vh, vw = sub_bgr.shape[:2]
+    relief = _solve_planar_relief_heightmap(sub_bgr)
+    try:
+        proc, model, device = _ensure_depth_model()
+        pil_in = Image.fromarray(cv2.cvtColor(sub_bgr, cv2.COLOR_BGR2RGB))
+        inputs = {k: v.to(device) for k, v in proc(images=pil_in, return_tensors="pt").items()}
+        with torch.no_grad():
+            pred = model(**inputs).predicted_depth
+        d_t = torch.nn.functional.interpolate(pred.unsqueeze(1), size=(vh, vw), mode="bicubic", align_corners=False).squeeze()
+        d_np = d_t.detach().float().cpu().numpy()
+        d_lo, d_hi = float(np.percentile(d_np, 3)), float(np.percentile(d_np, 97))
+        d_norm = np.clip((d_np - d_lo) / max(1e-4, d_hi - d_lo), 0.0, 1.0)
+        relief = np.clip(relief * 0.68 + d_norm * 0.32, 0.0, 1.0)
+    except Exception:
+        pass
+
+    # Extract balanced multi-level carved silhouette boundaries + adaptive edges
+    rel_u8 = np.clip(relief * 255.0, 0, 255).astype(np.uint8)
+    edge_c = cv2.Canny(rel_u8, 28, 78)
+    t_hi = np.where(rel_u8 >= int(np.percentile(rel_u8, 68)), 255, 0).astype(np.uint8)
+    t_lo = np.where(rel_u8 <= int(np.percentile(rel_u8, 26)), 255, 0).astype(np.uint8)
+    comb_m = cv2.bitwise_or(cv2.bitwise_xor(t_hi, t_lo), cv2.dilate(edge_c, np.ones((2, 2), np.uint8)))
+    comb_m = cv2.morphologyEx(comb_m, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+    bw_img = 255 - comb_m
+    ok_r, pb_r = cv2.imencode(".png", cv2.cvtColor(bw_img, cv2.COLOR_GRAY2BGR))
+    if not ok_r:
+        return []
+    svg_rec = vtracer.convert_raw_image_to_svg(
+        bytes(pb_r),
+        img_format="png",
+        colormode="binary",
+        mode="spline",
+        filter_speckle=8,
+        corner_threshold=int(round(36 + corners * 16)),
+        length_threshold=4.2,
+        splice_threshold=45,
+        path_precision=4,
+    )
+    ents = _parse_svg_paths_to_entities(svg_rec, off_x, off_y, sx_mm, sy_mm, "Carved Grooves & Panels")
+    span_w, span_h = vw * sx_mm, vh * sy_mm
+    out: list[dict[str, Any]] = []
+    for ent in ents:
+        pts = ent.get("points") or []
+        if not pts:
+            continue
+        if not ent.get("holes") and len(pts) <= 6:
+            xs = [p["x"] for p in pts]; ys = [p["y"] for p in pts]
+            if (max(xs) - min(xs)) >= span_w * 0.94 and (max(ys) - min(ys)) >= span_h * 0.94:
+                continue
+        ent["fillColor"] = None
+        ent["strokeColor"] = "#38bdf8"
+        ent["color"] = "#38bdf8"
+        ent["name"] = f"AI Relief Contour #{len(out) + 1}"
+        ent["relief"] = {"enabled": False, "shape": "smooth", "heightMm": 2.2, "radiusMm": 1.4, "mode": "max"}
+        out.append(ent)
+    return out
+
+
 def _extract_wood_relief_vectors(
     sub_bgr: np.ndarray,
     off_x: float,
@@ -490,47 +594,68 @@ def _extract_wood_relief_vectors(
     detail: float,
     corners: float,
 ) -> list[dict[str, Any]]:
-    """De-grain carved relief wood surfaces and extract smooth closed VTracer Cubic Bezier outlines."""
+    """Dual-scale de-grained carved relief extraction with thin Canny rail/bevel completion."""
     vh, vw = sub_bgr.shape[:2]
     den = cv2.fastNlMeansDenoisingColored(sub_bgr, None, 6, 6, 7, 21)
-    epf = cv2.edgePreservingFilter(den, flags=cv2.NORMCONV_FILTER, sigma_s=18, sigma_r=0.20)
-    lab = cv2.cvtColor(epf, cv2.COLOR_BGR2LAB)
-    L_u8 = lab[:, :, 0]
-    L_sm = cv2.bilateralFilter(L_u8, d=7, sigmaColor=22, sigmaSpace=16).astype(np.float32)
+    epf_c = cv2.edgePreservingFilter(den, flags=cv2.NORMCONV_FILTER, sigma_s=20, sigma_r=0.22)
+    epf_f = cv2.edgePreservingFilter(den, flags=cv2.NORMCONV_FILTER, sigma_s=10, sigma_r=0.14)
 
-    r_f = max(5, int(round(min(vw, vh) * 0.0065)) | 1)
-    r_m = max(11, int(round(min(vw, vh) * 0.018)) | 1)
-    bh_f = cv2.morphologyEx(L_sm, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_f, r_f)))
-    bh_m = cv2.morphologyEx(L_sm, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_m, r_m)))
-    bh = bh_f * 0.62 + bh_m * 0.58
+    Lc = cv2.bilateralFilter(cv2.cvtColor(epf_c, cv2.COLOR_BGR2LAB)[:, :, 0], d=7, sigmaColor=22, sigmaSpace=16).astype(np.float32)
+    Lf_u8 = cv2.bilateralFilter(cv2.cvtColor(epf_f, cv2.COLOR_BGR2LAB)[:, :, 0], d=5, sigmaColor=16, sigmaSpace=12)
+    Lf = Lf_u8.astype(np.float32)
 
-    gx = cv2.Scharr(L_sm, cv2.CV_32F, 1, 0) / 16.0
-    gy = cv2.Scharr(L_sm, cv2.CV_32F, 0, 1) / 16.0
-    gmag = np.hypot(gx, gy)
+    r_f = max(5, int(round(min(vw, vh) * 0.006)) | 1)
+    r_m = max(11, int(round(min(vw, vh) * 0.017)) | 1)
+    ker_f = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_f, r_f))
+    ker_m = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_m, r_m))
+
+    # Coarse gate isolates genuine carved motifs & frame rails while keeping flat bare wood stiles clean
+    bh_c = cv2.morphologyEx(Lc, cv2.MORPH_BLACKHAT, ker_f) * 0.62 + cv2.morphologyEx(Lc, cv2.MORPH_BLACKHAT, ker_m) * 0.58
+    gx_c = cv2.Scharr(Lc, cv2.CV_32F, 1, 0) / 16.0
+    gy_c = cv2.Scharr(Lc, cv2.CV_32F, 0, 1) / 16.0
+    g_c = np.hypot(gx_c, gy_c)
 
     detail_bias = (0.70 - float(np.clip(detail, 0.15, 1.0))) * 14.0
-    bh_med = float(np.median(bh))
-    bh_mad = float(np.median(np.abs(bh - bh_med)))
-    bh_floor = max(float(np.percentile(bh, 76)), bh_med + 3.6 * max(bh_mad, 1.25), 11.5) + detail_bias * 0.25
+    c_med = float(np.median(bh_c))
+    c_mad = float(np.median(np.abs(bh_c - c_med)))
+    gc_med = float(np.median(g_c))
+    gc_mad = float(np.median(np.abs(g_c - gc_med)))
 
-    g_med = float(np.median(gmag))
-    g_mad = float(np.median(np.abs(gmag - g_med)))
-    g_floor = max(float(np.percentile(gmag, 74)), g_med + 3.1 * max(g_mad, 1.25), 10.5) + detail_bias * 0.25
+    c_zone = (
+        (bh_c >= max(float(np.percentile(bh_c, 78)), c_med + 4.0 * max(c_mad, 1.3), 18.0) + detail_bias * 0.35)
+        | (g_c >= max(float(np.percentile(g_c, 78)), gc_med + 3.6 * max(gc_mad, 1.3), 16.5) + detail_bias * 0.35)
+    ).astype(np.uint8)
+    k_dil = max(11, int(round(min(vw, vh) * 0.013)) | 1)
+    zone_dil = cv2.dilate(c_zone, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_dil, k_dil)))
 
-    bh_score = np.clip((bh - bh_floor) * 3.1, 0, 255)
-    g_score = np.clip((gmag - g_floor) * 2.9, 0, 255) * 0.92
-    comb = np.maximum(bh_score, g_score).astype(np.uint8)
+    # Fine relief details (petals, louvers, moldings) strictly inside carved zones + thin Canny edge completion
+    bh_f = cv2.morphologyEx(Lf, cv2.MORPH_BLACKHAT, ker_f) * 0.65 + cv2.morphologyEx(Lf, cv2.MORPH_BLACKHAT, ker_m) * 0.55
+    gx_f = cv2.Scharr(Lf, cv2.CV_32F, 1, 0) / 16.0
+    gy_f = cv2.Scharr(Lf, cv2.CV_32F, 0, 1) / 16.0
+    g_f = np.hypot(gx_f, gy_f)
 
-    _, mask = cv2.threshold(comb, max(16, int(round(26 + detail_bias * 0.5))), 255, cv2.THRESH_BINARY)
+    bh_floor_f = max(float(np.percentile(bh_f, 72)), float(np.median(bh_f)) + 2.8 * max(float(np.median(np.abs(bh_f - np.median(bh_f)))), 1.1), 8.5) + detail_bias * 0.25
+    g_floor_f = max(float(np.percentile(g_f, 72)), float(np.median(g_f)) + 2.8 * max(float(np.median(np.abs(g_f - np.median(g_f)))), 1.1), 8.5) + detail_bias * 0.25
+
+    comb = np.maximum(np.clip((bh_f - bh_floor_f) * 3.1, 0, 255), np.clip((g_f - g_floor_f) * 2.8, 0, 255) * 0.90)
+    comb_masked = np.where((zone_dil > 0) | (bh_c > c_med + 5.5 * max(c_mad, 1.3)), comb, 0.0).astype(np.uint8)
+
+    med_v = float(np.median(Lf_u8))
+    canny_edges = cv2.Canny(Lf_u8, max(16, int(med_v * 0.35)), max(48, int(med_v * 0.90)))
+    canny_zone = cv2.bitwise_and(canny_edges, cv2.dilate(zone_dil, np.ones((7, 7), np.uint8)) * 255)
+    canny_dil = cv2.dilate(canny_zone, np.ones((2, 2), np.uint8))
+
+    _, mask = cv2.threshold(comb_masked, max(16, int(round(24 + detail_bias * 0.4))), 255, cv2.THRESH_BINARY)
+    mask = cv2.bitwise_or(mask, canny_dil)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
 
-    # Measure local carving density to filter flat bare-stile wood grain speckles while keeping strong flutes & rails
-    k_act = max(21, int(round(min(vw, vh) * 0.030)) | 1)
-    act_map = cv2.GaussianBlur((comb > 46).astype(np.float32), (k_act, k_act), 0)
+    # Measure local carving density to drop isolated stile noise speckles while preserving intricate motifs
+    k_act = max(21, int(round(min(vw, vh) * 0.028)) | 1)
+    act_map = cv2.GaussianBlur((comb_masked > 44).astype(np.float32), (k_act, k_act), 0)
 
     num_l, lbls, stats, _ = cv2.connectedComponentsWithStats(mask)
     clean_mask = np.zeros_like(mask)
-    min_area = max(30, int(vw * vh * 0.000030))
+    min_area = max(26, int(vw * vh * 0.000022))
     max_grain_w = max(16, int(vw * 0.014))
     for i in range(1, num_l):
         area = int(stats[i, cv2.CC_STAT_AREA])
@@ -541,18 +666,15 @@ def _extract_wood_relief_vectors(
         bw_i = int(stats[i, cv2.CC_STAT_WIDTH])
         bh_i = int(stats[i, cv2.CC_STAT_HEIGHT])
         comp_m = lbls[by_i : by_i + bh_i, bx_i : bx_i + bw_i] == i
-        sub_c = comb[by_i : by_i + bh_i, bx_i : bx_i + bw_i][comp_m]
-        p75 = float(np.percentile(sub_c, 75))
-        mn = float(sub_c.mean())
+        sub_c = comb_masked[by_i : by_i + bh_i, bx_i : bx_i + bw_i][comp_m]
         pk = int(sub_c.max())
+        mn = float(sub_c.mean())
         act_mn = float(act_map[by_i : by_i + bh_i, bx_i : bx_i + bw_i][comp_m].mean())
-        if p75 < 56.0 and area < min_area * 12:
+        if act_mn < 0.038 and pk < 94 and area < min_area * 12:
             continue
-        if act_mn < 0.045 and pk < 102 and area < min_area * 12:
+        if bh_i >= bw_i * 4.2 and bw_i <= max_grain_w and mn < 74.0 and pk < 105 and bh_i < vh * 0.22:
             continue
-        if bh_i >= bw_i * 4.0 and bw_i <= max_grain_w and mn < 74.0 and p75 < 92.0 and bh_i < vh * 0.22:
-            continue
-        if area < min_area * 4 and pk < 88 and mn < 48:
+        if area < min_area * 4 and pk < 78:
             continue
         clean_mask[lbls == i] = 255
 
@@ -567,7 +689,7 @@ def _extract_wood_relief_vectors(
         mode="spline",
         filter_speckle=max(5, int(round(12 - detail * 6))),
         corner_threshold=int(round(36 + corners * 16)),
-        length_threshold=4.0,
+        length_threshold=3.6,
         splice_threshold=45,
         path_precision=4,
     )
@@ -579,10 +701,12 @@ def _extract_wood_relief_vectors(
         pts = ent.get("points") or []
         if not pts:
             continue
-        xs = [p["x"] for p in pts]
-        ys = [p["y"] for p in pts]
-        if (max(xs) - min(xs)) >= span_w * 0.94 and (max(ys) - min(ys)) >= span_h * 0.94:
-            continue
+        # Never discard compound paths carrying inner motif holes (e.g. door lattices & rose rings)
+        if not ent.get("holes") and len(pts) <= 6:
+            xs = [p["x"] for p in pts]
+            ys = [p["y"] for p in pts]
+            if (max(xs) - min(xs)) >= span_w * 0.94 and (max(ys) - min(ys)) >= span_h * 0.94:
+                continue
         ent["fillColor"] = None
         ent["strokeColor"] = "#38bdf8"
         ent["color"] = "#38bdf8"
@@ -635,7 +759,7 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
             sub = np.clip(sub.astype(np.float32) * alpha_f + 255.0 * (1.0 - alpha_f), 0, 255).astype(np.uint8)
 
     sh0, sw0 = sub.shape[:2]
-    if roi is not None:
+    if roi is not None or not is_logo:
         if min(sw0, sh0) < 1200:
             sc = min(3.2, 1200.0 / max(1, min(sw0, sh0)))
             if max(sw0, sh0) * sc > 2800:
@@ -728,7 +852,11 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
     elif roi is not None and not is_engraved_wood_plaque:
         wood_ents = _extract_wood_relief_vectors(sub, off_x, off_y, sx_mm, sy_mm, detail, corners)
         entities.extend(wood_ents)
-        if len(entities) < 10:
+        total_rings = sum(1 + len(e.get("holes", [])) for e in entities)
+        if total_rings < 12:
+            ai_ents = _extract_ai_model_recovery_vectors(sub, off_x, off_y, sx_mm, sy_mm, corners)
+            entities.extend(ai_ents)
+        if sum(1 + len(e.get("holes", [])) for e in entities) < 10:
             den_c = cv2.fastNlMeansDenoisingColored(sub, None, 5, 5, 7, 21)
             ok_c, png_c = cv2.imencode(".png", den_c)
             if ok_c:
@@ -748,7 +876,7 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
                 )
                 for ent in _parse_svg_paths_to_entities(svg_col, off_x, off_y, sx_mm, sy_mm, "Vector Layer"):
                     pts = ent.get("points") or []
-                    if pts:
+                    if pts and not ent.get("holes") and len(pts) <= 6:
                         xs = [p["x"] for p in pts]
                         ys = [p["y"] for p in pts]
                         if (max(xs) - min(xs)) >= span_w * 0.94 and (max(ys) - min(ys)) >= span_h * 0.94:
@@ -795,12 +923,17 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
         )
         raw_ents = _parse_svg_paths_to_entities(svg_col, off_x, off_y, sx_mm, sy_mm, "Vector Layer")
         for ent in raw_ents:
-            if ignore_bg and ent["points"]:
+            if ignore_bg and ent["points"] and not ent.get("holes") and len(ent["points"]) <= 6:
                 xs = [p["x"] for p in ent["points"]]
                 ys = [p["y"] for p in ent["points"]]
                 if (max(xs) - min(xs)) >= span_w * 0.94 and (max(ys) - min(ys)) >= span_h * 0.94:
                     continue
             entities.append(ent)
+        if trace_mode in ("auto", "wood") and sum(1 + len(e.get("holes", [])) for e in entities) < 12:
+            rel_ents = _extract_wood_relief_vectors(sub, off_x, off_y, sx_mm, sy_mm, detail, corners)
+            entities.extend(rel_ents)
+            if sum(1 + len(e.get("holes", [])) for e in entities) < 12:
+                entities.extend(_extract_ai_model_recovery_vectors(sub, off_x, off_y, sx_mm, sy_mm, corners))
 
     return {
         "ok": True,
@@ -894,25 +1027,26 @@ def handle_reconstruct_3d(req: dict[str, Any]) -> dict[str, Any]:
         crop_bgra = np.dstack([rgb_up, a_up])
         ch, cw = crop_bgra.shape[:2]
 
-    # Run cached Depth-Anything-V2-Small-hf on M1 GPU
-    proc, model, device = _ensure_depth_model()
-    pil_in = Image.fromarray(cv2.cvtColor(crop_bgra[:, :, :3], cv2.COLOR_BGR2RGB))
-    inputs = proc(images=pil_in, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    with torch.no_grad():
-        pred = model(**inputs).predicted_depth
-    depth_t = torch.nn.functional.interpolate(
-        pred.unsqueeze(1), size=(ch, cw), mode="bicubic", align_corners=False
-    ).squeeze()
-    d_np = depth_t.detach().float().cpu().numpy()
-    d_lo, d_hi = float(np.percentile(d_np, 2)), float(np.percentile(d_np, 98))
-    depth_norm = np.clip((d_np - d_lo) / max(1e-5, d_hi - d_lo), 0.0, 1.0).astype(np.float32)
+    # Run cached Depth-Anything-V2-Small-hf on M1 GPU only for non-planar 3D objects/scenes
+    depth_norm = None
+    if not is_planar:
+        proc, model, device = _ensure_depth_model()
+        pil_in = Image.fromarray(cv2.cvtColor(crop_bgra[:, :, :3], cv2.COLOR_BGR2RGB))
+        inputs = proc(images=pil_in, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            pred = model(**inputs).predicted_depth
+        depth_t = torch.nn.functional.interpolate(
+            pred.unsqueeze(1), size=(ch, cw), mode="bicubic", align_corners=False
+        ).squeeze()
+        d_np = depth_t.detach().float().cpu().numpy()
+        d_lo, d_hi = float(np.percentile(d_np, 2)), float(np.percentile(d_np, 98))
+        depth_norm = np.clip((d_np - d_lo) / max(1e-5, d_hi - d_lo), 0.0, 1.0).astype(np.float32)
 
     # Foreground Mask Extraction tailored strictly per class
     if is_planar:
         fg_mask = np.full((ch, cw), 255, dtype=np.uint8)
-        sfs = _solve_photometric_sfs_fft(crop_bgra[:, :, :3], fg_mask)
-        depth_norm = np.clip(depth_norm * 0.48 + sfs * 0.52, 0.0, 1.0).astype(np.float32)
+        depth_norm = _solve_planar_relief_heightmap(crop_bgra[:, :, :3])
     elif is_logo:
         alpha = crop_bgra[:, :, 3]
         if float((alpha < 220).mean()) > 0.05:
@@ -958,8 +1092,8 @@ def handle_reconstruct_3d(req: dict[str, Any]) -> dict[str, Any]:
             except Exception:
                 pass
 
-    # Compute downsample transport buffer (max edge 512px) for browser WebGL mesh construction
-    max_t = 512
+    # Compute downsample transport buffer (max edge 640px) for crisp browser WebGL mesh construction
+    max_t = 640
     sc_t = min(1.0, max_t / max(cw, ch))
     tw, th = max(32, int(round(cw * sc_t))), max(32, int(round(ch * sc_t)))
     d_small = cv2.resize(depth_norm, (tw, th), interpolation=cv2.INTER_AREA)

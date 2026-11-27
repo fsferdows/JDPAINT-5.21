@@ -437,6 +437,8 @@ document.addEventListener('DOMContentLoaded', () => {
         basePhotoBuffer = null;
         updateBasePhotoBox();
         cadCanvas.setReferenceImage(img);
+        const fitBounds = ImageVectorizer.getImageFitBounds(img, reliefEngine.width, reliefEngine.height);
+        viewport3D.setReferenceDesignTexture(img, fitBounds);
         refStatus.textContent = `Picture: ${file.name} (Ready to trace / auto-vectorize)`;
         statusMode.textContent = `Reference picture '${file.name}' loaded! You can now use "⚡ Auto-Trace 2D", "✨ 1-Click (2D+3D)", or Pen/Freehand tools.`;
       };
@@ -1059,6 +1061,79 @@ document.addEventListener('DOMContentLoaded', () => {
     return { update, finish, fail };
   }
 
+  /**
+   * Sync high-precision M1 Vision / Photometric relief heightmap into reliefEngine within exact aspect fit bounds.
+   */
+  async function syncHighAccuracyBaseRelief(imgElement, opts = {}) {
+    await reliefEngine.loadImageHighAccuracyAsync(imgElement, opts, opts.onProgress || null);
+    try {
+      const visionRes = await CadKernelBridge.reconstruct3DViaVision(imgElement, {
+        removeBg: opts.removeWhiteBg ?? true,
+        delight: true,
+        invert: !!opts.invert,
+      });
+      if (!visionRes?.depth || !visionRes.width || !visionRes.height) return;
+      const N = reliefEngine.resolution;
+      const fit = ImageVectorizer.getImageFitBounds(imgElement, reliefEngine.width, reliefEngine.height);
+      const rb = visionRes.roiBox || { x: 0, y: 0, w: imgElement.naturalWidth || 1, h: imgElement.naturalHeight || 1, img_w: imgElement.naturalWidth || 1, img_h: imgElement.naturalHeight || 1 };
+      const rx0 = fit.x + (rb.x / Math.max(1, rb.img_w)) * fit.w;
+      const ry0 = fit.y + (rb.y / Math.max(1, rb.img_h)) * fit.h;
+      const rw = Math.max(1e-4, (rb.w / Math.max(1, rb.img_w)) * fit.w);
+      const rh = Math.max(1e-4, (rb.h / Math.max(1, rb.img_h)) * fit.h);
+      const vw = visionRes.width;
+      const vh = visionRes.height;
+      const vDepth = visionRes.depth;
+      const fgMask = visionRes.fgMask;
+      const checkFg = !visionRes.isPlanarPanel && fgMask && fgMask.length === vw * vh;
+
+      reliefEngine.data.fill(0);
+      for (let iy = 0; iy < N; iy++) {
+        const wy = (iy / Math.max(1, N - 1)) * reliefEngine.height;
+        const vNorm = (wy - ry0) / rh;
+        if (vNorm < 0 || vNorm > 1) continue;
+        const fy = vNorm * (vh - 1);
+        const y0 = Math.max(0, Math.min(vh - 1, Math.floor(fy)));
+        const y1 = Math.min(vh - 1, y0 + 1);
+        const ty = fy - y0;
+        const rowOut = iy * N;
+        for (let ix = 0; ix < N; ix++) {
+          const wx = (ix / Math.max(1, N - 1)) * reliefEngine.width;
+          const uNorm = (wx - rx0) / rw;
+          if (uNorm < 0 || uNorm > 1) continue;
+          const fx = uNorm * (vw - 1);
+          const x0 = Math.max(0, Math.min(vw - 1, Math.floor(fx)));
+          const x1 = Math.min(vw - 1, x0 + 1);
+          const tx = fx - x0;
+          const d00 = vDepth[y0 * vw + x0];
+          const d10 = vDepth[y0 * vw + x1];
+          const d01 = vDepth[y1 * vw + x0];
+          const d11 = vDepth[y1 * vw + x1];
+          const z = (d00 * (1 - tx) + d10 * tx) * (1 - ty) + (d01 * (1 - tx) + d11 * tx) * ty;
+          if (checkFg && fgMask[Math.round(fy) * vw + Math.round(fx)] < 110) continue;
+          reliefEngine.data[rowOut + ix] = Math.max(0.02, Math.min(1.0, z));
+        }
+      }
+      let texImg = imgElement;
+      let texBounds = fit;
+      if (visionRes.cleanedDataUrl && typeof Image !== 'undefined') {
+        const cleanIm = await new Promise((resolve) => {
+          const im = new Image();
+          im.onload = () => resolve(im);
+          im.onerror = () => resolve(null);
+          im.src = visionRes.cleanedDataUrl;
+        });
+        if (cleanIm) {
+          texImg = cleanIm;
+          texBounds = { x: rx0, y: ry0, w: rw, h: rh };
+        }
+      }
+      viewport3D.setReferenceDesignTexture(texImg, texBounds);
+      reliefEngine.notify();
+    } catch (_err) {
+      // Keep Pure-JS high-accuracy heightmap when bridge is offline
+    }
+  }
+
   // ============================================================
   // AUTO-TRACE PICTURE TO 2D VECTORS (Step-by-Step Deep 2D+3D Conversion!)
   // ============================================================
@@ -1074,15 +1149,15 @@ document.addEventListener('DOMContentLoaded', () => {
     await new Promise((r) => setTimeout(r, 16));
 
     try {
-      // Sync clean sculpted base height so 3D view renders coherent carved relief instead of isolated jagged shards
-      await reliefEngine.loadImageHighAccuracyAsync(loadedImageElement, {
+      await syncHighAccuracyBaseRelief(loadedImageElement, {
         style: document.getElementById('relief-style')?.value || 'sculpted',
         edgeStrength: parseFloat(document.getElementById('relief-edge-strength')?.value || '0.35') || 0.35,
         invert: opts.invert,
         removeWhiteBg: document.getElementById('relief-remove-bg')?.checked ?? true,
         denoise: true,
-      }, (rPct, rLabel) => {
-        prog.update(6 + Math.round(rPct * 0.14), rLabel);
+        onProgress: (rPct, rLabel) => {
+          prog.update(6 + Math.round(rPct * 0.14), rLabel);
+        },
       });
       basePhotoBuffer = new Float32Array(reliefEngine.data);
 
@@ -1207,15 +1282,16 @@ document.addEventListener('DOMContentLoaded', () => {
     prog.update(6, 'Step 1/5 (6%): Preparing high-res relief depth field & image analysis...');
     await new Promise((r) => setTimeout(r, 16));
 
-    // 1. Pre-compute high-accuracy relief heightmap buffer
-    await reliefEngine.loadImageHighAccuracyAsync(loadedImageElement, {
+    // 1. Pre-compute high-accuracy relief heightmap buffer (Vision M1 + Pure-JS fallback)
+    await syncHighAccuracyBaseRelief(loadedImageElement, {
       style,
       edgeStrength,
       invert: opts.invert,
       removeWhiteBg,
       denoise: true,
-    }, (rPct, rLabel) => {
-      prog.update(6 + Math.round(rPct * 0.22), rLabel);
+      onProgress: (rPct, rLabel) => {
+        prog.update(6 + Math.round(rPct * 0.22), rLabel);
+      },
     });
     basePhotoBuffer = new Float32Array(reliefEngine.data);
 
@@ -1282,14 +1358,15 @@ document.addEventListener('DOMContentLoaded', () => {
         const btnBackRel = document.getElementById('btn-back-relief');
         if (btnBackRel) btnBackRel.style.display = 'none';
       }
-      await reliefEngine.loadImageHighAccuracyAsync(loadedImageElement, {
+      await syncHighAccuracyBaseRelief(loadedImageElement, {
         style,
         edgeStrength,
         invert,
         removeWhiteBg,
         denoise: true,
-      }, (pct, label) => {
-        prog.update(pct, label);
+        onProgress: (pct, label) => {
+          prog.update(pct, label);
+        },
       });
       basePhotoBuffer = new Float32Array(reliefEngine.data);
       basePhotoEnabled = true;

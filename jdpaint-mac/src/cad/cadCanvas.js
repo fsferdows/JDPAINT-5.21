@@ -865,6 +865,9 @@ export class CadCanvas {
     this.saveState();
     if (replacePrevious) {
       this.entities = this.entities.filter((e) => e.source !== 'trace');
+      this.hoveredEntity = null;
+      this.detectedShapePreview = null;
+      this.selectedEntities = this.selectedEntities.filter((e) => e && e.source !== 'trace');
     }
     const vectors = ImageVectorizer.traceImageToVectors(
       this.refImage,
@@ -898,6 +901,9 @@ export class CadCanvas {
     this.saveState();
     if (replacePrevious) {
       this.entities = this.entities.filter((e) => e.source !== 'trace');
+      this.hoveredEntity = null;
+      this.detectedShapePreview = null;
+      this.selectedEntities = this.selectedEntities.filter((e) => e && e.source !== 'trace');
     }
 
     let traced = null;

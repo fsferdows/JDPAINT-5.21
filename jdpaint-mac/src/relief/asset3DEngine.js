@@ -155,7 +155,8 @@ export class Asset3DEngine {
     Asset3DEngine._solveSurfaceDepth(prep, { delight, invert, edgeStrength });
 
     await emit(3, 64, `Stage 3/5: Applying Volume-Preserving Taubin Fairing & Sobel Rolling-Ball Fillet (r=${filletRatio.toFixed(3)})...`);
-    Asset3DEngine.taubinSmoothDepth(prep.depth, prep.fgMask, prep.resX, prep.resY, prep.isPlanarPanel ? 6 : 5);
+    const taubinPasses = (prep.isPlanarPanel && prep.neuralDepth) ? 2 : (prep.isPlanarPanel ? 4 : 5);
+    Asset3DEngine.taubinSmoothDepth(prep.depth, prep.fgMask, prep.resX, prep.resY, taubinPasses);
     Asset3DEngine.applySlopeAwareFillet(prep.depth, prep.fgMask, prep.resX, prep.resY, prep.aspect >= 1 ? widthMm : widthMm * prep.aspect, thicknessMm, filletRatio);
 
     await emit(4, 82, `Stage 4/5: Newton zero-isocontour rim snapping & watertight manifold ${assetMode.toUpperCase()} mesh (${prep.resX}×${prep.resY})...`);
@@ -783,16 +784,24 @@ export class Asset3DEngine {
         const microDelta = Math.tanh(rawMicro * 1.40) * 0.66;
         const pSfs = invert ? 1.0 - planarSfs[i] : planarSfs[i];
         const railHold = Math.max(0.0, Math.min(1.0, smoothDist[i] / railMargin));
-        const macroBase = nDepth
-          ? ((invert ? 1.0 - nDepth[i] : nDepth[i]) * 0.48 + macroElev * 0.52)
-          : (macroElev * (1.0 - 0.32 * railHold) + pSfs * (0.32 * railHold));
-        const zVal = Math.max(0.10, Math.min(1.0, macroBase * 0.68 + 0.16 + microDelta * 0.28));
+        let zVal;
+        if (nDepth) {
+          // Local Vision bridge returns de-tilted multi-scale SFS + morphological carved depth; preserve full geometric relief
+          const nd = invert ? 1.0 - nDepth[i] : nDepth[i];
+          const detailPunch = Math.max(0.0, Math.min(1.0, 0.5 + microDelta * 0.70));
+          zVal = Math.max(0.05, Math.min(0.99, nd * 0.80 + detailPunch * 0.20));
+        } else {
+          const macroBase = macroElev * (1.0 - 0.32 * railHold) + pSfs * (0.32 * railHold);
+          zVal = Math.max(0.10, Math.min(1.0, macroBase * 0.68 + 0.16 + microDelta * 0.28));
+        }
         sculptSignal[i] = zVal;
         depth[i] = zVal;
       }
 
-      const smoothPlanar = ImageVectorizer.guidedFilter(depth, resX, resY, 2, 0.018);
-      for (let i = 0; i < total; i++) depth[i] = fgMask[i] ? Math.max(0.10, Math.min(1.0, smoothPlanar[i])) : 0;
+      const gfRad = nDepth ? 1 : 2;
+      const gfEps = nDepth ? 0.004 : 0.018;
+      const smoothPlanar = ImageVectorizer.guidedFilter(depth, resX, resY, gfRad, gfEps);
+      for (let i = 0; i < total; i++) depth[i] = fgMask[i] ? Math.max(0.05, Math.min(0.99, smoothPlanar[i])) : 0;
       return;
     }
 
