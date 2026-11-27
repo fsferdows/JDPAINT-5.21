@@ -1033,6 +1033,23 @@ def _trace_mask_vtracer(
     return _refine_cad_anchors(cleaned, span_w, span_h, snap_axis=True)
 
 
+def _fill_tiny_holes(mask_u8: np.ndarray, min_hole_px: int) -> np.ndarray:
+    """Close sub-millimeter enclosed pinholes inside relief blobs before VTracer traces them."""
+    if min_hole_px <= 4 or not mask_u8.any():
+        return mask_u8
+    inv = 255 - mask_u8
+    nl, lbl, st, _ = cv2.connectedComponentsWithStats(inv)
+    vh, vw = mask_u8.shape[:2]
+    out = mask_u8.copy()
+    for i in range(1, nl):
+        bx, by, bw_i, bh_i, area = (int(st[i, 0]), int(st[i, 1]), int(st[i, 2]), int(st[i, 3]), int(st[i, 4]))
+        if bx == 0 or by == 0 or bx + bw_i >= vw or by + bh_i >= vh:
+            continue
+        if area < min_hole_px:
+            out[lbl == i] = 255
+    return out
+
+
 def _extract_wood_relief_vectors(
     sub_bgr: np.ndarray,
     off_x: float,
@@ -1041,6 +1058,7 @@ def _extract_wood_relief_vectors(
     sy_mm: float,
     detail: float,
     corners: float,
+    wm_mask: np.ndarray | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Multi-layer clean closed-region relief vectorization + Retinex shadow equalization + convergence loop."""
     vh, vw = sub_bgr.shape[:2]
@@ -1121,13 +1139,18 @@ def _extract_wood_relief_vectors(
     groove_mask = cv2.bitwise_or(groove_mask, cv2.bitwise_or(v_rail, h_rail))
     groove_mask = cv2.morphologyEx(groove_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
 
-    # Filter out bare plank speckles/grain on both masks cleanly
+    # Filter out bare plank speckles, border-stile vertical wood grain & inpainted watermark margins cleanly
     k_act = max(21, int(round(min(vw, vh) * 0.028)) | 1)
     act_map = cv2.GaussianBlur((comb_masked > 42).astype(np.float32), (k_act, k_act), 0)
-    min_area = max(28, int(vw * vh * 0.000024))
-    max_grain_w = max(16, int(vw * 0.014))
+    min_area = max(42, int(vw * vh * 0.000038))
+    min_hole_px = max(36, int(vw * vh * 0.000032))
+    max_grain_w = max(18, int(vw * 0.022))
 
-    def filter_mask_components(src_m: np.ndarray, min_a: int) -> np.ndarray:
+    wm_sup = None
+    if wm_mask is not None and wm_mask.shape[:2] == (vh, vw) and wm_mask.any():
+        wm_sup = cv2.dilate((wm_mask > 0).astype(np.uint8) * 255, np.ones((11, 11), np.uint8))
+
+    def filter_mask_components(src_m: np.ndarray, min_a: int, keep_rails: bool = True) -> np.ndarray:
         nl, lbl, st, _ = cv2.connectedComponentsWithStats(src_m)
         out_m = np.zeros_like(src_m)
         for i in range(1, nl):
@@ -1136,47 +1159,64 @@ def _extract_wood_relief_vectors(
                 continue
             bxi, byi, bwi, bhi = int(st[i, 0]), int(st[i, 1]), int(st[i, 2]), int(st[i, 3])
             cm = lbl[byi : byi + bhi, bxi : bxi + bwi] == i
+            # Suppress components trapped on inpainted watermark regions (e.g. Doors Fair bottom strip)
+            if wm_sup is not None and float((wm_sup[byi : byi + bhi, bxi : bxi + bwi][cm] > 0).mean()) > 0.45:
+                continue
+            # Suppress narrow outermost side-stile wood grain confetti strips hugging image left/right margins
+            near_side_edge = (bxi <= vw * 0.035 and (bxi + bwi) <= vw * 0.085) or ((bxi + bwi) >= vw * 0.965 and bxi >= vw * 0.915)
+            if near_side_edge and bwi <= max_grain_w * 1.4 and bhi < vh * 0.65:
+                continue
             sc = comb_masked[byi : byi + bhi, bxi : bxi + bwi][cm]
             pk, mn = int(sc.max()), float(sc.mean())
             act_mn = float(act_map[byi : byi + bhi, bxi : bxi + bwi][cm].mean())
-            if act_mn < 0.036 and pk < 94 and area < min_a * 12:
+            if act_mn < 0.042 and pk < 96 and area < min_a * 10:
                 continue
-            if bhi >= bwi * 4.2 and bwi <= max_grain_w and ((mn < 78.0 and pk < 108 and bhi < vh * 0.24) or (act_mn < 0.06 and bhi < vh * 0.42 and mn < 95.0)):
+            if bhi >= bwi * 3.8 and bwi <= max_grain_w:
+                if (mn < 84.0 and pk < 112 and bhi < vh * 0.28) or (act_mn < 0.072 and bhi < vh * 0.48 and mn < 98.0):
+                    continue
+            if not keep_rails and area < min_a * 2 and pk < 92:
                 continue
-            if area < min_a * 4 and pk < 76:
+            if area < min_a * 3 and pk < 82:
                 continue
             out_m[lbl == i] = 255
-        return out_m
+        if wm_sup is not None:
+            out_m[wm_sup > 0] = 0
+        return _fill_tiny_holes(out_m, min_hole_px)
 
-    clean_grooves = filter_mask_components(groove_mask, min_area)
-    clean_raised = filter_mask_components(raised_raw, max(44, int(min_area * 1.5)))
+    clean_grooves = filter_mask_components(groove_mask, min_area, keep_rails=True)
+    clean_raised = filter_mask_components(raised_raw, max(64, int(min_area * 1.7)), keep_rails=False)
 
     # Keep outer bevel frame borders intact while separating inner thick relief bodies cleanly
     raised_frac = float((clean_raised > 0).sum()) / max(1, vw * vh)
     groove_unique = clean_grooves
     if raised_frac >= 0.015:
-        groove_unique = cv2.bitwise_and(clean_grooves, 255 - cv2.erode(clean_raised, np.ones((5, 5), np.uint8)))
+        groove_unique = _fill_tiny_holes(
+            cv2.bitwise_and(clean_grooves, 255 - cv2.erode(clean_raised, np.ones((5, 5), np.uint8))),
+            min_hole_px,
+        )
 
     target_mask = cv2.bitwise_or(clean_grooves, clean_raised)
     target_mask = cv2.bitwise_or(target_mask, cv2.bitwise_and(canny_zone, ((comb_masked > 10).astype(np.uint8)) * 255))
+    if wm_sup is not None:
+        target_mask[wm_sup > 0] = 0
 
     corner_t = int(round(40 + corners * 18))
-    speckle_base = max(6, int(round(14 - detail * 7)))
+    speckle_base = max(10, int(round(20 - detail * 9)))
 
     # Closed-Loop Convergence Iter 1: Clean Layered Regions (Raised Relief Motifs + Carved Grooves & Panels)
     all_ents: list[dict[str, Any]] = []
-    if raised_frac >= 0.012:
+    if raised_frac >= 0.014:
         all_ents.extend(
             _trace_mask_vtracer(
                 clean_raised, off_x, off_y, sx_mm, sy_mm,
-                max(8, speckle_base + 2), corner_t, 4.6,
+                max(12, speckle_base + 4), corner_t, 5.2,
                 layer_group="Raised Relief Motifs", smooth_mask=True,
             )
         )
     all_ents.extend(
         _trace_mask_vtracer(
             groove_unique, off_x, off_y, sx_mm, sy_mm,
-            speckle_base, corner_t, 4.2,
+            speckle_base, corner_t, 4.8,
             layer_group="Carved Grooves & Panels", smooth_mask=True,
         )
     )
@@ -1258,6 +1298,21 @@ def _extract_wood_relief_vectors(
         "iterations": iters,
         "converged": bool(cov >= 0.945 and min_tile >= 0.84),
     }
+
+    # Organize & sort entities top-to-bottom cleanly by layerGroup with readable sequential layer names
+    group_order = {"Architectural Frame": 0, "Raised Relief Motifs": 1, "Carved Grooves & Panels": 2}
+    all_ents.sort(key=lambda e: (
+        group_order.get(e.get("layerGroup", ""), 3),
+        min((p["y"] for p in (e.get("points") or [{"y": 0.0}])), default=0.0),
+        min((p["x"] for p in (e.get("points") or [{"x": 0.0}])), default=0.0),
+    ))
+    g_cnt: dict[str, int] = {}
+    for e in all_ents:
+        lg = e.get("layerGroup", "Carved Grooves & Panels")
+        g_cnt[lg] = g_cnt.get(lg, 0) + 1
+        prefix = "Carved Motif" if lg == "Raised Relief Motifs" else ("Frame Part" if lg == "Architectural Frame" else "Carved Panel")
+        e["name"] = f"{prefix} #{g_cnt[lg]}"
+
     return all_ents, conv
 
 
@@ -1290,10 +1345,11 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
     is_logo = _classify_graphic_logo(bgra)
     roi = None if (is_logo or trace_mode in ("bw-logo", "lineart", "color") or not ignore_bg) else detect_furniture_roi(bgr)
 
+    wm_mask = None
     if roi is not None:
         x0, y0, x1, y1 = roi["x0"], roi["y0"], roi["x1"], roi["y1"]
         sub = bgr[y0 : y1 + 1, x0 : x1 + 1].copy()
-        sub, _ = _inpaint_watermarks(
+        sub, wm_mask = _inpaint_watermarks(
             sub, roi["dc"][y0 : y1 + 1, x0 : x1 + 1], roi["L"][y0 : y1 + 1, x0 : x1 + 1], roi["l_med"]
         )
     else:
@@ -1311,13 +1367,19 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
             if max(sw0, sh0) * sc > 2800:
                 sc = 2800.0 / max(1, max(sw0, sh0))
             if sc > 1.02:
-                sub = cv2.resize(sub, (int(round(sw0 * sc)), int(round(sh0 * sc))), interpolation=cv2.INTER_LANCZOS4)
+                nw_s, nh_s = int(round(sw0 * sc)), int(round(sh0 * sc))
+                sub = cv2.resize(sub, (nw_s, nh_s), interpolation=cv2.INTER_LANCZOS4)
+                if wm_mask is not None:
+                    wm_mask = cv2.resize(wm_mask, (nw_s, nh_s), interpolation=cv2.INTER_NEAREST)
                 if sc > 1.25:
                     sub = cv2.fastNlMeansDenoisingColored(sub, None, 4, 4, 7, 21)
                     sub = cv2.addWeighted(sub, 1.15, cv2.GaussianBlur(sub, (0, 0), 1.05), -0.15, 0)
     elif max(sw0, sh0) < 1100:
         sc = min(2.4, 1280.0 / max(1, max(sw0, sh0)))
-        sub = cv2.resize(sub, (int(round(sw0 * sc)), int(round(sh0 * sc))), interpolation=cv2.INTER_LANCZOS4)
+        nw_s, nh_s = int(round(sw0 * sc)), int(round(sh0 * sc))
+        sub = cv2.resize(sub, (nw_s, nh_s), interpolation=cv2.INTER_LANCZOS4)
+        if wm_mask is not None:
+            wm_mask = cv2.resize(wm_mask, (nw_s, nh_s), interpolation=cv2.INTER_NEAREST)
 
     vh, vw = sub.shape[:2]
     off_x = bx + (x0 / iw) * bw
@@ -1416,7 +1478,7 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
             )
         )
     elif roi is not None and not is_engraved_wood_plaque:
-        wood_ents, convergence = _extract_wood_relief_vectors(sub, off_x, off_y, sx_mm, sy_mm, detail, corners)
+        wood_ents, convergence = _extract_wood_relief_vectors(sub, off_x, off_y, sx_mm, sy_mm, detail, corners, wm_mask=wm_mask)
         entities.extend(wood_ents)
         total_rings = sum(1 + len(e.get("holes", [])) for e in entities)
         if total_rings < 12:
