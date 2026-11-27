@@ -122,7 +122,8 @@ export class CadKernelBridge {
   static async vectorizeViaVision(imgElement, widthMm = 100, heightMm = 100, options = {}) {
     const health = await CadKernelBridge.checkHealth(2000, { passive: true });
     if (!health?.ok || !health?.vision_ai) return null;
-    const imageB64 = CadKernelBridge._encodeImageB64(imgElement, 2400);
+    const maxDim = Math.min(3840, Math.max(1280, Number(options.traceQuality || options.maxDimension || 3840)));
+    const imageB64 = CadKernelBridge._encodeImageB64(imgElement, maxDim);
     if (!imageB64) return null;
     const resp = await fetch(`${CadKernelBridge.BASE_URL}/api/vision/vectorize`, {
       method: 'POST',
@@ -134,6 +135,8 @@ export class CadKernelBridge {
         corners: options.corners ?? 0.65,
         color_count: options.colorCount ?? 6,
         ignore_bg: options.ignoreBg ?? true,
+        trace_quality: maxDim,
+        noise_px: options.noisePx ?? 10,
         width_mm: widthMm,
         height_mm: heightMm,
       }),
@@ -156,7 +159,8 @@ export class CadKernelBridge {
   static async reconstruct3DViaVision(imgElement, options = {}) {
     const health = await CadKernelBridge.checkHealth(2000, { passive: true });
     if (!health?.ok || !health?.vision_ai) return null;
-    const imageB64 = CadKernelBridge._encodeImageB64(imgElement, 2400);
+    const maxDim = Math.min(3840, Math.max(1600, Number(options.maxDimension || options.traceQuality || 2800)));
+    const imageB64 = CadKernelBridge._encodeImageB64(imgElement, maxDim);
     if (!imageB64) return null;
     const resp = await fetch(`${CadKernelBridge.BASE_URL}/api/vision/reconstruct-3d`, {
       method: 'POST',

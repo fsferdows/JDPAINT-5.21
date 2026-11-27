@@ -234,12 +234,15 @@ def _make_ocp_face(outer: list[tuple[float, float]], holes: list[list[tuple[floa
     if not mf.IsDone():
         return None, 0
     raw_face = mf.Face()
-    if not BRepCheck_Analyzer(raw_face).IsValid():
-        sf = ShapeFix_Face(raw_face)
-        sf.Perform()
-        raw_face = sf.Face()
+    try:
         if not BRepCheck_Analyzer(raw_face).IsValid():
-            return None, 0
+            sf = ShapeFix_Face(raw_face)
+            sf.Perform()
+            raw_face = sf.Face()
+            if not BRepCheck_Analyzer(raw_face).IsValid():
+                return None, 0
+    except Exception:
+        return None, 0
     return b3d.Face(raw_face), len(eo)
 
 
@@ -282,6 +285,8 @@ def _polygon_to_faces_with_insets(
         except Exception:
             pass
     face, vc = _make_ocp_face(outer, holes)
+    if face is None and holes:
+        face, vc = _make_ocp_face(outer, [])
     if face is not None:
         tiers[0.0] = [(face, vc)]
     return tiers
@@ -494,7 +499,10 @@ def build_solid_from_vectors(payload: dict[str, Any]) -> dict[str, Any]:
         mode_str = str(relief.get("mode", "add")).lower()
         is_cut = base_mm > 0.2 and mode_str in ("subtract", "carve", "min", "cut")
         profile = str(relief.get("shape", "flat")).lower()
-        entity_faces = _build_entity_faces(ent, work_h, profile="flat" if is_cut else profile, h_mm=h_mm)
+        try:
+            entity_faces = _build_entity_faces(ent, work_h, profile="flat" if is_cut else profile, h_mm=h_mm)
+        except Exception:
+            entity_faces = []
         if not entity_faces:
             continue
         for face, vc, z_frac, h_frac in entity_faces:

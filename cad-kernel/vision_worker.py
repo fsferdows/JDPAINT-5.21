@@ -12,7 +12,10 @@ import json
 import math
 import os
 import re
+import struct
+import subprocess
 import sys
+import threading
 import traceback
 from typing import Any
 
@@ -21,6 +24,66 @@ import numpy as np
 from PIL import Image
 from skimage.morphology import skeletonize
 import vtracer
+
+_RUST_CORE_BIN = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "jdpaint_rust_core",
+    "target",
+    "release",
+    "jdpaint_rust_core",
+)
+_RUST_PROC: subprocess.Popen | None = None
+_RUST_LOCK = threading.Lock()
+
+
+def _read_exact(pipe, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = pipe.read(n - len(buf))
+        if not chunk:
+            raise EOFError("Rust worker closed pipe unexpectedly")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _rust_rpc(payload: bytes, expect_magic: bytes, poisson_bytes: int = 0) -> bytes | None:
+    """Zero-fork persistent binary pipe RPC to native multi-core Rust core."""
+    global _RUST_PROC
+    if not os.path.isfile(_RUST_CORE_BIN):
+        return None
+    with _RUST_LOCK:
+        for attempt in range(2):
+            if _RUST_PROC is None or _RUST_PROC.poll() is not None:
+                _RUST_PROC = subprocess.Popen(
+                    [_RUST_CORE_BIN, "serve"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=0,
+                )
+            try:
+                assert _RUST_PROC.stdin is not None and _RUST_PROC.stdout is not None
+                _RUST_PROC.stdin.write(payload)
+                _RUST_PROC.stdin.flush()
+                if expect_magic == b"JDR2":
+                    hdr = _read_exact(_RUST_PROC.stdout, 8)
+                    if hdr[:4] != b"JDR2":
+                        raise IOError("Bad JDR2 magic")
+                    body_len = struct.unpack_from("<I", hdr, 4)[0]
+                    return _read_exact(_RUST_PROC.stdout, body_len)
+                hdr = _read_exact(_RUST_PROC.stdout, 4)
+                if hdr != b"JDP2":
+                    raise IOError("Bad JDP2 magic")
+                return _read_exact(_RUST_PROC.stdout, poisson_bytes)
+            except Exception:
+                try:
+                    _RUST_PROC.kill()
+                except Exception:
+                    pass
+                _RUST_PROC = None
+                if attempt == 1:
+                    return None
+    return None
 
 _DEPTH_PROC = None
 _DEPTH_MODEL = None
@@ -212,14 +275,20 @@ def detect_furniture_roi(bgr: np.ndarray) -> dict[str, Any] | None:
     if ry0 > py:
         ry0 = max(0, ry0 - py) + int(np.argmax(gy[max(0, ry0 - py) : min(h, ry0 + py)]))
     if ry1 < h - py:
-        # Door bottom shadow crease across [68%..ry1+py] catches wood floor continuity
+        # Door bottom shadow crease across [68%..ry1+py] catches wood floor continuity, ignoring bright white footer margins
         y_lo = max(ry0 + int((ry1 - ry0) * 0.68), ry1 - int(h * 0.18))
         y_hi = min(h, ry1 + py)
         row_dark = (L[y_lo:y_hi, rx0 : rx1 + 1] < 24.0).mean(axis=1)
+        row_white = ((L[y_lo:y_hi, rx0 : rx1 + 1] > 188.0) & (dc[y_lo:y_hi, rx0 : rx1 + 1] < 16.0)).mean(axis=1)
         row_edge = gy[y_lo:y_hi]
-        score = row_edge + row_dark * 55.0
-        # Reward clear dark gap spanning >45% of panel width near bottom
+        score = row_edge + row_dark * 55.0 - row_white * 140.0
         ry1 = y_lo + int(np.argmax(score))
+
+    # Trim bottom/top pure white catalog margin strips (e.g. Doors Fair footer) cleanly before crop
+    sub_w_check = ((L[ry0 : ry1 + 1, rx0 : rx1 + 1] > 192.0) & (dc[ry0 : ry1 + 1, rx0 : rx1 + 1] < 18.0)).mean(axis=1)
+    while ry1 - ry0 > int(h * 0.35) and len(sub_w_check) > 8 and sub_w_check[-1] > 0.58:
+        ry1 -= 1
+        sub_w_check = sub_w_check[:-1]
 
     rw, rh = rx1 - rx0 + 1, ry1 - ry0 + 1
     if rw < w * 0.24 or rh < h * min_h_frac:
@@ -250,22 +319,23 @@ def _inpaint_watermarks(sub_bgr: np.ndarray, dc_sub: np.ndarray, L_sub: np.ndarr
     rgb_sat = np.maximum(np.maximum(r, g), b).astype(np.int16) - np.minimum(np.minimum(r, g), b).astype(np.int16)
     luma_raw = 0.2126 * r + 0.7152 * g + 0.0722 * b
 
-    is_bright_wm = (L_sub > l_med + 14.0) & (rgb_sat < 24) & (dc_sub > 17.0)
-    is_neutral_ink = (luma_raw < 34.0) & (rgb_sat < 14) & (dc_sub > 16.0)
-    is_red_accent = (r.astype(np.int16) - g.astype(np.int16) > 95) & (dc_sub > 32.0)
+    is_bright_wm = (L_sub > l_med + 14.0) & (rgb_sat < 22) & (dc_sub > 16.0)
+    # Guard against dark charcoal plaques (e.g. Khoj24 l_med ~ 45) while catching "aarsun" grey ink on wood doors
+    is_neutral_ink = (l_med > 82.0) & (luma_raw < 74.0) & (rgb_sat < 14) & ((L_sub < l_med * 0.72) | (dc_sub > 14.0))
+    is_red_accent = (r.astype(np.int16) - g.astype(np.int16) > 56) & (dc_sub > 20.0)
     is_blue_accent = (b.astype(np.int16) - r.astype(np.int16) > 28) & (dc_sub > 18.0)
 
     cand = is_bright_wm | is_neutral_ink | is_red_accent | is_blue_accent
     tot_px = sub_bgr.shape[0] * sub_bgr.shape[1]
     wm_u8 = np.zeros((sub_bgr.shape[0], sub_bgr.shape[1]), dtype=np.uint8)
-    if 0 < int(cand.sum()) < int(tot_px * 0.045):
+    if 0 < int(cand.sum()) < int(tot_px * 0.055):
         n_lbl, lbls, stats, _ = cv2.connectedComponentsWithStats(cand.astype(np.uint8) * 255)
         max_comp = int(tot_px * 0.015)
         for ci in range(1, n_lbl):
             if 4 <= int(stats[ci, cv2.CC_STAT_AREA]) <= max_comp:
                 wm_u8[lbls == ci] = 255
     if int(wm_u8.sum()) > 0:
-        wm_u8 = cv2.dilate(wm_u8, np.ones((4, 4), np.uint8), iterations=1)
+        wm_u8 = cv2.dilate(wm_u8, np.ones((5, 5), np.uint8), iterations=1)
         cleaned = cv2.inpaint(sub_bgr, wm_u8, 5, cv2.INPAINT_TELEA)
         return cleaned, wm_u8
     return sub_bgr, wm_u8
@@ -527,8 +597,34 @@ def _equalize_illumination_retinex(L_f: np.ndarray, strength: float = 0.58) -> n
     return np.clip(eq, 0.0, 255.0).astype(np.float32)
 
 
+def _run_rust_poisson(
+    px: np.ndarray,
+    qy: np.ndarray,
+    z_macro: np.ndarray,
+    grain_gate: np.ndarray,
+    lam: float = 0.0022,
+    iters: int = 16,
+    grad_knee: float = 0.036,
+    grad_scale: float = 1.15,
+) -> np.ndarray | None:
+    """Solve logarithmic gradient-compressed Screened Poisson bas-relief in native multi-core Rust."""
+    h, w = z_macro.shape[:2]
+    header = struct.pack("<4sIIfIff", b"JDP2", w, h, float(lam), int(iters), float(grad_knee), float(grad_scale))
+    payload = (
+        header
+        + np.ascontiguousarray(px, dtype="<f4").tobytes()
+        + np.ascontiguousarray(qy, dtype="<f4").tobytes()
+        + np.ascontiguousarray(z_macro, dtype="<f4").tobytes()
+        + np.ascontiguousarray(grain_gate, dtype="<f4").tobytes()
+    )
+    out = _rust_rpc(payload, b"JDP2", poisson_bytes=w * h * 4)
+    if out is None or len(out) != w * h * 4:
+        return None
+    return np.frombuffer(out, dtype="<f4").reshape((h, w)).copy()
+
+
 def _solve_planar_relief_heightmap(sub_bgr: np.ndarray) -> np.ndarray:
-    """Compute a volumetric de-tilted bas-relief heightmap fusing AI Depth-Anything-V2, SFS & geodesic relief volumes."""
+    """Compute a volumetric de-tilted bas-relief heightmap fusing AI Depth-Anything-V2, SFS & Rust Screened Poisson."""
     import torch
 
     ch, cw = sub_bgr.shape[:2]
@@ -557,10 +653,10 @@ def _solve_planar_relief_heightmap(sub_bgr: np.ndarray) -> np.ndarray:
 
     Lc_raw = cv2.bilateralFilter(cv2.cvtColor(epf_c, cv2.COLOR_BGR2LAB)[:, :, 0], 7, 22, 16).astype(np.float32)
     Lc = _equalize_illumination_retinex(Lc_raw, strength=0.62) / 255.0
-    k_bg = max(31, int(round(m_dim * 0.14)) | 1)
+    k_bg = max(31, int(round(m_dim * 0.12)) | 1)
     bg_l = cv2.GaussianBlur(Lc, (k_bg, k_bg), 0)
     elev = Lc - bg_l
-    delight = np.clip(elev * 1.60 + 0.5, 0.0, 1.0)
+    delight = np.clip(elev * 1.55 + 0.5, 0.0, 1.0)
 
     # De-tilt broad FFT pillow bow on planar panels
     sfs_bow = cv2.GaussianBlur(sfs, (0, 0), sigmaX=max(18.0, m_dim * 0.11))
@@ -568,34 +664,54 @@ def _solve_planar_relief_heightmap(sub_bgr: np.ndarray) -> np.ndarray:
 
     # Gate out bare flat wood grain while keeping genuine carved motifs solid
     grad_e = np.hypot(cv2.Scharr(delight, cv2.CV_32F, 1, 0), cv2.Scharr(delight, cv2.CV_32F, 0, 1)) / 16.0
-    act_e = cv2.GaussianBlur(np.maximum(grad_e, np.abs(elev) * 2.2), (0, 0), sigmaX=max(6.0, m_dim * 0.015))
-    act_floor = max(0.035, float(np.percentile(act_e, 48)))
-    grain_gate = np.clip((act_e - act_floor * 0.72) / max(1e-4, act_floor * 1.45), 0.0, 1.0)
+    act_e = cv2.GaussianBlur(np.maximum(grad_e, np.abs(elev) * 2.1), (0, 0), sigmaX=max(6.0, m_dim * 0.014))
+    act_floor = max(0.032, float(np.percentile(act_e, 46)))
+    grain_gate = np.clip((act_e - act_floor * 0.70) / max(1e-4, act_floor * 1.40), 0.0, 1.0).astype(np.float32)
 
-    # Geodesic rounded bas-relief dome volume for raised petals & smooth recessed grooves (zero 1px noise needles!)
-    pos_bin = (((elev * 1.8) * (0.35 + 0.65 * grain_gate)) > 0.065).astype(np.uint8)
-    neg_bin = (((-elev * 1.8) * (0.35 + 0.65 * grain_gate)) > 0.068).astype(np.uint8)
-    ker_v = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    pos_bin = cv2.morphologyEx(pos_bin, cv2.MORPH_OPEN, ker_v)
-    neg_bin = cv2.morphologyEx(neg_bin, cv2.MORPH_OPEN, ker_v)
+    # De-spike 1-3px glossy specular dots so thin bright ribs don't become needle stalagmites inside dark motifs
+    Lc_u8 = np.clip(Lc * 255.0, 0, 255).astype(np.uint8)
+    L_med5 = cv2.medianBlur(Lc_u8, 5).astype(np.float32) / 255.0
+    Lc_despiked = np.minimum(Lc, L_med5 + 0.030).astype(np.float32)
+    Ld_u8 = np.clip(Lc_despiked * 255.0, 0, 255).astype(np.uint8)
 
-    ref_r = max(4.0, m_dim * 0.022)
-    dt_pos = cv2.distanceTransform(pos_bin, cv2.DIST_L2, 3)
-    dt_neg = cv2.distanceTransform(neg_bin, cv2.DIST_L2, 3)
-    dome_pos = np.power(np.clip(dt_pos / ref_r, 0.0, 1.0), 0.58)
-    pocket_neg = np.power(np.clip(dt_neg / ref_r, 0.0, 1.0), 0.58)
-    vol_raw = 0.5 + dome_pos * 0.44 - pocket_neg * 0.42 + np.clip(elev * grain_gate * 1.15, -0.25, 0.25)
-    vol_relief = cv2.GaussianBlur(np.clip(vol_raw, 0.0, 1.0).astype(np.float32), (0, 0), sigmaX=max(0.85, m_dim * 0.0022))
+    # Smooth continuous meso-sculpting + recessed BlackHat crevice troughs (ZERO binary distance-transform stalagmites!)
+    z_macro_raw = (ai_flat * 0.45 + sfs_flat * 0.55) if ai_flat is not None else sfs_flat.copy()
+    z_macro = np.clip(cv2.GaussianBlur(z_macro_raw.astype(np.float32), (0, 0), sigmaX=max(2.0, m_dim * 0.0038)), 0.18, 0.90)
 
-    if ai_flat is not None:
-        rel = ai_flat * 0.24 + sfs_flat * 0.26 + vol_relief * 0.50
-    else:
-        rel = sfs_flat * 0.34 + vol_relief * 0.66
+    r_bh = max(7, int(round(m_dim * 0.014)) | 1)
+    ker_bh = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_bh, r_bh))
+    bh_r = cv2.morphologyEx(Ld_u8, cv2.MORPH_BLACKHAT, ker_bh).astype(np.float32) / 255.0
+    bg_petal = cv2.GaussianBlur(Lc_despiked, (0, 0), sigmaX=max(7.0, m_dim * 0.024))
+    elev_petal = np.clip((Lc_despiked - bg_petal) * 1.15, -0.14, 0.24)
+    val_carve = np.clip(bh_r * 0.55, 0.0, 0.18)
+    sculpt_field = cv2.GaussianBlur(
+        ((elev_petal - val_carve * 0.65) * grain_gate).astype(np.float32),
+        (0, 0),
+        sigmaX=max(1.8, m_dim * 0.0032),
+    )
 
-    # Light edge-preserving polish removes micro plank ripple while preserving carved shoulders
-    rel = cv2.bilateralFilter(rel.astype(np.float32), d=5, sigmaColor=0.09, sigmaSpace=4.5)
+    guide_surf = np.clip(z_macro * 0.58 + (0.5 + sculpt_field * 0.92) * 0.42, 0.0, 1.0).astype(np.float32)
+    px = cv2.Scharr(guide_surf, cv2.CV_32F, 1, 0) / 32.0
+    qy = cv2.Scharr(guide_surf, cv2.CV_32F, 0, 1) / 32.0
+
+    rel = _run_rust_poisson(
+        px,
+        qy,
+        z_macro,
+        np.maximum(grain_gate, 0.10).astype(np.float32),
+        lam=0.0085,
+        iters=18,
+        grad_knee=0.020,
+        grad_scale=0.58,
+    )
+    if rel is None:
+        rel = guide_surf
+
+    # Gentle edge-preserving polish removes micro plank ripple & needle chatter while preserving sculpted shoulders
+    rel = cv2.bilateralFilter(rel.astype(np.float32), d=7, sigmaColor=0.075, sigmaSpace=4.5)
+    rel = cv2.GaussianBlur(rel, (0, 0), sigmaX=max(0.75, m_dim * 0.0014))
     lo, hi = float(np.percentile(rel, 2)), float(np.percentile(rel, 98))
-    return np.clip((rel - lo) / max(1e-4, hi - lo), 0.05, 0.96).astype(np.float32)
+    return np.clip((rel - lo) / max(1e-4, hi - lo), 0.04, 0.96).astype(np.float32)
 
 
 def _extract_ai_model_recovery_vectors(
@@ -979,6 +1095,248 @@ def _measure_vector_coverage(
     return global_rec, min_tile_rec, uncovered_full
 
 
+def _trace_field_rust(
+    field_u8: np.ndarray,
+    off_x: float,
+    off_y: float,
+    sx_mm: float,
+    sy_mm: float,
+    detail: float = 0.72,
+    corners: float = 0.65,
+    min_area_px: float = 20.0,
+    straight_tol_px: float = 1.15,
+    layer_group: str = "Carved Grooves & Panels",
+    smooth_sigma: float = 0.68,
+) -> list[dict[str, Any]]:
+    """Run native multi-core Rust subpixel Marching Squares + Schneider Least-Squares Cubic Bézier fitter."""
+    if not os.path.isfile(_RUST_CORE_BIN):
+        return []
+    vh, vw = field_u8.shape[:2]
+    if smooth_sigma > 0.05:
+        field_in = cv2.GaussianBlur(field_u8, (3, 3), smooth_sigma)
+    else:
+        field_in = np.ascontiguousarray(field_u8, dtype=np.uint8)
+
+    header = struct.pack(
+        "<4sIIfffffffff",
+        b"JDV2",
+        vw,
+        vh,
+        127.5,
+        float(np.clip(detail, 0.1, 1.0)),
+        float(np.clip(corners, 0.0, 1.0)),
+        float(max(4.0, min_area_px)),
+        float(max(0.35, straight_tol_px)),
+        float(off_x + 0.5 * sx_mm),
+        float(off_y + 0.5 * sy_mm),
+        float(sx_mm),
+        float(sy_mm),
+    )
+    body = _rust_rpc(
+        header + np.ascontiguousarray(field_in, dtype=np.uint8).tobytes(),
+        b"JDR2",
+    )
+    if body is None or len(body) < 4:
+        return []
+
+    buf = memoryview(body)
+    ring_count = struct.unpack_from("<I", buf, 0)[0]
+    pos = 4
+    node_dt = np.dtype("<6f4,u4")
+    outer_pts_by_idx: dict[int, list[dict[str, Any]]] = {}
+    holes_by_parent: dict[int, list[list[dict[str, Any]]]] = {}
+    outer_order: list[int] = []
+
+    stroke = (
+        "#22c55e"
+        if layer_group == "Raised Relief Motifs"
+        else ("#f59e0b" if layer_group == "Engraved Wood Design" else "#38bdf8")
+    )
+
+    for r_i in range(ring_count):
+        if pos + 9 > len(buf):
+            break
+        is_hole, parent_idx, pt_count = struct.unpack_from("<BiI", buf, pos)
+        pos += 9
+        byte_len = pt_count * 28
+        if pos + byte_len > len(buf):
+            break
+        arr = np.frombuffer(buf[pos : pos + byte_len], dtype=node_dt)
+        pos += byte_len
+        coords = arr["f0"].round(4).tolist()
+        flags_l = arr["f1"].tolist()
+        pts: list[dict[str, Any]] = [
+            {
+                "x": c[0],
+                "y": c[1],
+                "corner": bool(fl & 1),
+                "hIn": {"x": c[2], "y": c[3]} if (fl & 2) else None,
+                "hOut": {"x": c[4], "y": c[5]} if (fl & 4) else None,
+            }
+            for c, fl in zip(coords, flags_l)
+        ]
+        if len(pts) < 3:
+            continue
+        if is_hole and parent_idx >= 0:
+            holes_by_parent.setdefault(parent_idx, []).append(pts)
+        else:
+            outer_pts_by_idx[r_i] = pts
+            outer_order.append(r_i)
+
+    span_w, span_h = vw * sx_mm, vh * sy_mm
+    entities: list[dict[str, Any]] = []
+    for r_i in outer_order:
+        pts = outer_pts_by_idx[r_i]
+        holes = holes_by_parent.get(r_i, [])
+        if not holes and len(pts) <= 6:
+            xs = [p["x"] for p in pts]
+            ys = [p["y"] for p in pts]
+            if (max(xs) - min(xs)) >= span_w * 0.94 and (max(ys) - min(ys)) >= span_h * 0.94:
+                continue
+        entities.append({
+            "type": "curve",
+            "points": pts,
+            "holes": holes,
+            "isClosed": True,
+            "color": stroke,
+            "fillColor": None,
+            "strokeColor": stroke,
+            "width": 1.25,
+            "layerGroup": layer_group,
+            "relief": {"enabled": False, "shape": "smooth", "heightMm": 2.0, "radiusMm": 1.2, "mode": "max"},
+        })
+    return entities
+
+
+def _extract_straight_cad_lines(
+    gray_eq_u8: np.ndarray,
+    zone_closed: np.ndarray,
+    wm_sup: np.ndarray | None,
+    off_x: float,
+    off_y: float,
+    sx_mm: float,
+    sy_mm: float,
+    detail: float,
+) -> tuple[list[dict[str, Any]], np.ndarray]:
+    """Detect clean straight architectural rails/stiles/panels via OpenCV LSD + centerline double-wall fusion."""
+    vh, vw = gray_eq_u8.shape[:2]
+    m_dim = min(vw, vh)
+    lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_ADV)
+    raw = lsd.detect(gray_eq_u8)[0]
+    arch_mask = np.zeros((vh, vw), dtype=np.uint8)
+    if raw is None or len(raw) == 0:
+        return [], arch_mask
+
+    min_len = max(20.0, m_dim * (0.042 - float(np.clip(detail, 0.1, 1.0)) * 0.014))
+    zone_d = cv2.dilate(zone_closed, np.ones((7, 7), np.uint8)) > 0
+    near_margin = max(8.0, vw * 0.032)
+
+    kept: list[list[float]] = []
+    for seg in raw.reshape(-1, 4):
+        x1, y1, x2, y2 = float(seg[0]), float(seg[1]), float(seg[2]), float(seg[3])
+        dx, dy = x2 - x1, y2 - y1
+        ln = math.hypot(dx, dy)
+        if ln < min_len:
+            continue
+        ang = abs(math.degrees(math.atan2(dy, dx))) % 180.0
+        is_h = ang <= 2.2 or ang >= 177.8
+        is_v = 87.8 <= ang <= 92.2
+        is_miter = (36.0 <= ang <= 54.0) or (126.0 <= ang <= 144.0)
+        if not (is_h or is_v or is_miter or ln >= min_len * 1.85):
+            continue
+
+        # Verify segment genuinely belongs to carved relief & not outermost border wood grain
+        xs_s = np.clip(np.round(np.linspace(x1, x2, 16)).astype(np.int32), 0, vw - 1)
+        ys_s = np.clip(np.round(np.linspace(y1, y2, 16)).astype(np.int32), 0, vh - 1)
+        if float(zone_d[ys_s, xs_s].mean()) < 0.65:
+            continue
+        if wm_sup is not None and float((wm_sup[ys_s, xs_s] > 0).mean()) > 0.25:
+            continue
+        if is_v and ln < vh * 0.42 and (max(x1, x2) < near_margin or min(x1, x2) > vw - near_margin):
+            continue
+
+        if is_h:
+            ym = 0.5 * (y1 + y2)
+            y1 = y2 = ym
+        elif is_v:
+            xm = 0.5 * (x1 + x2)
+            x1 = x2 = xm
+        kept.append([x1, y1, x2, y2, ln])
+
+    if not kept:
+        return [], arch_mask
+
+    # Sort longest first and fuse parallel double-wall LSD detections (step edge thickness ~3-5px) + colinear gaps
+    kept.sort(key=lambda s: s[4], reverse=True)
+    perp_merge_px = max(4.6, m_dim * 0.0048)
+    gap_bridge_px = max(14.0, m_dim * 0.020)
+    merged: list[list[float]] = []
+    for x1, y1, x2, y2, ln in kept:
+        dx, dy = x2 - x1, y2 - y1
+        ux, uy = dx / ln, dy / ln
+        placed = False
+        for m in merged:
+            mx1, my1, mx2, my2, mln = m
+            mdx, mdy = mx2 - mx1, my2 - my1
+            mux, muy = mdx / mln, mdy / mln
+            dot = ux * mux + uy * muy
+            if abs(dot) < 0.996:
+                continue
+            midx, midy = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+            perp = abs((midx - mx1) * muy - (midy - my1) * mux)
+            if perp > perp_merge_px:
+                continue
+            p1 = (x1 - mx1) * mux + (y1 - my1) * muy
+            p2 = (x2 - mx1) * mux + (y2 - my1) * muy
+            lo_p, hi_p = min(p1, p2), max(p1, p2)
+            ov = min(hi_p, mln) - max(lo_p, 0.0)
+            gap = max(0.0, max(lo_p - mln, -hi_p))
+            if gap <= gap_bridge_px and (ov >= -gap_bridge_px):
+                # If overlapping parallel twin edge, average lateral centerline weighted slightly to stronger/longer
+                if ov > 0.45 * min(ln, mln) and perp >= 1.0:
+                    w_n = ln / (mln + ln)
+                    nx = -muy
+                    ny = mux
+                    signed_perp = ((midx - mx1) * nx + (midy - my1) * ny)
+                    mx1 += nx * signed_perp * w_n
+                    my1 += ny * signed_perp * w_n
+                n_lo = min(0.0, lo_p)
+                n_hi = max(mln, hi_p)
+                m[0] = mx1 + mux * n_lo
+                m[1] = my1 + muy * n_lo
+                m[2] = mx1 + mux * n_hi
+                m[3] = my1 + muy * n_hi
+                m[4] = n_hi - n_lo
+                placed = True
+                break
+        if not placed:
+            merged.append([x1, y1, x2, y2, ln])
+
+    entities: list[dict[str, Any]] = []
+    draw_th = max(3, int(round(m_dim * 0.0042)))
+    for x1, y1, x2, y2, ln in merged:
+        if ln < min_len:
+            continue
+        p1i = (int(round(x1)), int(round(y1)))
+        p2i = (int(round(x2)), int(round(y2)))
+        cv2.line(arch_mask, p1i, p2i, 255, draw_th)
+        entities.append({
+            "type": "line",
+            "x1": round(off_x + (x1 + 0.5) * sx_mm, 4),
+            "y1": round(off_y + (y1 + 0.5) * sy_mm, 4),
+            "x2": round(off_x + (x2 + 0.5) * sx_mm, 4),
+            "y2": round(off_y + (y2 + 0.5) * sy_mm, 4),
+            "isClosed": False,
+            "color": "#22d3ee",
+            "fillColor": None,
+            "strokeColor": "#22d3ee",
+            "width": 1.35,
+            "layerGroup": "Architectural Frame",
+            "relief": {"enabled": False, "shape": "flat", "heightMm": 0.4, "radiusMm": 1.0, "mode": "max"},
+        })
+    return entities, arch_mask
+
+
 def _trace_mask_vtracer(
     mask_u8: np.ndarray,
     off_x: float,
@@ -992,8 +1350,25 @@ def _trace_mask_vtracer(
     smooth_mask: bool = True,
 ) -> list[dict[str, Any]]:
     vh, vw = mask_u8.shape[:2]
+    detail_est = float(np.clip((20.0 - filter_speckle) / 14.0, 0.4, 0.95))
+    corners_est = float(np.clip((corner_thresh - 32.0) / 32.0, 0.2, 0.95))
+    rust_ents = _trace_field_rust(
+        mask_u8,
+        off_x,
+        off_y,
+        sx_mm,
+        sy_mm,
+        detail=detail_est,
+        corners=corners_est,
+        min_area_px=max(16.0, filter_speckle * 2.2),
+        straight_tol_px=1.15,
+        layer_group=layer_group,
+        smooth_sigma=0.72 if smooth_mask else 0.0,
+    )
+    if rust_ents:
+        return rust_ents
+
     if smooth_mask:
-        # Subpixel Gaussian mask smoothing before VTracer eliminates jagged staircase pixel teeth
         sm = cv2.GaussianBlur(mask_u8, (3, 3), 0.72)
         work_m = np.where(sm >= 118, 255, 0).astype(np.uint8)
     else:
@@ -1059,27 +1434,36 @@ def _extract_wood_relief_vectors(
     detail: float,
     corners: float,
     wm_mask: np.ndarray | None = None,
+    noise_px: float = 10.0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Multi-layer clean closed-region relief vectorization + Retinex shadow equalization + convergence loop."""
+    """Multi-layer clean Architectural CAD Lines + crevice-split relief petals + Retinex + Rust Bézier convergence."""
     vh, vw = sub_bgr.shape[:2]
+    m_dim = min(vw, vh)
     span_w, span_h = vw * sx_mm, vh * sy_mm
-    den = cv2.fastNlMeansDenoisingColored(sub_bgr, None, 6, 6, 7, 21)
-    epf_c = cv2.edgePreservingFilter(den, flags=cv2.NORMCONV_FILTER, sigma_s=22, sigma_r=0.22)
-    epf_f = cv2.edgePreservingFilter(den, flags=cv2.NORMCONV_FILTER, sigma_s=12, sigma_r=0.16)
+    # Fast resolution-bounded NLM denoise (avoids slow 10s stalls on 4K inputs while preserving clean grain rejection)
+    if max(vw, vh) > 1650:
+        sc_d = 1650.0 / max(vw, vh)
+        dw, dh = max(64, int(round(vw * sc_d))), max(64, int(round(vh * sc_d)))
+        den_s = cv2.fastNlMeansDenoisingColored(cv2.resize(sub_bgr, (dw, dh), interpolation=cv2.INTER_AREA), None, 6, 6, 7, 21)
+        den = cv2.resize(den_s, (vw, vh), interpolation=cv2.INTER_CUBIC)
+    else:
+        den = cv2.fastNlMeansDenoisingColored(sub_bgr, None, 6, 6, 7, 21)
+    epf_c = cv2.edgePreservingFilter(den, flags=cv2.NORMCONV_FILTER, sigma_s=20, sigma_r=0.22)
+    epf_f = cv2.edgePreservingFilter(den, flags=cv2.NORMCONV_FILTER, sigma_s=11, sigma_r=0.16)
 
     Lc_raw = cv2.bilateralFilter(cv2.cvtColor(epf_c, cv2.COLOR_BGR2LAB)[:, :, 0], d=7, sigmaColor=24, sigmaSpace=16).astype(np.float32)
     Lf_raw = cv2.bilateralFilter(cv2.cvtColor(epf_f, cv2.COLOR_BGR2LAB)[:, :, 0], d=7, sigmaColor=20, sigmaSpace=14).astype(np.float32)
-    # Apply local Multi-Scale Retinex equalization so low-light / shadowed carvings match sunlit SNR cleanly
+    # Multi-Scale Retinex equalization so low-light / shadowed carvings match sunlit SNR cleanly
     Lc = _equalize_illumination_retinex(Lc_raw, strength=0.62)
     Lf = _equalize_illumination_retinex(Lf_raw, strength=0.60)
     Lf_u8 = np.clip(Lf, 0, 255).astype(np.uint8)
 
-    r_f = max(5, int(round(min(vw, vh) * 0.006)) | 1)
-    r_m = max(13, int(round(min(vw, vh) * 0.018)) | 1)
+    r_f = max(5, int(round(m_dim * 0.006)) | 1)
+    r_m = max(13, int(round(m_dim * 0.018)) | 1)
     ker_f = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_f, r_f))
     ker_m = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_m, r_m))
 
-    # Coarse carving gate: balance directional X and Y gradients so vertical panel stiles aren't dropped by overhead light!
+    # Coarse carving gate balanced per axis so overhead lighting doesn't drop vertical rails/stiles
     bh_c = cv2.morphologyEx(Lc, cv2.MORPH_BLACKHAT, ker_f) * 0.58 + cv2.morphologyEx(Lc, cv2.MORPH_BLACKHAT, ker_m) * 0.62
     gx_c = np.abs(cv2.Scharr(Lc, cv2.CV_32F, 1, 0) / 16.0)
     gy_c = np.abs(cv2.Scharr(Lc, cv2.CV_32F, 0, 1) / 16.0)
@@ -1097,21 +1481,22 @@ def _extract_wood_relief_vectors(
         (bh_c >= max(float(np.percentile(bh_c, 77)), c_med + 3.8 * max(c_mad, 1.3), 17.5) + detail_bias * 0.35)
         | (g_c >= max(float(np.percentile(g_c, 76)), gc_med + 3.4 * max(gc_mad, 1.3), 15.5) + detail_bias * 0.35)
     ).astype(np.uint8)
-    k_dil = max(11, int(round(min(vw, vh) * 0.015)) | 1)
+    k_dil = max(11, int(round(m_dim * 0.015)) | 1)
     zone_dil = cv2.dilate(c_zone, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_dil, k_dil)))
-    k_rail = max(25, int(round(min(vw, vh) * 0.032)) | 1)
+    k_rail = max(25, int(round(m_dim * 0.032)) | 1)
     zone_closed = cv2.morphologyEx(zone_dil, cv2.MORPH_CLOSE, np.ones((k_rail, 3), np.uint8))
     zone_closed = cv2.morphologyEx(zone_closed, cv2.MORPH_CLOSE, np.ones((3, k_rail), np.uint8))
 
-    # Multi-Layer Decomposition: crisp raised carving volumes (strictly interior petals/motifs) vs closed structural grooves
-    bg_surf = cv2.GaussianBlur(Lf, (0, 0), sigmaX=max(14.0, min(vw, vh) * 0.042))
-    elev = Lf - bg_surf
-    pos_floor = max(11.5, float(np.percentile(elev[zone_dil > 0] if zone_dil.any() else elev, 72)) * 0.78) + detail_bias * 0.30
-    raised_raw = np.where((zone_dil > 0) & (elev >= pos_floor), 255, 0).astype(np.uint8)
-    raised_raw = cv2.morphologyEx(raised_raw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-    raised_raw = cv2.morphologyEx(raised_raw, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    wm_sup = None
+    if wm_mask is not None and wm_mask.shape[:2] == (vh, vw) and wm_mask.any():
+        wm_sup = cv2.dilate((wm_mask > 0).astype(np.uint8) * 255, np.ones((11, 11), np.uint8))
 
-    # Recessed valleys, vertical stiles & horizontal rails normalized per-axis so frame rectangles close completely!
+    # Stage 1: Architectural Straight CAD Lines (clean straight door stiles, rails & molding panels via OpenCV LSD)
+    arch_lines, arch_line_mask = _extract_straight_cad_lines(
+        Lf_u8, zone_closed, wm_sup, off_x, off_y, sx_mm, sy_mm, detail
+    )
+
+    # Stage 2: Tight Crevice-Split Carved Petals & Motifs (kills the blurred 4.2% sigma potato blob overlap!)
     bh_f = cv2.morphologyEx(Lf, cv2.MORPH_BLACKHAT, ker_f) * 0.65 + cv2.morphologyEx(Lf, cv2.MORPH_BLACKHAT, ker_m) * 0.55
     gx_f = np.abs(cv2.Scharr(Lf, cv2.CV_32F, 1, 0) / 16.0)
     gy_f = np.abs(cv2.Scharr(Lf, cv2.CV_32F, 0, 1) / 16.0)
@@ -1125,9 +1510,14 @@ def _extract_wood_relief_vectors(
     comb = np.maximum(np.clip((bh_f - bh_floor_f) * 3.15, 0, 255), np.clip((g_f - g_floor_f) * 2.90, 0, 255) * 0.92)
     comb_masked = np.where((zone_closed > 0) | (bh_c > c_med + 5.2 * max(c_mad, 1.3)), comb, 0.0).astype(np.uint8)
 
-    # Directional rail healing bridges faint overhead-lit vertical panel borders & horizontal frame bars cleanly
-    v_rail = cv2.morphologyEx(np.where((gx_f * (20.0 / gxf_sc) >= g_floor_f * 0.85) & (zone_closed > 0), 255, 0).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((21, 1), np.uint8))
-    h_rail = cv2.morphologyEx(np.where((gy_f * (20.0 / gyf_sc) >= g_floor_f * 0.85) & (zone_closed > 0), 255, 0).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((1, 21), np.uint8))
+    # Tight 1.4% surface separates individual leaves/petals explicitly cut by dark carved crevices
+    bg_tight = cv2.GaussianBlur(Lf, (0, 0), sigmaX=max(7.0, m_dim * 0.0145))
+    elev_tight = Lf - bg_tight
+    crevice_cut = (bh_f >= bh_floor_f * 1.12) & (zone_closed > 0)
+    pos_vals = elev_tight[zone_dil > 0] if zone_dil.any() else elev_tight
+    pos_floor_t = max(8.5, float(np.percentile(pos_vals, 68)) * 0.76) + detail_bias * 0.24
+    raised_raw = np.where((zone_dil > 0) & (elev_tight >= pos_floor_t) & (~crevice_cut), 255, 0).astype(np.uint8)
+    raised_raw = cv2.morphologyEx(raised_raw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
 
     med_v = float(np.median(Lf_u8))
     canny_edges = cv2.Canny(Lf_u8, max(14, int(med_v * 0.28)), max(40, int(med_v * 0.78)))
@@ -1136,21 +1526,19 @@ def _extract_wood_relief_vectors(
 
     _, groove_mask = cv2.threshold(comb_masked, max(15, int(round(22 + detail_bias * 0.4))), 255, cv2.THRESH_BINARY)
     groove_mask = cv2.bitwise_or(groove_mask, canny_dil)
-    groove_mask = cv2.bitwise_or(groove_mask, cv2.bitwise_or(v_rail, h_rail))
     groove_mask = cv2.morphologyEx(groove_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
 
-    # Filter out bare plank speckles, border-stile vertical wood grain & inpainted watermark margins cleanly
-    k_act = max(21, int(round(min(vw, vh) * 0.028)) | 1)
+    # Noise/speckle threshold dynamically driven by user noise_px & 4K canvas scale
+    noise_scale = max(0.35, float(noise_px) / 10.0)
+    k_act = max(21, int(round(m_dim * 0.028)) | 1)
     act_map = cv2.GaussianBlur((comb_masked > 42).astype(np.float32), (k_act, k_act), 0)
-    min_area = max(42, int(vw * vh * 0.000038))
-    min_hole_px = max(36, int(vw * vh * 0.000032))
+    min_area = max(32, int(vw * vh * 0.000032 * noise_scale))
+    min_hole_px = max(28, int(vw * vh * 0.000028 * noise_scale))
     max_grain_w = max(18, int(vw * 0.022))
 
-    wm_sup = None
-    if wm_mask is not None and wm_mask.shape[:2] == (vh, vw) and wm_mask.any():
-        wm_sup = cv2.dilate((wm_mask > 0).astype(np.uint8) * 255, np.ones((11, 11), np.uint8))
+    arch_corridor = cv2.dilate(arch_line_mask, np.ones((5, 5), np.uint8)) if arch_line_mask.any() else None
 
-    def filter_mask_components(src_m: np.ndarray, min_a: int, keep_rails: bool = True) -> np.ndarray:
+    def filter_mask_components(src_m: np.ndarray, min_a: int, keep_rails: bool = True, skip_arch: bool = True) -> np.ndarray:
         nl, lbl, st, _ = cv2.connectedComponentsWithStats(src_m)
         out_m = np.zeros_like(src_m)
         for i in range(1, nl):
@@ -1159,71 +1547,87 @@ def _extract_wood_relief_vectors(
                 continue
             bxi, byi, bwi, bhi = int(st[i, 0]), int(st[i, 1]), int(st[i, 2]), int(st[i, 3])
             cm = lbl[byi : byi + bhi, bxi : bxi + bwi] == i
-            # Suppress components trapped on inpainted watermark regions (e.g. Doors Fair bottom strip)
             if wm_sup is not None and float((wm_sup[byi : byi + bhi, bxi : bxi + bwi][cm] > 0).mean()) > 0.45:
                 continue
-            # Suppress narrow outermost side-stile wood grain confetti strips hugging image left/right margins
+            # Avoid jagged duplicate spline walls directly tracing straight LSD Architectural Frame lines
+            if skip_arch and arch_corridor is not None and area < vw * vh * 0.04:
+                arch_ov = float((arch_corridor[byi : byi + bhi, bxi : bxi + bwi][cm] > 0).mean())
+                if arch_ov > 0.72:
+                    continue
             near_side_edge = (bxi <= vw * 0.035 and (bxi + bwi) <= vw * 0.085) or ((bxi + bwi) >= vw * 0.965 and bxi >= vw * 0.915)
             if near_side_edge and bwi <= max_grain_w * 1.4 and bhi < vh * 0.65:
                 continue
             sc = comb_masked[byi : byi + bhi, bxi : bxi + bwi][cm]
             pk, mn = int(sc.max()), float(sc.mean())
             act_mn = float(act_map[byi : byi + bhi, bxi : bxi + bwi][cm].mean())
-            if act_mn < 0.042 and pk < 96 and area < min_a * 10:
+            if act_mn < 0.040 and pk < 94 and area < min_a * 10:
                 continue
             if bhi >= bwi * 3.8 and bwi <= max_grain_w:
-                if (mn < 84.0 and pk < 112 and bhi < vh * 0.28) or (act_mn < 0.072 and bhi < vh * 0.48 and mn < 98.0):
+                if (mn < 84.0 and pk < 112 and bhi < vh * 0.28) or (act_mn < 0.070 and bhi < vh * 0.48 and mn < 98.0):
                     continue
-            if not keep_rails and area < min_a * 2 and pk < 92:
+            if not keep_rails and area < min_a * 1.8 and pk < 90:
                 continue
-            if area < min_a * 3 and pk < 82:
+            if area < min_a * 2.8 and pk < 80:
                 continue
             out_m[lbl == i] = 255
         if wm_sup is not None:
             out_m[wm_sup > 0] = 0
         return _fill_tiny_holes(out_m, min_hole_px)
 
-    clean_grooves = filter_mask_components(groove_mask, min_area, keep_rails=True)
-    clean_raised = filter_mask_components(raised_raw, max(64, int(min_area * 1.7)), keep_rails=False)
+    clean_grooves = filter_mask_components(groove_mask, min_area, keep_rails=True, skip_arch=True)
+    clean_raised = filter_mask_components(raised_raw, max(48, int(min_area * 1.25)), keep_rails=False, skip_arch=True)
 
-    # Keep outer bevel frame borders intact while separating inner thick relief bodies cleanly
+    # Subtract crisp straight CAD lines before rasterizing groove_unique so panel molding walls stay sharp 2-pt lines
+    if arch_line_mask.any():
+        groove_sub = cv2.bitwise_and(clean_grooves, 255 - arch_line_mask)
+        groove_sub = filter_mask_components(groove_sub, max(32, int(min_area * 0.85)), keep_rails=True, skip_arch=True)
+    else:
+        groove_sub = clean_grooves
+
     raised_frac = float((clean_raised > 0).sum()) / max(1, vw * vh)
-    groove_unique = clean_grooves
-    if raised_frac >= 0.015:
+    groove_unique = groove_sub
+    if raised_frac >= 0.014:
         groove_unique = _fill_tiny_holes(
-            cv2.bitwise_and(clean_grooves, 255 - cv2.erode(clean_raised, np.ones((5, 5), np.uint8))),
+            cv2.bitwise_and(groove_sub, 255 - cv2.erode(clean_raised, np.ones((3, 3), np.uint8))),
             min_hole_px,
         )
 
-    target_mask = cv2.bitwise_or(clean_grooves, clean_raised)
+    target_mask = cv2.bitwise_or(arch_line_mask, cv2.bitwise_or(clean_grooves, clean_raised))
     target_mask = cv2.bitwise_or(target_mask, cv2.bitwise_and(canny_zone, ((comb_masked > 10).astype(np.uint8)) * 255))
     if wm_sup is not None:
         target_mask[wm_sup > 0] = 0
 
-    corner_t = int(round(40 + corners * 18))
-    speckle_base = max(10, int(round(20 - detail * 9)))
+    speckle_px = max(18.0, float(min_area) * 0.85)
+    straight_tol = max(0.85, 1.35 - detail * 0.45)
 
-    # Closed-Loop Convergence Iter 1: Clean Layered Regions (Raised Relief Motifs + Carved Grooves & Panels)
-    all_ents: list[dict[str, Any]] = []
-    if raised_frac >= 0.014:
+    # Stage 3: Rust Multi-Core Subpixel Vectorization + Closed-Loop Convergence Verification
+    all_ents: list[dict[str, Any]] = list(arch_lines)
+    if raised_frac >= 0.012:
         all_ents.extend(
-            _trace_mask_vtracer(
+            _trace_field_rust(
                 clean_raised, off_x, off_y, sx_mm, sy_mm,
-                max(12, speckle_base + 4), corner_t, 5.2,
+                detail=detail, corners=corners, min_area_px=speckle_px * 1.15,
+                straight_tol_px=straight_tol, layer_group="Raised Relief Motifs", smooth_sigma=0.72,
+            ) or _trace_mask_vtracer(
+                clean_raised, off_x, off_y, sx_mm, sy_mm,
+                max(10, int(round(18 - detail * 8))), int(round(40 + corners * 18)), 5.0,
                 layer_group="Raised Relief Motifs", smooth_mask=True,
             )
         )
     all_ents.extend(
-        _trace_mask_vtracer(
+        _trace_field_rust(
             groove_unique, off_x, off_y, sx_mm, sy_mm,
-            speckle_base, corner_t, 4.8,
+            detail=detail, corners=corners, min_area_px=speckle_px,
+            straight_tol_px=straight_tol, layer_group="Carved Grooves & Panels", smooth_sigma=0.68,
+        ) or _trace_mask_vtracer(
+            groove_unique, off_x, off_y, sx_mm, sy_mm,
+            max(8, int(round(16 - detail * 8))), int(round(40 + corners * 18)), 4.6,
             layer_group="Carved Grooves & Panels", smooth_mask=True,
         )
     )
     cov, min_tile, uncovered = _measure_vector_coverage(all_ents, target_mask, off_x, off_y, span_w, span_h)
     iters = 1
 
-    # Closed-Loop Iter 2..4: Targeted Residual Recovery ONLY inside uncovered motifs/shadow tiles
     def merge_non_overlapping(base: list[dict[str, Any]], extra: list[dict[str, Any]]):
         if not extra:
             return
@@ -1247,7 +1651,7 @@ def _extract_wood_relief_vectors(
                 inter = ix * iy
                 ea = max(1e-4, (x1e - x0e) * (y1e - y0e))
                 ba = max(1e-4, (bx1 - bx0) * (by1 - by0))
-                if inter / min(ea, ba) > 0.78 and abs(ea - ba) / max(ea, ba) < 0.35:
+                if inter / min(ea, ba) > 0.76 and abs(ea - ba) / max(ea, ba) < 0.35:
                     dup = True
                     break
             if not dup:
@@ -1259,9 +1663,15 @@ def _extract_wood_relief_vectors(
         if iters == 2:
             dark_boost = cv2.bitwise_and(cv2.dilate(((comb_masked > 10).astype(np.uint8)) * 255, np.ones((3, 3), np.uint8)), uncovered)
             dark_boost = cv2.bitwise_or(dark_boost, cv2.bitwise_and(canny_dil, uncovered))
+            if arch_line_mask.any():
+                dark_boost = cv2.bitwise_and(dark_boost, 255 - arch_line_mask)
             dark_boost = cv2.morphologyEx(dark_boost, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
             if int((dark_boost > 0).sum()) > 32:
-                pass2 = _trace_mask_vtracer(dark_boost, off_x, off_y, sx_mm, sy_mm, max(4, speckle_base - 2), corner_t, 3.6, "Carved Grooves & Panels", True)
+                pass2 = _trace_field_rust(
+                    dark_boost, off_x, off_y, sx_mm, sy_mm,
+                    detail=detail, corners=corners, min_area_px=max(14.0, speckle_px * 0.72),
+                    straight_tol_px=straight_tol, layer_group="Carved Grooves & Panels", smooth_sigma=0.65,
+                )
                 merge_non_overlapping(all_ents, pass2)
         elif iters == 3:
             ai_ents = _extract_ai_model_recovery_vectors(sub_bgr, off_x, off_y, sx_mm, sy_mm, corners)
@@ -1287,7 +1697,11 @@ def _extract_wood_relief_vectors(
             res_bin = cv2.bitwise_and(cv2.dilate(((g_f > g_floor_f * 0.72).astype(np.uint8)) * 255, np.ones((2, 2), np.uint8)), uncovered)
             res_bin = cv2.bitwise_and(res_bin, cv2.dilate(zone_dil, np.ones((11, 11), np.uint8)) * 255)
             if int((res_bin > 0).sum()) > 28:
-                pass4 = _trace_mask_vtracer(res_bin, off_x, off_y, sx_mm, sy_mm, 4, corner_t, 3.2, "Carved Grooves & Panels", True)
+                pass4 = _trace_field_rust(
+                    res_bin, off_x, off_y, sx_mm, sy_mm,
+                    detail=detail, corners=corners, min_area_px=max(14.0, speckle_px * 0.65),
+                    straight_tol_px=straight_tol, layer_group="Carved Grooves & Panels", smooth_sigma=0.60,
+                )
                 merge_non_overlapping(all_ents, pass4)
 
         cov, min_tile, uncovered = _measure_vector_coverage(all_ents, target_mask, off_x, off_y, span_w, span_h)
@@ -1299,18 +1713,17 @@ def _extract_wood_relief_vectors(
         "converged": bool(cov >= 0.945 and min_tile >= 0.84),
     }
 
-    # Organize & sort entities top-to-bottom cleanly by layerGroup with readable sequential layer names
     group_order = {"Architectural Frame": 0, "Raised Relief Motifs": 1, "Carved Grooves & Panels": 2}
     all_ents.sort(key=lambda e: (
         group_order.get(e.get("layerGroup", ""), 3),
-        min((p["y"] for p in (e.get("points") or [{"y": 0.0}])), default=0.0),
-        min((p["x"] for p in (e.get("points") or [{"x": 0.0}])), default=0.0),
+        min((p["y"] for p in (e.get("points") or [{"y": e.get("y1", 0.0)}])), default=e.get("y1", 0.0)),
+        min((p["x"] for p in (e.get("points") or [{"x": e.get("x1", 0.0)}])), default=e.get("x1", 0.0)),
     ))
     g_cnt: dict[str, int] = {}
     for e in all_ents:
         lg = e.get("layerGroup", "Carved Grooves & Panels")
         g_cnt[lg] = g_cnt.get(lg, 0) + 1
-        prefix = "Carved Motif" if lg == "Raised Relief Motifs" else ("Frame Part" if lg == "Architectural Frame" else "Carved Panel")
+        prefix = "Carved Motif" if lg == "Raised Relief Motifs" else ("Frame Line" if e.get("type") == "line" else ("Frame Part" if lg == "Architectural Frame" else "Carved Panel"))
         e["name"] = f"{prefix} #{g_cnt[lg]}"
 
     return all_ents, conv
@@ -1325,6 +1738,8 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
     corners = float(req.get("corners", 0.65))
     color_count = int(req.get("color_count", 6))
     ignore_bg = bool(req.get("ignore_bg", True))
+    trace_quality = int(np.clip(req.get("trace_quality", 3840), 1024, 3840))
+    noise_px = float(np.clip(req.get("noise_px", 10.0), 1.0, 64.0))
     width_mm = float(req.get("width_mm", 100.0))
     height_mm = float(req.get("height_mm", 100.0))
 
@@ -1361,21 +1776,21 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
             sub = np.clip(sub.astype(np.float32) * alpha_f + 255.0 * (1.0 - alpha_f), 0, 255).astype(np.uint8)
 
     sh0, sw0 = sub.shape[:2]
+    target_long = min(3840, trace_quality)
     if roi is not None or not is_logo:
-        if min(sw0, sh0) < 1200:
-            sc = min(3.2, 1200.0 / max(1, min(sw0, sh0)))
-            if max(sw0, sh0) * sc > 2800:
-                sc = 2800.0 / max(1, max(sw0, sh0))
+        proc_cap = min(target_long, 2600 if trace_quality >= 3840 else target_long)
+        if max(sw0, sh0) < min(2048, proc_cap):
+            sc = min(3.4, min(2048.0, float(proc_cap)) / max(1, max(sw0, sh0)))
             if sc > 1.02:
+                if max(sw0, sh0) <= 1400:
+                    sub = cv2.fastNlMeansDenoisingColored(sub, None, 4, 4, 7, 21)
                 nw_s, nh_s = int(round(sw0 * sc)), int(round(sh0 * sc))
                 sub = cv2.resize(sub, (nw_s, nh_s), interpolation=cv2.INTER_LANCZOS4)
                 if wm_mask is not None:
                     wm_mask = cv2.resize(wm_mask, (nw_s, nh_s), interpolation=cv2.INTER_NEAREST)
-                if sc > 1.25:
-                    sub = cv2.fastNlMeansDenoisingColored(sub, None, 4, 4, 7, 21)
-                    sub = cv2.addWeighted(sub, 1.15, cv2.GaussianBlur(sub, (0, 0), 1.05), -0.15, 0)
-    elif max(sw0, sh0) < 1100:
-        sc = min(2.4, 1280.0 / max(1, max(sw0, sh0)))
+                sub = cv2.addWeighted(sub, 1.15, cv2.GaussianBlur(sub, (0, 0), 1.05), -0.15, 0)
+    elif max(sw0, sh0) < min(1600, target_long):
+        sc = min(2.8, min(1600.0, float(target_long)) / max(1, max(sw0, sh0)))
         nw_s, nh_s = int(round(sw0 * sc)), int(round(sh0 * sc))
         sub = cv2.resize(sub, (nw_s, nh_s), interpolation=cv2.INTER_LANCZOS4)
         if wm_mask is not None:
@@ -1478,7 +1893,9 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
             )
         )
     elif roi is not None and not is_engraved_wood_plaque:
-        wood_ents, convergence = _extract_wood_relief_vectors(sub, off_x, off_y, sx_mm, sy_mm, detail, corners, wm_mask=wm_mask)
+        wood_ents, convergence = _extract_wood_relief_vectors(
+            sub, off_x, off_y, sx_mm, sy_mm, detail, corners, wm_mask=wm_mask, noise_px=noise_px
+        )
         entities.extend(wood_ents)
         total_rings = sum(1 + len(e.get("holes", [])) for e in entities)
         if total_rings < 12:
@@ -1579,8 +1996,8 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "ok": True,
-        "engine": "opencv-vtracer-vision",
-        "entities": entities[:1100],
+        "engine": "opencv-rust-4k-vision",
+        "entities": entities[:1400],
         "convergence": convergence,
         "roi": None if roi is None else {"x0": x0, "y0": y0, "x1": x1, "y1": y1, "has_bg": roi["has_bg"]},
     }

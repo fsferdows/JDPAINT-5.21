@@ -1,0 +1,11 @@
+[package]
+name = "jdpaint_rust_core"
+version = "0.2.0"
+edition = "2021"
+description = "Native multi-core 4K subpixel contour Bézier vectorization and Screened Poisson 3D bas-relief engine for JDPaint 5.21"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

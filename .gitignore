@@ -36,3 +36,6 @@ Thumbs.db
 
 # agentcad runtime session logs
 .agentcad/
+
+# Rust build artifacts
+cad-kernel/jdpaint_rust_core/target/

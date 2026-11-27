@@ -2154,7 +2154,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // ============================================================
   const cadKernelStatusEl = document.getElementById('cad-kernel-status');
   async function refreshCadKernelStatus({ passive = false } = {}) {
-    const info = await CadKernelBridge.checkHealth(1200, { passive });
+    const info = await CadKernelBridge.checkHealth(3500, { passive });
     if (!cadKernelStatusEl) return info;
     if (info.ok) {
       cadKernelStatusEl.textContent = `Connected: build123d ${info.build123d_version} + agentcad ${info.agentcad_version}`;
