@@ -169,7 +169,7 @@ def detect_furniture_roi(bgr: np.ndarray) -> dict[str, Any] | None:
         l_tol = max(12.0, min(32.0, l_var * 2.2))
         panel = (np.abs(L - l_med) <= l_tol).astype(np.float32)
     else:
-        tol_c = np.where(L < 28.0, 28.0, 18.5)
+        tol_c = np.where(L < 22.0, 22.0, 17.0)
         panel = ((dc_eq <= tol_c) & (np.abs(L - l_med) <= 46.0)).astype(np.float32)
 
     y0_b, y1_b = int(h * 0.18), int(h * 0.76)
@@ -181,7 +181,7 @@ def detect_furniture_roi(bgr: np.ndarray) -> dict[str, Any] | None:
     in_run = False
     start = 0
     for x in range(w):
-        if sm_col[x] >= 0.30 and not in_run:
+        if sm_col[x] >= 0.34 and not in_run:
             in_run = True
             start = x
         elif sm_col[x] < 0.25 and in_run:
@@ -269,9 +269,13 @@ def detect_furniture_roi(bgr: np.ndarray) -> dict[str, Any] | None:
     gy = np.abs(cv2.Sobel(gray[:, rx0 : rx1 + 1], cv2.CV_32F, 0, 1, ksize=3)).mean(axis=1)
     px, py = max(4, int(w * 0.035)), max(4, int(h * 0.035))
     if rx0 > px:
-        rx0 = max(0, rx0 - px) + int(np.argmax(gx[max(0, rx0 - px) : min(w, rx0 + px)]))
+        x_lo, x_hi = max(0, rx0 - px), min(w, rx0 + px)
+        in_w = np.array([float(panel[y0_b:y1_b, min(w - 1, xx + 4) : min(w, xx + 16)].mean()) for xx in range(x_lo, x_hi)], dtype=np.float32)
+        rx0 = x_lo + int(np.argmax(gx[x_lo:x_hi] * (0.25 + in_w)))
     if rx1 < w - px:
-        rx1 = max(0, rx1 - px) + int(np.argmax(gx[max(0, rx1 - px) : min(w, rx1 + px)]))
+        x_lo, x_hi = max(0, rx1 - px), min(w, rx1 + px)
+        in_w = np.array([float(panel[y0_b:y1_b, max(0, xx - 15) : max(1, xx - 3)].mean()) for xx in range(x_lo, x_hi)], dtype=np.float32)
+        rx1 = x_lo + int(np.argmax(gx[x_lo:x_hi] * (0.25 + in_w)))
     if ry0 > py:
         ry0 = max(0, ry0 - py) + int(np.argmax(gy[max(0, ry0 - py) : min(h, ry0 + py)]))
     if ry1 < h - py:
@@ -279,13 +283,13 @@ def detect_furniture_roi(bgr: np.ndarray) -> dict[str, Any] | None:
         y_lo = max(ry0 + int((ry1 - ry0) * 0.68), ry1 - int(h * 0.18))
         y_hi = min(h, ry1 + py)
         row_dark = (L[y_lo:y_hi, rx0 : rx1 + 1] < 24.0).mean(axis=1)
-        row_white = ((L[y_lo:y_hi, rx0 : rx1 + 1] > 188.0) & (dc[y_lo:y_hi, rx0 : rx1 + 1] < 16.0)).mean(axis=1)
+        row_white = ((L[y_lo:y_hi, rx0 : rx1 + 1] > 74.0) & (dc[y_lo:y_hi, rx0 : rx1 + 1] < 16.0)).mean(axis=1)
         row_edge = gy[y_lo:y_hi]
         score = row_edge + row_dark * 55.0 - row_white * 140.0
         ry1 = y_lo + int(np.argmax(score))
 
     # Trim bottom/top pure white catalog margin strips (e.g. Doors Fair footer) cleanly before crop
-    sub_w_check = ((L[ry0 : ry1 + 1, rx0 : rx1 + 1] > 192.0) & (dc[ry0 : ry1 + 1, rx0 : rx1 + 1] < 18.0)).mean(axis=1)
+    sub_w_check = ((L[ry0 : ry1 + 1, rx0 : rx1 + 1] > 75.5) & (dc[ry0 : ry1 + 1, rx0 : rx1 + 1] < 18.0)).mean(axis=1)
     while ry1 - ry0 > int(h * 0.35) and len(sub_w_check) > 8 and sub_w_check[-1] > 0.58:
         ry1 -= 1
         sub_w_check = sub_w_check[:-1]
@@ -320,7 +324,8 @@ def _inpaint_watermarks(sub_bgr: np.ndarray, dc_sub: np.ndarray, L_sub: np.ndarr
     rgb_sat = np.maximum(np.maximum(r, g), b).astype(np.int16) - np.minimum(np.minimum(r, g), b).astype(np.int16)
     luma_raw = 0.2126 * r + 0.7152 * g + 0.0722 * b
 
-    is_bright_wm = (L_sub > l_med + 14.0) & (rgb_sat < 22) & (dc_sub > 16.0)
+    # Neutral bright overlays (aarsun/shutterstock) have low chroma saturation vs glossy wood grain speculars
+    is_bright_wm = (L_sub > l_med + 20.0) & (rgb_sat < 14) & (dc_sub > 18.0)
     is_neutral_ink = (l_med > 82.0) & (luma_raw < 74.0) & (rgb_sat < 14) & ((L_sub < l_med * 0.72) | (dc_sub > 14.0))
     # Pure crimson/red graphic ink (Doors Fair R~203, G~32 -> G/R~0.16) never matches warm oak/mahogany wood (G/R>=0.38)
     is_red_accent = (r >= 145) & (r.astype(np.int16) - np.maximum(g, b).astype(np.int16) >= 115) & (g.astype(np.float32) < r.astype(np.float32) * 0.34) & (dc_sub > 18.0)
@@ -1644,14 +1649,60 @@ def _extract_wood_relief_vectors(
         float(np.median(bh_fine_crev)) + 2.8 * max(float(np.median(np.abs(bh_fine_crev - np.median(bh_fine_crev)))), 1.0),
         8.2,
     )
-    crevice_cut = (bh_fine_crev >= bh_fine_fl * 0.94) & (zone_closed > 0)
+    # NLM-denoised (pre-EPF) luminance keeps razor-sharp 1-2px inter-petal/feather crevices without wood-grain speckle
+    L_den = _equalize_illumination_retinex(
+        cv2.cvtColor(den, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32),
+        strength=0.60,
+    )
+    bh_sharp = cv2.morphologyEx(np.clip(L_den, 0, 255).astype(np.float32), cv2.MORPH_BLACKHAT, ker_f)
+    bh_sharp_fl = max(
+        float(np.percentile(bh_sharp, 80)),
+        float(np.median(bh_sharp)) + 3.0 * max(float(np.median(np.abs(bh_sharp - np.median(bh_sharp)))), 1.0),
+        10.5,
+    )
+    # Sharper crevice + saddle-valley split prevents adjacent overlapping motifs from bridging into mega-blobs
+    crevice_cut = ((bh_fine_crev >= bh_fine_fl * 0.88) | (bh_sharp >= bh_sharp_fl * 0.90)) & (zone_closed > 0)
     # Local contrast adaptation ensures shadowed roses, top berries, & dark ribbed petals equal sunlit leaf recall
     env_wh = np.maximum(15.0, cv2.GaussianBlur(wh_petal, (0, 0), sigmaX=max(14.0, m_dim * 0.028)))
     wh_score = wh_petal * 0.55 + np.clip((wh_petal / env_wh) * 28.0, 0.0, 90.0) * 0.45
     pos_vals = wh_score[zone_dil > 0] if zone_dil.any() else wh_score
     pos_floor_t = max(12.0, float(np.percentile(pos_vals, 42)) * 0.72) + detail_bias * 0.20
-    raised_raw = np.where((zone_dil > 0) & (wh_score >= pos_floor_t) & (wh_petal >= 3.2) & (~crevice_cut), 255, 0).astype(np.uint8)
+    # Cut fine gradient/BlackHat saddles only along narrow dim valleys between bright raised domes
+    ridge_valley = (g_f >= g_floor_f * 1.18) & ((bh_fine_crev >= bh_fine_fl * 0.58) | (bh_sharp >= bh_sharp_fl * 0.62)) & (wh_score < pos_floor_t * 1.65)
+    raised_raw = np.where((zone_dil > 0) & (wh_score >= pos_floor_t) & (wh_petal >= 3.2) & (~crevice_cut) & (~ridge_valley), 255, 0).astype(np.uint8)
     raised_raw = cv2.morphologyEx(raised_raw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+
+    def _split_oversized_necks(src_m: np.ndarray, *, for_groove: bool = False) -> np.ndarray:
+        """Split fused multi-motif mats along thin shadow/gradient or geometric saddle pinches."""
+        out_s = src_m.copy()
+        nl_r, lbl_r, st_r, _ = cv2.connectedComponentsWithStats(out_s)
+        span_frac = 0.14
+        max_span_x, max_span_y = vw * span_frac, vh * span_frac
+        for ri in range(1, nl_r):
+            rx_i, ry_i, rw_i, rh_i, ra_i = (
+                int(st_r[ri, 0]), int(st_r[ri, 1]), int(st_r[ri, 2]), int(st_r[ri, 3]), int(st_r[ri, 4])
+            )
+            if (rw_i > max_span_x or rh_i > max_span_y) and ra_i > vw * vh * 0.0040:
+                sl = (slice(ry_i, ry_i + rh_i), slice(rx_i, rx_i + rw_i))
+                sub_m = (lbl_r[sl] == ri).astype(np.uint8) * 255
+                dist_m = cv2.distanceTransform(sub_m, cv2.DIST_L2, 5)
+                local_pk = cv2.dilate(dist_m, np.ones((11, 11), np.uint8))
+                bh_sub = bh_sharp[sl]
+                g_sub = g_f[sl]
+                wh_sub = wh_score[sl]
+                is_pinch = (dist_m <= max(3.2, m_dim * 0.0046)) | (
+                    (dist_m < local_pk * 0.62) & (dist_m <= max(6.0, m_dim * 0.0080))
+                )
+                if for_groove:
+                    gate = (dist_m < local_pk * 0.60) | (wh_sub >= pos_floor_t * 0.48) | (g_sub >= g_floor_f * 0.88)
+                else:
+                    gate = (bh_sub >= bh_sharp_fl * 0.28) | (g_sub >= g_floor_f * 0.72)
+                neck = (sub_m > 0) & is_pinch & gate
+                if neck.any():
+                    out_s[sl][neck] = 0
+        return out_s
+
+    raised_raw = _split_oversized_necks(raised_raw, for_groove=False)
 
     # Smooth morphological groove mask without jagged Canny pixel worms
     med_v = float(np.median(Lf_u8))
@@ -1740,8 +1791,9 @@ def _extract_wood_relief_vectors(
     if raised_frac >= 0.012:
         exclusion_m = cv2.bitwise_or(exclusion_m, cv2.dilate(clean_raised, np.ones((5, 5), np.uint8)))
     groove_sub = cv2.bitwise_and(clean_grooves, 255 - exclusion_m) if exclusion_m.any() else clean_grooves
-    # Close tiny gaps along curved architectural borders (e.g. top arch) cleanly without touching central floral motifs
+    # Close tiny gaps along curved architectural borders cleanly, then break lacy inter-motif webs
     groove_sub = cv2.morphologyEx(groove_sub, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    groove_sub = _split_oversized_necks(groove_sub, for_groove=True)
     groove_unique = filter_mask_components(groove_sub, max(44, int(min_area * 1.25)), keep_rails=True, skip_arch=True)
 
     target_mask = cv2.bitwise_or(arch_line_mask, cv2.bitwise_or(clean_grooves, clean_raised))
@@ -1939,7 +1991,7 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
             alpha_f = bgra[:, :, 3:4].astype(np.float32) / 255.0
             sub = np.clip(sub.astype(np.float32) * alpha_f + 255.0 * (1.0 - alpha_f), 0, 255).astype(np.uint8)
         elif not is_logo:
-            L_full = cv2.cvtColor(sub, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
+            L_full = cv2.cvtColor(sub, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32) * (100.0 / 255.0)
             l_med_f = float(np.median(L_full))
             dc_full = np.abs(L_full - cv2.GaussianBlur(L_full, (0, 0), sigmaX=max(12.0, min(iw, ih) * 0.025)))
             sub, wm_mask = _inpaint_watermarks(sub, dc_full, L_full, l_med_f)
@@ -2243,7 +2295,7 @@ def handle_reconstruct_3d(req: dict[str, Any]) -> dict[str, Any]:
         x0, y0, x1, y1 = 0, 0, iw - 1, ih - 1
         crop_bgra = bgra.copy()
         if not is_logo:
-            L_f3 = cv2.cvtColor(crop_bgra[:, :, :3], cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
+            L_f3 = cv2.cvtColor(crop_bgra[:, :, :3], cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32) * (100.0 / 255.0)
             l_m3 = float(np.median(L_f3))
             dc_3 = np.abs(L_f3 - cv2.GaussianBlur(L_f3, (0, 0), sigmaX=max(12.0, min(iw, ih) * 0.025)))
             cleaned_bgr, wm_mask_3d = _inpaint_watermarks(crop_bgra[:, :, :3], dc_3, L_f3, l_m3)
