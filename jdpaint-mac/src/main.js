@@ -1145,6 +1145,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     const opts = getTraceOptions();
+    if (opts.traceQuality >= 2048 && reliefEngine.resolution < 512) {
+      reliefEngine.setResolution(512);
+    }
     const prog = beginPipelineProgress('Precision 2D Auto-Trace & Contour Fit');
     prog.update(6, `Stage 1/5 (6%): Calibrating ${opts.traceMode.toUpperCase()} (${Math.round(opts.detail * 100)}% detail) depth field...`);
     await new Promise((r) => setTimeout(r, 16));
@@ -1182,18 +1185,27 @@ document.addEventListener('DOMContentLoaded', () => {
       cadCanvas.requestRender();
 
       const tracedTail = count > 0 ? cadCanvas.entities.slice(-count) : [];
-      const isWoodOrArch = tracedTail.some((e) => e.layerGroup === 'Raised Petals & Motifs' || e.layerGroup === 'Carved Grooves & Panels' || e.layerGroup === 'Architectural Frame');
+      const isWoodOrArch = tracedTail.some((e) =>
+        e.layerGroup === 'Raised Relief Motifs' ||
+        e.layerGroup === 'Raised Petals & Motifs' ||
+        e.layerGroup === 'Carved Grooves & Panels' ||
+        e.layerGroup === 'Architectural Frame'
+      );
       if (isWoodOrArch) {
-        // Prevent 100+ highlight/groove shards on textured wood photos from spawning raw spikes over base relief
+        // Drive silky layered 3D geometry directly from 2D CAD layers fused cleanly with Vision AI bas-relief base
         for (const ent of tracedTail) {
-          if (ent.relief) {
-            ent.relief.shape = 'smooth';
-            ent.relief.heightMm = Math.min(ent.relief.heightMm || 2.5, 2.2);
-            ent.relief.enabled = false;
+          cadCanvas.ensureEntityMetadata(ent);
+          const lg = ent.layerGroup || '';
+          if (lg === 'Raised Relief Motifs' || lg === 'Raised Petals & Motifs') {
+            ent.relief = { enabled: true, shape: 'smooth', heightMm: 0.72, radiusMm: 1.85, adaptiveRadius: true, mode: 'add' };
+          } else if (lg === 'Carved Grooves & Panels') {
+            ent.relief = { enabled: true, shape: 'smooth', heightMm: 0.45, radiusMm: 0.75, adaptiveRadius: true, mode: 'sub' };
+          } else if (lg === 'Architectural Frame') {
+            ent.relief = { enabled: true, shape: 'flat', heightMm: 0.45, radiusMm: 0.42, adaptiveRadius: true, mode: 'max' };
           }
         }
         basePhotoEnabled = true;
-        basePhotoWeight = 0.92;
+        basePhotoWeight = 0.80;
       } else {
         basePhotoEnabled = true;
         basePhotoWeight = 0.55;
@@ -1277,6 +1289,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     const opts = getTraceOptions();
+    if (opts.traceQuality >= 2048 && reliefEngine.resolution < 512) {
+      reliefEngine.setResolution(512);
+    }
     const style = document.getElementById('relief-style')?.value || 'sculpted';
     const edgeStrength = parseFloat(document.getElementById('relief-edge-strength')?.value) || 0.35;
     const removeWhiteBg = document.getElementById('relief-remove-bg')?.checked ?? true;
@@ -1314,9 +1329,14 @@ document.addEventListener('DOMContentLoaded', () => {
     // 3. Drive 3D Relief cleanly from traced 2D layers (+ sculpted wood slab base on bas-relief doors)
     if (vectorCount > 0) {
       const tracedTail = cadCanvas.entities.slice(-vectorCount);
-      const isWoodBasRelief = tracedTail.some((e) => e.layerGroup === 'Raised Petals & Motifs' || e.layerGroup === 'Carved Grooves & Panels');
+      const isWoodBasRelief = tracedTail.some((e) =>
+        e.layerGroup === 'Raised Relief Motifs' ||
+        e.layerGroup === 'Raised Petals & Motifs' ||
+        e.layerGroup === 'Carved Grooves & Panels' ||
+        e.layerGroup === 'Architectural Frame'
+      );
       basePhotoEnabled = isWoodBasRelief;
-      basePhotoWeight = isWoodBasRelief ? 0.65 : 0.25;
+      basePhotoWeight = isWoodBasRelief ? 0.72 : 0.25;
       if (chkClipBaseTo2d) chkClipBaseTo2d.checked = !isWoodBasRelief;
       updateBasePhotoBox();
       rebuild3DFromLayers(true);

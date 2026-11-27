@@ -585,8 +585,8 @@ fn fit_span_schneider(
         return;
     }
     let chord_len = pts[n - 1].sub(pts[0]).len();
-    // Collapse genuine straight CAD edges >= 9px & >= 6 samples so small organic curves always remain smooth C1 Beziers
-    if n >= 6 && chord_len >= 9.0 && check_straight_run(pts, straight_tol) {
+    // Collapse genuine straight CAD edges >= 16px & >= 8 samples so petal arcs always remain smooth C1 Beziers
+    if n >= 8 && chord_len >= 16.0 && check_straight_run(pts, straight_tol * 0.55) {
         let p0 = pts[0];
         let p3 = pts[n - 1];
         out.push(CubicSeg {

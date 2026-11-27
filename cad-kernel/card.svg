@@ -9,14 +9,14 @@
 <rect x="64" y="172" width="520" height="230" rx="20" fill="#ffffff" stroke="#e5e5e5" stroke-width="3"/>
 <text x="96" y="218" font-size="26" font-weight="700" fill="#1a1a1a">Original</text>
 <text x="552" y="218" font-size="17" fill="#666666" text-anchor="end">per call, all functions</text>
-<text x="96" y="318" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="60" font-weight="700" fill="#1a1a1a">19.2 ms</text>
+<text x="96" y="318" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="60" font-weight="700" fill="#1a1a1a">20.7 ms</text>
 <rect x="96" y="360" width="470" height="14" rx="7" fill="#9e9e9e"/>
 <rect x="616" y="172" width="520" height="230" rx="20" fill="#fdf4ef" stroke="#f2b89a" stroke-width="3"/>
 <text x="648" y="218" font-size="26" font-weight="700" fill="#1a1a1a">Rust port</text>
 <text x="1104" y="218" font-size="17" fill="#666666" text-anchor="end">switched on</text>
-<text x="648" y="318" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="60" font-weight="700" fill="#e8561a">5.6 ms</text>
-<rect x="648" y="360" width="136" height="14" rx="7" fill="#e8561a"/>
-<text x="600" y="460" font-size="28" fill="#1a1a1a" text-anchor="middle">Same result as the original on all 6 recorded cases: <tspan font-weight="700" fill="#e8561a">4.3x faster</tspan></text>
+<text x="648" y="318" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="60" font-weight="700" fill="#e8561a">6.3 ms</text>
+<rect x="648" y="360" width="144" height="14" rx="7" fill="#e8561a"/>
+<text x="600" y="460" font-size="28" fill="#1a1a1a" text-anchor="middle">Same result as the original on all 6 recorded cases: <tspan font-weight="700" fill="#e8561a">4.2x faster</tspan></text>
 <text x="600" y="500" font-size="18" fill="#777777" text-anchor="middle">Fallback to the original: 0.0% of cases · call included · Apple M1, 8 cores, macOS</text>
 <text x="600" y="556" font-size="17" fill="#888888" text-anchor="middle">github.com/erkamyaman/rust-anything (reporter schema) · cargo test 3/3 passed</text>
 </g>

@@ -388,6 +388,7 @@ export class Viewport3D {
   buildMesh() {
     if (this.mesh) {
       this.scene.remove(this.mesh);
+      this.mesh.material?.dispose();
       this.geometry.dispose();
     }
     if (this.baseSlab) {
@@ -432,6 +433,11 @@ export class Viewport3D {
 
   updateMeshHeights() {
     if (!this.geometry) return;
+    const expectedVerts = this.relief.resolution * this.relief.resolution;
+    if (this.geometry.attributes.position.count !== expectedVerts) {
+      this.buildMesh();
+      return;
+    }
 
     const pos = this.geometry.attributes.position;
     const res = this.relief.resolution;
@@ -463,7 +469,7 @@ export class Viewport3D {
             avgNbr = (data[idx - 1] + data[idx + 1] + data[idx - res] + data[idx + res]) * 0.25;
           }
           const cavity = Math.max(0, avgNbr - normZ);
-          const shade = Math.max(0.74, Math.min(1.12, 0.90 + normZ * 0.18 - cavity * 1.45));
+          const shade = Math.max(0.70, Math.min(1.14, 0.90 + normZ * 0.20 - cavity * 1.65));
           colors[pIdx * 3] = shade;
           colors[pIdx * 3 + 1] = shade;
           colors[pIdx * 3 + 2] = shade;
@@ -505,6 +511,7 @@ export class Viewport3D {
     this.geometry.computeVertexNormals();
     this.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     this._dirty = true;
+    this._emitStats();
   }
 
   getBaseTint(type) {
@@ -652,9 +659,9 @@ export class Viewport3D {
       return new THREE.MeshStandardMaterial({
         map: tex,
         vertexColors: true,
-        color: useDesignPhoto ? 0xf8f3ee : 0xffffff,
-        roughness: useDesignPhoto ? 0.44 : 0.48,
-        metalness: 0.04,
+        color: useDesignPhoto ? 0xfaf5f0 : 0xffffff,
+        roughness: useDesignPhoto ? 0.52 : 0.48,
+        metalness: 0.02,
       });
     } else if (type === 'brass') {
       return new THREE.MeshStandardMaterial({

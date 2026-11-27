@@ -322,9 +322,9 @@ def _inpaint_watermarks(sub_bgr: np.ndarray, dc_sub: np.ndarray, L_sub: np.ndarr
 
     is_bright_wm = (L_sub > l_med + 14.0) & (rgb_sat < 22) & (dc_sub > 16.0)
     is_neutral_ink = (l_med > 82.0) & (luma_raw < 74.0) & (rgb_sat < 14) & ((L_sub < l_med * 0.72) | (dc_sub > 14.0))
-    # Pure crimson/red stamps sit noticeably above natural mahogany/teak grain highlights
-    is_red_accent = (r.astype(np.int16) - g.astype(np.int16) > 58) & (r.astype(np.int16) - b.astype(np.int16) > 36) & (dc_sub > 20.0)
-    is_blue_accent = (b.astype(np.int16) - r.astype(np.int16) > 28) & (dc_sub > 18.0)
+    # Pure crimson/red graphic ink (Doors Fair R~203, G~32 -> G/R~0.16) never matches warm oak/mahogany wood (G/R>=0.38)
+    is_red_accent = (r >= 145) & (r.astype(np.int16) - np.maximum(g, b).astype(np.int16) >= 115) & (g.astype(np.float32) < r.astype(np.float32) * 0.34) & (dc_sub > 18.0)
+    is_blue_accent = (b >= 125) & (b.astype(np.int16) - np.maximum(r, g).astype(np.int16) >= 42) & (r.astype(np.float32) < b.astype(np.float32) * 0.65) & (dc_sub > 16.0)
 
     cand = is_bright_wm | is_neutral_ink | is_red_accent | is_blue_accent
     tot_px = vh_w * vw_w
@@ -1224,6 +1224,15 @@ def _trace_field_rust(
             ys = [p["y"] for p in pts]
             if (max(xs) - min(xs)) >= span_w * 0.94 and (max(ys) - min(ys)) >= span_h * 0.94:
                 continue
+        relief_cfg = (
+            {"enabled": True, "shape": "smooth", "heightMm": 0.72, "radiusMm": 1.85, "adaptiveRadius": True, "mode": "add"}
+            if layer_group == "Raised Relief Motifs"
+            else (
+                {"enabled": True, "shape": "smooth", "heightMm": 0.45, "radiusMm": 0.75, "adaptiveRadius": True, "mode": "sub"}
+                if layer_group == "Carved Grooves & Panels"
+                else {"enabled": True, "shape": "flat", "heightMm": 3.5, "radiusMm": 1.8, "adaptiveRadius": True, "mode": "max"}
+            )
+        )
         entities.append({
             "type": "curve",
             "points": pts,
@@ -1234,7 +1243,7 @@ def _trace_field_rust(
             "strokeColor": stroke,
             "width": 1.25,
             "layerGroup": layer_group,
-            "relief": {"enabled": False, "shape": "smooth", "heightMm": 2.0, "radiusMm": 1.2, "mode": "max"},
+            "relief": relief_cfg,
         })
     return entities
 
@@ -1442,7 +1451,7 @@ def _extract_straight_cad_lines(
             "strokeColor": "#22d3ee",
             "width": 1.35,
             "layerGroup": "Architectural Frame",
-            "relief": {"enabled": False, "shape": "flat", "heightMm": 0.4, "radiusMm": 1.0, "mode": "max"},
+            "relief": {"enabled": True, "shape": "flat", "heightMm": 0.75, "radiusMm": 0.42, "adaptiveRadius": True, "mode": "max"},
         })
     return entities, arch_mask
 
@@ -1635,11 +1644,13 @@ def _extract_wood_relief_vectors(
         float(np.median(bh_fine_crev)) + 2.8 * max(float(np.median(np.abs(bh_fine_crev - np.median(bh_fine_crev)))), 1.0),
         8.2,
     )
-    crevice_cut = (bh_fine_crev >= bh_fine_fl * 1.15) & (zone_closed > 0)
-    pos_vals = wh_petal[zone_dil > 0] if zone_dil.any() else wh_petal
-    pos_floor_t = max(8.5, float(np.percentile(pos_vals, 52)) * 0.68) + detail_bias * 0.22
-    raised_raw = np.where((zone_dil > 0) & (wh_petal >= pos_floor_t) & (~crevice_cut), 255, 0).astype(np.uint8)
-    raised_raw = cv2.morphologyEx(raised_raw, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    crevice_cut = (bh_fine_crev >= bh_fine_fl * 0.94) & (zone_closed > 0)
+    # Local contrast adaptation ensures shadowed roses, top berries, & dark ribbed petals equal sunlit leaf recall
+    env_wh = np.maximum(15.0, cv2.GaussianBlur(wh_petal, (0, 0), sigmaX=max(14.0, m_dim * 0.028)))
+    wh_score = wh_petal * 0.55 + np.clip((wh_petal / env_wh) * 28.0, 0.0, 90.0) * 0.45
+    pos_vals = wh_score[zone_dil > 0] if zone_dil.any() else wh_score
+    pos_floor_t = max(12.0, float(np.percentile(pos_vals, 42)) * 0.72) + detail_bias * 0.20
+    raised_raw = np.where((zone_dil > 0) & (wh_score >= pos_floor_t) & (wh_petal >= 3.2) & (~crevice_cut), 255, 0).astype(np.uint8)
     raised_raw = cv2.morphologyEx(raised_raw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
 
     # Smooth morphological groove mask without jagged Canny pixel worms
@@ -1704,9 +1715,9 @@ def _extract_wood_relief_vectors(
                 mean_w = area / max(1, bhi)
                 if (bhi >= bwi * 4.5 and bhi < vh * 0.22 and mean_w < max(8.5, vw * 0.0115)) or (bhi >= bwi * 3.9 and bhi < vh * 0.16 and mean_w < max(6.0, vw * 0.0088)) or (mn < 88.0 and pk < 116 and bhi < vh * 0.32) or (act_mn < 0.075 and bhi < vh * 0.50 and mn < 102.0):
                     continue
-            if not keep_rails and area < min_a * 1.8 and pk < 92:
+            if not keep_rails and area < min_a * 1.6 and pk < 90:
                 continue
-            if area < min_a * 2.8 and pk < 82:
+            if area < min_a * 2.4 and pk < 72 and act_mn < 0.16:
                 continue
             out_m[lbl == i] = 255
         if wm_sup is not None:
@@ -1714,7 +1725,7 @@ def _extract_wood_relief_vectors(
         return _fill_tiny_holes(out_m, min_hole_px)
 
     clean_grooves = filter_mask_components(groove_mask, min_area, keep_rails=True, skip_arch=True)
-    clean_raised_raw = filter_mask_components(raised_raw, max(56, int(min_area * 1.35)), keep_rails=False, skip_arch=True)
+    clean_raised_raw = filter_mask_components(raised_raw, max(44, int(min_area * 0.92)), keep_rails=False, skip_arch=True)
     if arch_line_mask.any():
         clean_raised = _fill_tiny_holes(cv2.bitwise_and(clean_raised_raw, 255 - arch_line_mask), min_hole_px)
     else:
@@ -1746,9 +1757,9 @@ def _extract_wood_relief_vectors(
         else:
             target_mask[bot_i:, :] = 0
 
-    speckle_px = max(24.0, float(min_area) * 0.90)
-    straight_tol = max(0.88, 1.32 - detail * 0.38)
-    organic_corners = max(0.25, corners * 0.85)
+    speckle_px = max(24.0, float(min_area) * 0.88)
+    straight_tol = max(1.05, 1.48 - detail * 0.35)
+    organic_corners = max(0.20, corners * 0.65)
 
     # Stage 3: Rust Multi-Core Subpixel Vectorization + Closed-Loop Convergence Verification
     all_ents: list[dict[str, Any]] = list(arch_lines)
@@ -1756,8 +1767,8 @@ def _extract_wood_relief_vectors(
         all_ents.extend(
             _trace_field_rust(
                 clean_raised, off_x, off_y, sx_mm, sy_mm,
-                detail=detail, corners=organic_corners, min_area_px=speckle_px * 1.15,
-                straight_tol_px=straight_tol, layer_group="Raised Relief Motifs", smooth_sigma=0.84,
+                detail=detail, corners=organic_corners, min_area_px=speckle_px * 1.10,
+                straight_tol_px=straight_tol, layer_group="Raised Relief Motifs", smooth_sigma=0.92,
             ) or _trace_mask_vtracer(
                 clean_raised, off_x, off_y, sx_mm, sy_mm,
                 max(10, int(round(18 - detail * 8))), int(round(40 + corners * 18)), 5.0,
@@ -1768,7 +1779,7 @@ def _extract_wood_relief_vectors(
         _trace_field_rust(
             groove_unique, off_x, off_y, sx_mm, sy_mm,
             detail=detail, corners=organic_corners, min_area_px=speckle_px,
-            straight_tol_px=straight_tol, layer_group="Carved Grooves & Panels", smooth_sigma=0.82,
+            straight_tol_px=straight_tol, layer_group="Carved Grooves & Panels", smooth_sigma=0.86,
         ) or _trace_mask_vtracer(
             groove_unique, off_x, off_y, sx_mm, sy_mm,
             max(8, int(round(16 - detail * 8))), int(round(40 + corners * 18)), 4.6,
@@ -2324,7 +2335,16 @@ def handle_reconstruct_3d(req: dict[str, Any]) -> dict[str, Any]:
     tw, th = max(32, int(round(cw * sc_t))), max(32, int(round(ch * sc_t)))
     d_small = cv2.resize(depth_norm, (tw, th), interpolation=cv2.INTER_AREA)
     fg_small = cv2.resize(fg_mask, (tw, th), interpolation=cv2.INTER_NEAREST)
-    _, cl_png = cv2.imencode(".png", crop_bgra)
+    # Shadow-balanced texture for PBR Standard 3D Preview so dark recessed rosettes don't crush to black
+    clean_tex_bgr = crop_bgra[:, :, :3]
+    if is_planar and bool(req.get("delight", True)):
+        lab_pbr = cv2.cvtColor(clean_tex_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        L_pbr = lab_pbr[:, :, 0]
+        L_eq = _equalize_illumination_retinex(L_pbr, strength=0.48)
+        lab_pbr[:, :, 0] = np.clip(L_pbr * 0.56 + L_eq * 0.44, 0.0, 255.0)
+        clean_tex_bgr = cv2.cvtColor(lab_pbr.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    clean_tex_bgra = np.dstack([clean_tex_bgr, crop_bgra[:, :, 3]])
+    _, cl_png = cv2.imencode(".png", clean_tex_bgra)
     d_u16 = np.clip(d_small * 65535.0, 0, 65535).astype(np.uint16)
 
     return {

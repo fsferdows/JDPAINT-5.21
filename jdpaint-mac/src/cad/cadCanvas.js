@@ -5084,7 +5084,7 @@ export class CadCanvas {
       ctx.save();
       ctx.fillStyle = useColor ? targetEnt.fillColor : strokeCol;
       ctx.globalAlpha = useColor
-        ? (isSelected ? 0.30 : (targetEnt.source === 'trace' ? (targetEnt.layerGroup === 'Raised Petals & Motifs' ? 0.08 : 0.16) : 0.22))
+        ? (isSelected ? 0.30 : (targetEnt.source === 'trace' ? ((targetEnt.layerGroup === 'Raised Petals & Motifs' || targetEnt.layerGroup === 'Raised Relief Motifs') ? 0.08 : 0.16) : 0.22))
         : (isSelected ? 0.16 : (targetEnt.source === 'trace' ? 0.045 : 0.065));
       ctx.fill('evenodd');
       ctx.restore();

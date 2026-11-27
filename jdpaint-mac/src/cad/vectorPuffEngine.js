@@ -161,26 +161,35 @@ export class VectorPuffEngine {
       appliedCount++;
     }
 
-    // Light bilateral smoothing strictly on active non-hole interior pixels so overlapping shapes blend smoothly without ragged step edges
+    // Smooth 2-pass Taubin-style bilateral fairing across interior pixels so layered vector cushions blend without needle spikes (holes <= 0.002 remain untouched)
     if (appliedCount > 0 && N >= 64) {
-      const src = new Float32Array(reliefEngine.data);
-      for (let y = 1; y < N - 1; y++) {
-        const row = y * N;
-        for (let x = 1; x < N - 1; x++) {
-          const i = row + x;
-          const zc = src[i];
-          if (zc <= 0.002) continue;
-          const zL = src[i - 1], zR = src[i + 1], zU = src[i - N], zD = src[i + N];
-          if (zL <= 0.001 || zR <= 0.001 || zU <= 0.001 || zD <= 0.001) continue;
-          let sum = zc * 2.5, wSum = 2.5;
-          for (const zn of [zL, zR, zU, zD]) {
-            const dz = zn - zc;
-            const wt = Math.exp(-(dz * dz) * 32.0);
-            sum += zn * wt;
-            wSum += wt;
+      const work = new Float32Array(len);
+      const ks = [0.42, -0.44];
+      for (let pass = 0; pass < 2; pass++) {
+        const k = ks[pass];
+        work.set(reliefEngine.data);
+        for (let y = 1; y < N - 1; y++) {
+          const row = y * N;
+          for (let x = 1; x < N - 1; x++) {
+            const i = row + x;
+            const zc = reliefEngine.data[i];
+            if (zc <= 0.002) continue;
+            const zL = reliefEngine.data[i - 1], zR = reliefEngine.data[i + 1];
+            const zU = reliefEngine.data[i - N], zD = reliefEngine.data[i + N];
+            if (zL <= 0.001 || zR <= 0.001 || zU <= 0.001 || zD <= 0.001) continue;
+            let sum = 0, wSum = 0;
+            for (const zn of [zL, zR, zU, zD]) {
+              const dz = zn - zc;
+              const wt = Math.exp(-(dz * dz) * 14.0);
+              sum += zn * wt;
+              wSum += wt;
+            }
+            if (wSum > 0.05) {
+              work[i] = Math.max(0.0, Math.min(1.0, zc + k * (sum / wSum - zc)));
+            }
           }
-          reliefEngine.data[i] = sum / wSum;
         }
+        reliefEngine.data.set(work);
       }
     }
 
@@ -320,7 +329,7 @@ export class VectorPuffEngine {
     const mmPerPixel = (wMm + hMm) / (2 * N);
 
     const isStroke = VectorPuffEngine.shouldStrokeEntity(ent, forceCloseOpen);
-    const strokeHalfWidthMm = Math.max(1.0, Math.min(radiusMm, 25.0));
+    const strokeHalfWidthMm = Math.max(0.35, Math.min(radiusMm, 25.0));
     const strokeWidthPx = Math.max(2, strokeHalfWidthMm * 2 * Math.min(scaleX, scaleY));
     const padPx = isStroke ? Math.ceil(strokeWidthPx / 2 + 4) : 4;
 
