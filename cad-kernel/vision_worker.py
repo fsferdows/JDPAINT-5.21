@@ -1227,9 +1227,9 @@ def _extract_straight_cad_lines(
     if raw is None or len(raw) == 0:
         return [], arch_mask
 
-    min_len = max(20.0, m_dim * (0.042 - float(np.clip(detail, 0.1, 1.0)) * 0.014))
+    min_len = max(20.0, m_dim * (0.044 - float(np.clip(detail, 0.1, 1.0)) * 0.014))
     zone_d = cv2.dilate(zone_closed, np.ones((7, 7), np.uint8)) > 0
-    near_margin = max(8.0, vw * 0.032)
+    near_margin = max(12.0, vw * 0.105)
 
     kept: list[list[float]] = []
     for seg in raw.reshape(-1, 4):
@@ -1242,17 +1242,19 @@ def _extract_straight_cad_lines(
         is_h = ang <= 2.2 or ang >= 177.8
         is_v = 87.8 <= ang <= 92.2
         is_miter = (36.0 <= ang <= 54.0) or (126.0 <= ang <= 144.0)
-        if not (is_h or is_v or is_miter or ln >= min_len * 1.85):
+        if not (is_h or is_v or is_miter or ln >= min_len * 1.95):
             continue
 
-        # Verify segment genuinely belongs to carved relief & not outermost border wood grain
+        # Verify segment genuinely belongs to carved relief & not outer plank wood grain or bottom catalog footers
         xs_s = np.clip(np.round(np.linspace(x1, x2, 16)).astype(np.int32), 0, vw - 1)
         ys_s = np.clip(np.round(np.linspace(y1, y2, 16)).astype(np.int32), 0, vh - 1)
-        if float(zone_d[ys_s, xs_s].mean()) < 0.65:
+        if float(zone_d[ys_s, xs_s].mean()) < 0.68:
             continue
         if wm_sup is not None and float((wm_sup[ys_s, xs_s] > 0).mean()) > 0.25:
             continue
         if is_v and ln < vh * 0.42 and (max(x1, x2) < near_margin or min(x1, x2) > vw - near_margin):
+            continue
+        if is_h and min(y1, y2) > vh * 0.905 and ln < vw * 0.28:
             continue
 
         if is_h:
@@ -1266,10 +1268,10 @@ def _extract_straight_cad_lines(
     if not kept:
         return [], arch_mask
 
-    # Sort longest first and fuse parallel double-wall LSD detections (step edge thickness ~3-5px) + colinear gaps
+    # Sort longest first and fuse parallel double-wall LSD detections + supported collinear gaps
     kept.sort(key=lambda s: s[4], reverse=True)
     perp_merge_px = max(4.6, m_dim * 0.0048)
-    gap_bridge_px = max(14.0, m_dim * 0.020)
+    gap_bridge_px = max(20.0, m_dim * 0.024)
     merged: list[list[float]] = []
     for x1, y1, x2, y2, ln in kept:
         dx, dy = x2 - x1, y2 - y1
@@ -1292,7 +1294,14 @@ def _extract_straight_cad_lines(
             ov = min(hi_p, mln) - max(lo_p, 0.0)
             gap = max(0.0, max(lo_p - mln, -hi_p))
             if gap <= gap_bridge_px and (ov >= -gap_bridge_px):
-                # If overlapping parallel twin edge, average lateral centerline weighted slightly to stronger/longer
+                # Require image carving support along bridged gap so separate columns never fuse across empty panels
+                if gap > 4.0:
+                    g_a = mln if lo_p > mln else hi_p
+                    g_b = lo_p if lo_p > mln else 0.0
+                    gx_s = np.clip(np.round(np.linspace(mx1 + mux * g_a, mx1 + mux * g_b, 8)).astype(np.int32), 0, vw - 1)
+                    gy_s = np.clip(np.round(np.linspace(my1 + muy * g_a, my1 + muy * g_b, 8)).astype(np.int32), 0, vh - 1)
+                    if float(zone_d[gy_s, gx_s].mean()) < 0.35:
+                        continue
                 if ov > 0.45 * min(ln, mln) and perp >= 1.0:
                     w_n = ln / (mln + ln)
                     nx = -muy
@@ -1311,6 +1320,34 @@ def _extract_straight_cad_lines(
                 break
         if not placed:
             merged.append([x1, y1, x2, y2, ln])
+
+    # Snap crisp 90-degree orthogonal corner intersections so rectangular panel borders close cleanly without gaps
+    corner_snap = max(14.0, m_dim * 0.018)
+    h_idxs = [i for i, m in enumerate(merged) if abs(m[3] - m[1]) <= 0.04 * m[4]]
+    v_idxs = [i for i, m in enumerate(merged) if abs(m[2] - m[0]) <= 0.04 * m[4]]
+    for hi in h_idxs:
+        hx1, hy1, hx2, hy2, _ = merged[hi]
+        hy = 0.5 * (hy1 + hy2)
+        hlo, hhi = min(hx1, hx2), max(hx1, hx2)
+        for vi in v_idxs:
+            vx1, vy1, vx2, vy2, _ = merged[vi]
+            vx = 0.5 * (vx1 + vx2)
+            vlo, vhi = min(vy1, vy2), max(vy1, vy2)
+            near_h = (abs(vx - hx1) <= corner_snap) or (abs(vx - hx2) <= corner_snap) or (hlo - 2.0 <= vx <= hhi + 2.0)
+            near_v = (abs(hy - vy1) <= corner_snap) or (abs(hy - vy2) <= corner_snap) or (vlo - 2.0 <= hy <= vhi + 2.0)
+            if not (near_h and near_v):
+                continue
+            if abs(vx - merged[hi][0]) <= corner_snap:
+                merged[hi][0] = vx
+            elif abs(vx - merged[hi][2]) <= corner_snap:
+                merged[hi][2] = vx
+            if abs(hy - merged[vi][1]) <= corner_snap:
+                merged[vi][1] = hy
+            elif abs(hy - merged[vi][3]) <= corner_snap:
+                merged[vi][3] = hy
+        merged[hi][4] = math.hypot(merged[hi][2] - merged[hi][0], merged[hi][3] - merged[hi][1])
+    for vi in v_idxs:
+        merged[vi][4] = math.hypot(merged[vi][2] - merged[vi][0], merged[vi][3] - merged[vi][1])
 
     entities: list[dict[str, Any]] = []
     draw_th = max(3, int(round(m_dim * 0.0042)))
@@ -1532,11 +1569,20 @@ def _extract_wood_relief_vectors(
     noise_scale = max(0.35, float(noise_px) / 10.0)
     k_act = max(21, int(round(m_dim * 0.028)) | 1)
     act_map = cv2.GaussianBlur((comb_masked > 42).astype(np.float32), (k_act, k_act), 0)
-    min_area = max(32, int(vw * vh * 0.000032 * noise_scale))
-    min_hole_px = max(28, int(vw * vh * 0.000028 * noise_scale))
-    max_grain_w = max(18, int(vw * 0.022))
+    min_area = max(44, int(vw * vh * 0.000044 * noise_scale))
+    min_hole_px = max(32, int(vw * vh * 0.000030 * noise_scale))
+    max_grain_w = max(22, int(vw * 0.026))
 
-    arch_corridor = cv2.dilate(arch_line_mask, np.ones((5, 5), np.uint8)) if arch_line_mask.any() else None
+    # Derive structural carving frame bounds from long Architectural Frame lines so empty outer plank margins stay spotless
+    frame_y_bot = vh * 0.91
+    h_rails = [e for e in arch_lines if abs(e["y2"] - e["y1"]) <= 0.5 and abs(e["x2"] - e["x1"]) >= span_w * 0.25]
+    if h_rails:
+        max_ry = max(0.5 * (e["y1"] + e["y2"]) for e in h_rails)
+        max_ry_px = (max_ry - off_y) / max(1e-6, sy_mm)
+        if max_ry_px >= vh * 0.72:
+            frame_y_bot = min(vh - 4.0, max_ry_px + vh * 0.015)
+
+    arch_corridor = cv2.dilate(arch_line_mask, np.ones((7, 7), np.uint8)) if arch_line_mask.any() else None
 
     def filter_mask_components(src_m: np.ndarray, min_a: int, keep_rails: bool = True, skip_arch: bool = True) -> np.ndarray:
         nl, lbl, st, _ = cv2.connectedComponentsWithStats(src_m)
@@ -1547,27 +1593,32 @@ def _extract_wood_relief_vectors(
                 continue
             bxi, byi, bwi, bhi = int(st[i, 0]), int(st[i, 1]), int(st[i, 2]), int(st[i, 3])
             cm = lbl[byi : byi + bhi, bxi : bxi + bwi] == i
-            if wm_sup is not None and float((wm_sup[byi : byi + bhi, bxi : bxi + bwi][cm] > 0).mean()) > 0.45:
+            if wm_sup is not None and float((wm_sup[byi : byi + bhi, bxi : bxi + bwi][cm] > 0).mean()) > 0.40:
                 continue
-            # Avoid jagged duplicate spline walls directly tracing straight LSD Architectural Frame lines
+            # Suppress bottom catalog footer text glyphs sitting below lowest architectural rail (e.g. Doors Fair banner)
+            if byi > frame_y_bot and bhi < vh * 0.065 and bwi < vw * 0.35:
+                continue
+            if (byi + bhi) < vh * 0.035 and bhi < vh * 0.025 and bwi < vw * 0.16:
+                continue
+            # Suppress outer bare-stile vertical wood-grain streaks inside outermost 10.5% margins
+            in_outer_margin = ((bxi + bwi) <= vw * 0.105) or (bxi >= vw * 0.895)
+            if in_outer_margin and bwi <= max_grain_w * 1.45 and bhi < vh * 0.55:
+                continue
             if skip_arch and arch_corridor is not None and area < vw * vh * 0.04:
                 arch_ov = float((arch_corridor[byi : byi + bhi, bxi : bxi + bwi][cm] > 0).mean())
-                if arch_ov > 0.72:
+                if arch_ov > 0.68:
                     continue
-            near_side_edge = (bxi <= vw * 0.035 and (bxi + bwi) <= vw * 0.085) or ((bxi + bwi) >= vw * 0.965 and bxi >= vw * 0.915)
-            if near_side_edge and bwi <= max_grain_w * 1.4 and bhi < vh * 0.65:
-                continue
             sc = comb_masked[byi : byi + bhi, bxi : bxi + bwi][cm]
             pk, mn = int(sc.max()), float(sc.mean())
             act_mn = float(act_map[byi : byi + bhi, bxi : bxi + bwi][cm].mean())
-            if act_mn < 0.040 and pk < 94 and area < min_a * 10:
+            if act_mn < 0.045 and pk < 96 and area < min_a * 10:
                 continue
-            if bhi >= bwi * 3.8 and bwi <= max_grain_w:
-                if (mn < 84.0 and pk < 112 and bhi < vh * 0.28) or (act_mn < 0.070 and bhi < vh * 0.48 and mn < 98.0):
+            if bhi >= bwi * 3.5 and bwi <= max_grain_w:
+                if (mn < 88.0 and pk < 116 and bhi < vh * 0.32) or (act_mn < 0.075 and bhi < vh * 0.50 and mn < 102.0):
                     continue
-            if not keep_rails and area < min_a * 1.8 and pk < 90:
+            if not keep_rails and area < min_a * 1.8 and pk < 92:
                 continue
-            if area < min_a * 2.8 and pk < 80:
+            if area < min_a * 2.8 and pk < 82:
                 continue
             out_m[lbl == i] = 255
         if wm_sup is not None:
@@ -1575,30 +1626,40 @@ def _extract_wood_relief_vectors(
         return _fill_tiny_holes(out_m, min_hole_px)
 
     clean_grooves = filter_mask_components(groove_mask, min_area, keep_rails=True, skip_arch=True)
-    clean_raised = filter_mask_components(raised_raw, max(48, int(min_area * 1.25)), keep_rails=False, skip_arch=True)
-
-    # Subtract crisp straight CAD lines before rasterizing groove_unique so panel molding walls stay sharp 2-pt lines
+    clean_raised_raw = filter_mask_components(raised_raw, max(56, int(min_area * 1.35)), keep_rails=False, skip_arch=True)
     if arch_line_mask.any():
-        groove_sub = cv2.bitwise_and(clean_grooves, 255 - arch_line_mask)
-        groove_sub = filter_mask_components(groove_sub, max(32, int(min_area * 0.85)), keep_rails=True, skip_arch=True)
+        clean_raised = _fill_tiny_holes(cv2.bitwise_and(clean_raised_raw, 255 - arch_line_mask), min_hole_px)
     else:
-        groove_sub = clean_grooves
+        clean_raised = clean_raised_raw
 
+    # Clean Manual-CAD Layer Separation: NEVER slice/tear green petals to extract cyan grooves!
+    # Keep raised motifs 100% intact, and extract only genuinely disjoint grooves outside a 5x5 halo around motifs & straight lines.
+    exclusion_m = np.zeros_like(clean_grooves)
+    if arch_corridor is not None:
+        exclusion_m = cv2.bitwise_or(exclusion_m, arch_corridor)
     raised_frac = float((clean_raised > 0).sum()) / max(1, vw * vh)
-    groove_unique = groove_sub
-    if raised_frac >= 0.014:
-        groove_unique = _fill_tiny_holes(
-            cv2.bitwise_and(groove_sub, 255 - cv2.erode(clean_raised, np.ones((3, 3), np.uint8))),
-            min_hole_px,
-        )
+    if raised_frac >= 0.012:
+        exclusion_m = cv2.bitwise_or(exclusion_m, cv2.dilate(clean_raised, np.ones((5, 5), np.uint8)))
+    groove_sub = cv2.bitwise_and(clean_grooves, 255 - exclusion_m) if exclusion_m.any() else clean_grooves
+    # Close tiny gaps along curved architectural borders (e.g. top arch) cleanly without touching central floral motifs
+    groove_sub = cv2.morphologyEx(groove_sub, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    groove_unique = filter_mask_components(groove_sub, max(44, int(min_area * 1.25)), keep_rails=True, skip_arch=True)
 
     target_mask = cv2.bitwise_or(arch_line_mask, cv2.bitwise_or(clean_grooves, clean_raised))
     target_mask = cv2.bitwise_or(target_mask, cv2.bitwise_and(canny_zone, ((comb_masked > 10).astype(np.uint8)) * 255))
     if wm_sup is not None:
         target_mask[wm_sup > 0] = 0
+    if frame_y_bot < vh - 4.0:
+        # Exclude bottom margin catalog banner from coverage target mask
+        bot_i = int(round(frame_y_bot))
+        if arch_line_mask.any():
+            bot_keep = cv2.dilate(arch_line_mask[bot_i:, :], np.ones((5, 5), np.uint8))
+            target_mask[bot_i:, :] = cv2.bitwise_and(target_mask[bot_i:, :], bot_keep)
+        else:
+            target_mask[bot_i:, :] = 0
 
-    speckle_px = max(18.0, float(min_area) * 0.85)
-    straight_tol = max(0.85, 1.35 - detail * 0.45)
+    speckle_px = max(24.0, float(min_area) * 0.90)
+    straight_tol = max(0.85, 1.30 - detail * 0.42)
 
     # Stage 3: Rust Multi-Core Subpixel Vectorization + Closed-Loop Convergence Verification
     all_ents: list[dict[str, Any]] = list(arch_lines)
@@ -1663,13 +1724,14 @@ def _extract_wood_relief_vectors(
         if iters == 2:
             dark_boost = cv2.bitwise_and(cv2.dilate(((comb_masked > 10).astype(np.uint8)) * 255, np.ones((3, 3), np.uint8)), uncovered)
             dark_boost = cv2.bitwise_or(dark_boost, cv2.bitwise_and(canny_dil, uncovered))
-            if arch_line_mask.any():
-                dark_boost = cv2.bitwise_and(dark_boost, 255 - arch_line_mask)
+            if exclusion_m.any():
+                dark_boost = cv2.bitwise_and(dark_boost, 255 - exclusion_m)
             dark_boost = cv2.morphologyEx(dark_boost, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+            dark_boost = filter_mask_components(dark_boost, max(36, int(min_area * 0.9)), keep_rails=True, skip_arch=True)
             if int((dark_boost > 0).sum()) > 32:
                 pass2 = _trace_field_rust(
                     dark_boost, off_x, off_y, sx_mm, sy_mm,
-                    detail=detail, corners=corners, min_area_px=max(14.0, speckle_px * 0.72),
+                    detail=detail, corners=corners, min_area_px=max(20.0, speckle_px * 0.85),
                     straight_tol_px=straight_tol, layer_group="Carved Grooves & Panels", smooth_sigma=0.65,
                 )
                 merge_non_overlapping(all_ents, pass2)
@@ -1696,10 +1758,13 @@ def _extract_wood_relief_vectors(
         elif iters == 4:
             res_bin = cv2.bitwise_and(cv2.dilate(((g_f > g_floor_f * 0.72).astype(np.uint8)) * 255, np.ones((2, 2), np.uint8)), uncovered)
             res_bin = cv2.bitwise_and(res_bin, cv2.dilate(zone_dil, np.ones((11, 11), np.uint8)) * 255)
+            if exclusion_m.any():
+                res_bin = cv2.bitwise_and(res_bin, 255 - exclusion_m)
+            res_bin = filter_mask_components(res_bin, max(36, int(min_area * 0.9)), keep_rails=True, skip_arch=True)
             if int((res_bin > 0).sum()) > 28:
                 pass4 = _trace_field_rust(
                     res_bin, off_x, off_y, sx_mm, sy_mm,
-                    detail=detail, corners=corners, min_area_px=max(14.0, speckle_px * 0.65),
+                    detail=detail, corners=corners, min_area_px=max(20.0, speckle_px * 0.80),
                     straight_tol_px=straight_tol, layer_group="Carved Grooves & Panels", smooth_sigma=0.60,
                 )
                 merge_non_overlapping(all_ents, pass4)
@@ -1774,6 +1839,11 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
             # Composite transparent logo cleanly onto white background for binary VTracer
             alpha_f = bgra[:, :, 3:4].astype(np.float32) / 255.0
             sub = np.clip(sub.astype(np.float32) * alpha_f + 255.0 * (1.0 - alpha_f), 0, 255).astype(np.uint8)
+        elif not is_logo:
+            L_full = cv2.cvtColor(sub, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
+            l_med_f = float(np.median(L_full))
+            dc_full = np.abs(L_full - cv2.GaussianBlur(L_full, (0, 0), sigmaX=max(12.0, min(iw, ih) * 0.025)))
+            sub, wm_mask = _inpaint_watermarks(sub, dc_full, L_full, l_med_f)
 
     sh0, sw0 = sub.shape[:2]
     target_long = min(3840, trace_quality)

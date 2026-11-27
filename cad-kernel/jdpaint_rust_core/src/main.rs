@@ -307,12 +307,37 @@ fn point_in_poly(p: Pt2, poly: &[Pt2]) -> bool {
     inside
 }
 
-/// Detect structural sharp corners via multi-scale chord turning angle & corner-pinned Taubin smoothing.
+fn arm_max_perp(raw: &[Pt2], start: usize, steps: usize, n: usize) -> f32 {
+    if steps < 3 || n < 4 {
+        return 0.0;
+    }
+    let a = raw[start % n];
+    let b = raw[(start + steps) % n];
+    let ab = b.sub(a);
+    let len = ab.len();
+    if len < 1.5 {
+        return 0.0;
+    }
+    let ux = ab.x / len;
+    let uy = ab.y / len;
+    let mut max_p = 0.0f32;
+    for s in 1..steps {
+        let p = raw[(start + s) % n];
+        let ap = p.sub(a);
+        let perp = (ap.x * uy - ap.y * ux).abs();
+        if perp > max_p {
+            max_p = perp;
+        }
+    }
+    max_p
+}
+
+/// Detect structural sharp corners via straight-arm verification + acute cusp detection & Taubin fairing.
 fn detect_corners_and_fair(raw: &[Pt2], corner_cos_thresh: f32) -> (Vec<Pt2>, Vec<bool>) {
     let n = raw.len();
-    let k = (n / 8).clamp(2, 8);
+    let k = (n / 8).clamp(3, 9);
     let mut pinned = vec![false; n];
-    if n >= 6 {
+    if n >= 8 {
         for i in 0..n {
             let p_prev = raw[(i + n - k) % n];
             let p_cur = raw[i];
@@ -320,13 +345,22 @@ fn detect_corners_and_fair(raw: &[Pt2], corner_cos_thresh: f32) -> (Vec<Pt2>, Ve
             let d1 = p_cur.sub(p_prev).norm();
             let d2 = p_next.sub(p_cur).norm();
             let cs = d1.dot(d2);
-            // Large turn angle (small cosine) => corner candidate
-            if cs < corner_cos_thresh {
-                // Verify 2-step turn is also crisp so gentle circular arcs never false-pin
+            // Acute cusp (>= ~82 deg turn) OR orthogonal straight-arm CAD corner (>= turn_deg with straight arms)
+            if cs < 0.14 {
                 let s1 = p_cur.sub(raw[(i + n - 2) % n]).norm();
                 let s2 = raw[(i + 2) % n].sub(p_cur).norm();
-                if s1.dot(s2) < (corner_cos_thresh + 0.25).min(0.86) {
+                if s1.dot(s2) < 0.72 {
                     pinned[i] = true;
+                }
+            } else if cs < corner_cos_thresh && k >= 4 {
+                let perp_in = arm_max_perp(raw, (i + n - k) % n, k, n);
+                let perp_out = arm_max_perp(raw, i, k, n);
+                if perp_in <= 0.85 && perp_out <= 0.85 {
+                    let s1 = p_cur.sub(raw[(i + n - 2) % n]).norm();
+                    let s2 = raw[(i + 2) % n].sub(p_cur).norm();
+                    if s1.dot(s2) < 0.78 {
+                        pinned[i] = true;
+                    }
                 }
             }
         }
@@ -556,7 +590,9 @@ fn fit_span_schneider(
     if n < 2 {
         return;
     }
-    if n == 2 || check_straight_run(pts, straight_tol) {
+    let chord_len = pts[n - 1].sub(pts[0]).len();
+    // Only collapse genuine architectural runs >= 7.5px into straight CAD segments so smooth petal curves stay C1 Bezier
+    if (n == 2 && chord_len >= 7.5) || (chord_len >= 7.5 && check_straight_run(pts, straight_tol)) {
         let p0 = pts[0];
         let p3 = pts[n - 1];
         out.push(CubicSeg {
@@ -769,8 +805,8 @@ fn run_vectorize_pipeline(
     sy_mm: f32,
 ) -> Vec<CadRing> {
     let raw_loops = marching_squares_contours(field, w, h, thresh);
-    // Turning angle threshold between incoming & outgoing multi-scale chords (47 deg turn = 133 deg interior corner at corners=0.65)
-    let turn_deg = 64.0 - corners.clamp(0.0, 1.0) * 26.0;
+    // Turning angle threshold for straight-arm corners (58 deg turn = 122 deg interior angle at corners=0.65)
+    let turn_deg = 70.0 - corners.clamp(0.0, 1.0) * 18.0;
     let corner_cos = turn_deg.to_radians().cos();
     let err_px = (1.65 - detail.clamp(0.0, 1.0) * 1.25).max(0.32);
 
@@ -1384,5 +1420,37 @@ mod tests {
         let corner = out[4 * w + 4];
         assert!(center > corner + 0.35, "dome center {} must exceed flat bg {}", center, corner);
         assert!((corner - 0.2).abs() < 0.05, "flat grain must stay suppressed around z_macro=0.2, got {}", corner);
+    }
+
+    #[test]
+    fn test_rosette_no_square_corners_keeps_cubic() {
+        let w = 240usize;
+        let h = 240usize;
+        let mut field = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let dx = x as f32 - 120.0;
+                let dy = y as f32 - 120.0;
+                let ang = dy.atan2(dx);
+                let r = (dx * dx + dy * dy).sqrt();
+                let rad_lim = 64.0 + 22.0 * (6.0 * ang).cos();
+                if r <= rad_lim {
+                    field[y * w + x] = 255;
+                }
+            }
+        }
+        let rings = run_vectorize_pipeline(&field, w, h, 127.5, 0.72, 0.65, 30.0, 1.05, 0.0, 0.0, 1.0, 1.0);
+        assert_eq!(rings.len(), 1);
+        let smooth_handles = rings[0]
+            .nodes
+            .iter()
+            .filter(|nd| (nd.flags & FLAG_HAS_OUT) != 0 || (nd.flags & FLAG_HAS_IN) != 0)
+            .count();
+        assert!(
+            smooth_handles > rings[0].nodes.len() / 2,
+            "curved rosette must use smooth C1 Cubic Beziers rather than straight polygon teeth: {}/{}",
+            smooth_handles,
+            rings[0].nodes.len()
+        );
     }
 }
