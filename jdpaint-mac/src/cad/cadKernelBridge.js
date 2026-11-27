@@ -122,7 +122,7 @@ export class CadKernelBridge {
   static async vectorizeViaVision(imgElement, widthMm = 100, heightMm = 100, options = {}) {
     const health = await CadKernelBridge.checkHealth(2000, { passive: true });
     if (!health?.ok || !health?.vision_ai) return null;
-    const imageB64 = CadKernelBridge._encodeImageB64(imgElement, 2048);
+    const imageB64 = CadKernelBridge._encodeImageB64(imgElement, 2400);
     if (!imageB64) return null;
     const resp = await fetch(`${CadKernelBridge.BASE_URL}/api/vision/vectorize`, {
       method: 'POST',
@@ -156,14 +156,14 @@ export class CadKernelBridge {
   static async reconstruct3DViaVision(imgElement, options = {}) {
     const health = await CadKernelBridge.checkHealth(2000, { passive: true });
     if (!health?.ok || !health?.vision_ai) return null;
-    const imageB64 = CadKernelBridge._encodeImageB64(imgElement, 1800);
+    const imageB64 = CadKernelBridge._encodeImageB64(imgElement, 2400);
     if (!imageB64) return null;
     const resp = await fetch(`${CadKernelBridge.BASE_URL}/api/vision/reconstruct-3d`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         image_b64: imageB64,
-        resolution: options.resolution || 288,
+        resolution: options.resolution || 384,
         remove_bg: options.removeBg ?? true,
         delight: options.delight ?? true,
         invert: options.invert ?? false,

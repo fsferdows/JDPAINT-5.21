@@ -83,11 +83,31 @@ def detect_furniture_roi(bgr: np.ndarray) -> dict[str, Any] | None:
     l_med = float(np.median(in_core)) if in_core.size > 20 else 50.0
     chroma_med = float(math.hypot(float(np.median(A[cy0:cy1, cx0:cx1])), float(np.median(B[cy0:cy1, cx0:cx1]))))
     chroma_eq_med = float(math.hypot(a_med, b_med))
-    if chroma_eq_med < 9.5 or chroma_med < 4.5:
-        return None
 
-    tol_c = np.where(L < 28.0, 28.0, 18.5)
-    panel = ((dc_eq <= tol_c) & (np.abs(L - l_med) <= 46.0)).astype(np.float32)
+    # Support BOTH warm wood furniture (doors/beds) AND bordered neutral/white/gray carved architectural panels
+    is_neutral_panel = False
+    if chroma_eq_med < 9.0 or chroma_med < 4.2:
+        gray_p = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        g_sm = cv2.bilateralFilter(gray_p, 5, 18, 12)
+        gx_p = np.abs(cv2.Sobel(g_sm, cv2.CV_32F, 1, 0, ksize=3))
+        gy_p = np.abs(cv2.Sobel(g_sm, cv2.CV_32F, 0, 1, ksize=3))
+        col_str = (gx_p > 22.0).mean(axis=0)
+        row_str = (gy_p > 22.0).mean(axis=1)
+        has_lr = float(col_str[: int(w * 0.35)].max()) >= 0.34 and float(col_str[int(w * 0.65) :].max()) >= 0.34
+        has_tb = float(row_str[: int(h * 0.35)].max()) >= 0.34 and float(row_str[int(h * 0.65) :].max()) >= 0.34
+        interior_tex = float(np.hypot(gx_p[cy0:cy1, cx0:cx1], gy_p[cy0:cy1, cx0:cx1]).mean())
+        if not (has_lr and has_tb and interior_tex >= 6.5):
+            return None
+        is_neutral_panel = True
+
+    if is_neutral_panel:
+        # Tighter luminance contrast isolates neutral painted doors/beds inside bright room walls
+        l_var = float(np.std(L[cy0:cy1, cx0:cx1]))
+        l_tol = max(12.0, min(32.0, l_var * 2.2))
+        panel = (np.abs(L - l_med) <= l_tol).astype(np.float32)
+    else:
+        tol_c = np.where(L < 28.0, 28.0, 18.5)
+        panel = ((dc_eq <= tol_c) & (np.abs(L - l_med) <= 46.0)).astype(np.float32)
 
     y0_b, y1_b = int(h * 0.18), int(h * 0.76)
     col_frac = panel[y0_b:y1_b, :].mean(axis=0)
@@ -164,14 +184,15 @@ def detect_furniture_roi(bgr: np.ndarray) -> dict[str, Any] | None:
         else:
             rmerged.append((r0, r1))
 
+    min_h_frac = 0.24 if (w > h * 1.15) else 0.35
     best_y = None
     best_sy = -1.0
     ymid = h * 0.45
     for r0, r1 in rmerged:
         rh = r1 - r0 + 1
-        if rh < h * 0.35:
+        if rh < h * min_h_frac:
             continue
-        ov = max(0.0, min(float(r1), h * 0.72) - max(float(r0), h * 0.18))
+        ov = max(0.0, min(float(r1), h * 0.76) - max(float(r0), h * 0.16))
         sc = ov * 3.0 + rh - abs((r0 + r1) * 0.5 - ymid) * 0.6
         if sc > best_sy:
             best_sy = sc
@@ -201,14 +222,14 @@ def detect_furniture_roi(bgr: np.ndarray) -> dict[str, Any] | None:
         ry1 = y_lo + int(np.argmax(score))
 
     rw, rh = rx1 - rx0 + 1, ry1 - ry0 + 1
-    if rw < w * 0.24 or rh < h * 0.35:
+    if rw < w * 0.24 or rh < h * min_h_frac:
         return None
     has_bg = (
         rx0 > w * 0.025 or rx1 < w * (1.0 - 0.025) or ry0 > h * 0.025 or ry1 < h * (1.0 - 0.025)
     )
     panel_sub = panel[ry0 : ry1 + 1, rx0 : rx1 + 1]
     density = float(panel_sub.mean()) if panel_sub.size > 0 else 0.0
-    if density < 0.45:
+    if density < 0.40:
         return None
     return {
         "x0": int(rx0),
@@ -507,49 +528,74 @@ def _equalize_illumination_retinex(L_f: np.ndarray, strength: float = 0.58) -> n
 
 
 def _solve_planar_relief_heightmap(sub_bgr: np.ndarray) -> np.ndarray:
-    """Compute a de-tilted multi-scale CNC relief heightmap with Retinex shadow equalization & residual loop."""
+    """Compute a volumetric de-tilted bas-relief heightmap fusing AI Depth-Anything-V2, SFS & geodesic relief volumes."""
+    import torch
+
     ch, cw = sub_bgr.shape[:2]
+    m_dim = min(cw, ch)
     fg_mask = np.full((ch, cw), 255, dtype=np.uint8)
     den = cv2.fastNlMeansDenoisingColored(sub_bgr, None, 5, 5, 7, 21)
-    epf_c = cv2.edgePreservingFilter(den, flags=cv2.NORMCONV_FILTER, sigma_s=18, sigma_r=0.20)
+    epf_c = cv2.edgePreservingFilter(den, flags=cv2.NORMCONV_FILTER, sigma_s=20, sigma_r=0.20)
     sfs = _solve_photometric_sfs_fft(epf_c, fg_mask)
+
+    # AI Depth-Anything-V2 macro/meso sculptural relief field (immune to plank grain)
+    ai_flat = None
+    try:
+        proc, model, device = _ensure_depth_model()
+        pil_in = Image.fromarray(cv2.cvtColor(den, cv2.COLOR_BGR2RGB))
+        inputs = {k: v.to(device) for k, v in proc(images=pil_in, return_tensors="pt").items()}
+        with torch.no_grad():
+            pred = model(**inputs).predicted_depth
+        dt_t = torch.nn.functional.interpolate(pred.unsqueeze(1), size=(ch, cw), mode="bicubic", align_corners=False).squeeze()
+        ai_raw = dt_t.detach().float().cpu().numpy()
+        ai_lo, ai_hi = float(np.percentile(ai_raw, 2)), float(np.percentile(ai_raw, 98))
+        ai_norm = np.clip((ai_raw - ai_lo) / max(1e-4, ai_hi - ai_lo), 0.0, 1.0)
+        ai_tilt = cv2.GaussianBlur(ai_norm, (0, 0), sigmaX=max(16.0, m_dim * 0.14))
+        ai_flat = np.clip(ai_norm * 0.28 + (0.5 + (ai_norm - ai_tilt) * 1.55) * 0.72, 0.0, 1.0)
+    except Exception:
+        ai_flat = None
 
     Lc_raw = cv2.bilateralFilter(cv2.cvtColor(epf_c, cv2.COLOR_BGR2LAB)[:, :, 0], 7, 22, 16).astype(np.float32)
     Lc = _equalize_illumination_retinex(Lc_raw, strength=0.62) / 255.0
-    m_dim = min(cw, ch)
-    k_s = max(5, int(round(m_dim * 0.015)) | 1)
-    k_m = max(13, int(round(m_dim * 0.050)) | 1)
-    k_bg = max(31, int(round(m_dim * 0.16)) | 1)
+    k_bg = max(31, int(round(m_dim * 0.14)) | 1)
     bg_l = cv2.GaussianBlur(Lc, (k_bg, k_bg), 0)
-    delight = np.clip((Lc - bg_l) * 1.55 + 0.5, 0.0, 1.0)
+    elev = Lc - bg_l
+    delight = np.clip(elev * 1.60 + 0.5, 0.0, 1.0)
 
-    # De-tilt broad FFT pillow bow on planar boards while preserving sculpted mid-relief forms
-    sfs_bow = cv2.GaussianBlur(sfs, (0, 0), sigmaX=max(18.0, m_dim * 0.10))
-    sfs_flat = np.clip(0.5 + (sfs - sfs_bow) * 1.35, 0.0, 1.0)
+    # De-tilt broad FFT pillow bow on planar panels
+    sfs_bow = cv2.GaussianBlur(sfs, (0, 0), sigmaX=max(18.0, m_dim * 0.11))
+    sfs_flat = np.clip(0.5 + (sfs - sfs_bow) * 1.45, 0.0, 1.0)
 
-    ker_s = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_s, k_s))
-    ker_m = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_m, k_m))
-    wh3 = cv2.morphologyEx(delight, cv2.MORPH_TOPHAT, ker_s) * 0.45 + cv2.morphologyEx(delight, cv2.MORPH_TOPHAT, ker_m) * 0.55
-    bh3 = cv2.morphologyEx(delight, cv2.MORPH_BLACKHAT, ker_s) * 0.45 + cv2.morphologyEx(delight, cv2.MORPH_BLACKHAT, ker_m) * 0.55
+    # Gate out bare flat wood grain while keeping genuine carved motifs solid
+    grad_e = np.hypot(cv2.Scharr(delight, cv2.CV_32F, 1, 0), cv2.Scharr(delight, cv2.CV_32F, 0, 1)) / 16.0
+    act_e = cv2.GaussianBlur(np.maximum(grad_e, np.abs(elev) * 2.2), (0, 0), sigmaX=max(6.0, m_dim * 0.015))
+    act_floor = max(0.035, float(np.percentile(act_e, 48)))
+    grain_gate = np.clip((act_e - act_floor * 0.72) / max(1e-4, act_floor * 1.45), 0.0, 1.0)
 
-    # Soft-core micro plank grain in flat areas while keeping sharp carved steps intact
-    diff_m = wh3 * 2.5 - bh3 * 2.3
-    abs_m = np.abs(diff_m)
-    noise_band = max(0.03, float(np.percentile(abs_m, 45)))
-    grain_gate = np.clip((abs_m - noise_band * 0.52) / max(1e-4, noise_band * 1.55), 0.12, 1.0)
-    morph3 = np.clip(0.5 + diff_m * grain_gate * 0.54, 0.0, 1.0)
+    # Geodesic rounded bas-relief dome volume for raised petals & smooth recessed grooves (zero 1px noise needles!)
+    pos_bin = (((elev * 1.8) * (0.35 + 0.65 * grain_gate)) > 0.065).astype(np.uint8)
+    neg_bin = (((-elev * 1.8) * (0.35 + 0.65 * grain_gate)) > 0.068).astype(np.uint8)
+    ker_v = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    pos_bin = cv2.morphologyEx(pos_bin, cv2.MORPH_OPEN, ker_v)
+    neg_bin = cv2.morphologyEx(neg_bin, cv2.MORPH_OPEN, ker_v)
 
-    rel = sfs_flat * 0.30 + morph3 * 0.48 + delight * 0.22
+    ref_r = max(4.0, m_dim * 0.022)
+    dt_pos = cv2.distanceTransform(pos_bin, cv2.DIST_L2, 3)
+    dt_neg = cv2.distanceTransform(neg_bin, cv2.DIST_L2, 3)
+    dome_pos = np.power(np.clip(dt_pos / ref_r, 0.0, 1.0), 0.58)
+    pocket_neg = np.power(np.clip(dt_neg / ref_r, 0.0, 1.0), 0.58)
+    vol_raw = 0.5 + dome_pos * 0.44 - pocket_neg * 0.42 + np.clip(elev * grain_gate * 1.15, -0.25, 0.25)
+    vol_relief = cv2.GaussianBlur(np.clip(vol_raw, 0.0, 1.0).astype(np.float32), (0, 0), sigmaX=max(0.85, m_dim * 0.0022))
 
-    # 2-step closed-loop 3D residual refinement: sharpen missing gradient relief in dark carved crevices
-    target_g = np.hypot(cv2.Scharr(delight, cv2.CV_32F, 1, 0), cv2.Scharr(delight, cv2.CV_32F, 0, 1)) / 16.0
-    for _ in range(2):
-        rel_g = np.hypot(cv2.Scharr(rel, cv2.CV_32F, 1, 0), cv2.Scharr(rel, cv2.CV_32F, 0, 1)) / 16.0
-        g_def = np.clip(target_g * 0.88 - rel_g, 0.0, 0.45) * grain_gate
-        rel = np.clip(rel + (wh3 - bh3) * (0.28 * np.clip(g_def * 4.5, 0.0, 1.0)), 0.0, 1.0)
+    if ai_flat is not None:
+        rel = ai_flat * 0.24 + sfs_flat * 0.26 + vol_relief * 0.50
+    else:
+        rel = sfs_flat * 0.34 + vol_relief * 0.66
 
+    # Light edge-preserving polish removes micro plank ripple while preserving carved shoulders
+    rel = cv2.bilateralFilter(rel.astype(np.float32), d=5, sigmaColor=0.09, sigmaSpace=4.5)
     lo, hi = float(np.percentile(rel, 2)), float(np.percentile(rel, 98))
-    return np.clip((rel - lo) / max(1e-4, hi - lo), 0.04, 0.98).astype(np.float32)
+    return np.clip((rel - lo) / max(1e-4, hi - lo), 0.05, 0.96).astype(np.float32)
 
 
 def _extract_ai_model_recovery_vectors(
@@ -631,15 +677,15 @@ def _pt_line_dist(px: float, py: float, x1: float, y1: float, x2: float, y2: flo
 
 
 def _refine_ring_cad(ring: list[dict[str, Any]], is_closed: bool, span_w: float, span_h: float, snap_axis: bool = True) -> list[dict[str, Any]]:
-    """Convert wiggly collinear spline chains to crisp CAD straight lines while enforcing C1 smooth curves."""
+    """Collapse zigzag rails into dead-straight CAD lines and beautify curves with corner-pinned C1 smoothing."""
     if not ring or len(ring) < 2:
         return ring
     min_span = max(1.0, min(span_w, span_h))
-    min_pt_d = max(0.04, min_span * 0.00045)
-    straight_tol = min(0.18, max(0.055, min_span * 0.0018))
-    axis_sin = math.sin(math.radians(0.95))
+    min_pt_d = max(0.05, min_span * 0.0005)
+    straight_tol = min(0.24, max(0.065, min_span * 0.0022))
+    axis_sin = math.sin(math.radians(1.35))
 
-    # 1. Remove redundant micro-duplicate points
+    # 1. Remove redundant micro-duplicate vertices
     dedup: list[dict[str, Any]] = [{
         "x": float(ring[0]["x"]),
         "y": float(ring[0]["y"]),
@@ -660,53 +706,85 @@ def _refine_ring_cad(ring: list[dict[str, Any]], is_closed: bool, span_w: float,
             "hIn": dict(p["hIn"]) if p.get("hIn") else None,
             "hOut": dict(p["hOut"]) if p.get("hOut") else None,
         })
-    if is_closed and len(dedup) > 2:
+    if is_closed and len(dedup) > 3:
         if math.hypot(dedup[-1]["x"] - dedup[0]["x"], dedup[-1]["y"] - dedup[0]["y"]) < min_pt_d:
             dedup[0]["hIn"] = dedup[-1]["hIn"]
             dedup.pop()
     if len(dedup) < 2:
         return dedup
 
-    # 2. Straighten collinear Cubic segments & apply sub-degree axis orthogonality on long straight edges
+    # 2. Straighten individual collinear Cubic segments first
     n = len(dedup)
-    seg_count = n if is_closed else n - 1
-    for i in range(seg_count):
+    for i in range(n if is_closed else n - 1):
         a = dedup[i]
         b = dedup[(i + 1) % n]
         L = math.hypot(b["x"] - a["x"], b["y"] - a["y"])
         if L < 1e-5:
             continue
-        h1 = a.get("hOut")
-        h2 = b.get("hIn")
+        h1, h2 = a.get("hOut"), b.get("hIn")
         d1 = _pt_line_dist(h1["x"], h1["y"], a["x"], a["y"], b["x"], b["y"]) if h1 else 0.0
         d2 = _pt_line_dist(h2["x"], h2["y"], a["x"], a["y"], b["x"], b["y"]) if h2 else 0.0
-        tol_seg = max(straight_tol, min(0.24, L * 0.022))
+        tol_seg = max(straight_tol, min(0.28, L * 0.025))
         if (not h1 and not h2) or (d1 <= tol_seg and d2 <= tol_seg):
             a["hOut"] = None
             b["hIn"] = None
 
-    # 3. Merge collinear consecutive straight vertices cleanly (Douglas-Peucker step for crisp louvers/rails)
-    changed = True
-    while changed and len(dedup) > (3 if is_closed else 2):
-        changed = False
-        keep: list[dict[str, Any]] = []
-        m = len(dedup)
-        for i in range(m):
-            if not is_closed and (i == 0 or i == m - 1):
-                keep.append(dedup[i])
-                continue
-            prev = dedup[(i - 1) % m]
-            cur = dedup[i]
-            nxt = dedup[(i + 1) % m]
-            if prev.get("hOut") is None and cur.get("hIn") is None and cur.get("hOut") is None and nxt.get("hIn") is None:
-                d_col = _pt_line_dist(cur["x"], cur["y"], prev["x"], prev["y"], nxt["x"], nxt["y"])
-                if d_col <= min(0.15, min_span * 0.0014):
-                    changed = True
+    # 3. Multi-node greedy linear chain simplification (turns zigzag/stepped door rails into single crisp 2-pt lines!)
+    n = len(dedup)
+    if n > (3 if is_closed else 2):
+        simplified: list[dict[str, Any]] = []
+        idx = 0
+        cos_turn_lim = math.cos(math.radians(28.0))
+        while idx < n:
+            a = dedup[idx]
+            simplified.append(a)
+            best_j = idx + 1
+            arc_len = 0.0
+            limit_j = n if not is_closed else min(n, idx + n - 1)
+            for j in range(idx + 1, limit_j):
+                p_prev = dedup[(j - 1) % n]
+                p_cur = dedup[j % n]
+                seg_l = math.hypot(p_cur["x"] - p_prev["x"], p_cur["y"] - p_prev["y"])
+                arc_len += seg_l
+                if j == idx + 1:
                     continue
-            keep.append(cur)
-        dedup = keep
+                b = dedup[j % n]
+                chord_l = math.hypot(b["x"] - a["x"], b["y"] - a["y"])
+                if chord_l < 0.1 or chord_l > min_span * 0.72:
+                    break
+                if arc_len / chord_l > 1.0045:
+                    break
+                # Stop before crossing a sharp corner turn
+                p_last = dedup[(j - 2) % n]
+                v1x, v1y = p_prev["x"] - p_last["x"], p_prev["y"] - p_last["y"]
+                v2x, v2y = p_cur["x"] - p_prev["x"], p_cur["y"] - p_prev["y"]
+                l1, l2 = math.hypot(v1x, v1y), math.hypot(v2x, v2y)
+                if l1 > 1e-4 and l2 > 1e-4 and ((v1x * v2x + v1y * v2y) / (l1 * l2)) < cos_turn_lim:
+                    break
+                # Verify all intermediate nodes & control handles fit cleanly within straight_tol
+                max_d = 0.0
+                for k in range(idx, j + 1):
+                    pk = dedup[k % n]
+                    if k > idx and k < j:
+                        max_d = max(max_d, _pt_line_dist(pk["x"], pk["y"], a["x"], a["y"], b["x"], b["y"]))
+                    if k < j and pk.get("hOut"):
+                        max_d = max(max_d, _pt_line_dist(pk["hOut"]["x"], pk["hOut"]["y"], a["x"], a["y"], b["x"], b["y"]))
+                    if k > idx and pk.get("hIn"):
+                        max_d = max(max_d, _pt_line_dist(pk["hIn"]["x"], pk["hIn"]["y"], a["x"], a["y"], b["x"], b["y"]))
+                    if max_d > straight_tol:
+                        break
+                if max_d <= straight_tol:
+                    best_j = j
+                else:
+                    break
+            if best_j > idx + 1:
+                a["hOut"] = None
+                dedup[best_j % n]["hIn"] = None
+            idx = best_j if best_j > idx else idx + 1
+        if len(simplified) >= (3 if is_closed else 2):
+            dedup = simplified
 
-    # 4. Gentle orthogonal snapping ONLY on isolated clean straight edges >= 1.8% min_span
+    # 4. Orthogonal snapping on straight architectural edges >= 1.5% span
     n = len(dedup)
     if snap_axis and n >= 3:
         for i in range(n if is_closed else n - 1):
@@ -716,7 +794,7 @@ def _refine_ring_cad(ring: list[dict[str, Any]], is_closed: bool, span_w: float,
                 continue
             dx, dy = b["x"] - a["x"], b["y"] - a["y"]
             L = math.hypot(dx, dy)
-            if L < min_span * 0.018:
+            if L < min_span * 0.015:
                 continue
             if abs(dx) <= L * axis_sin and a.get("corner", True):
                 mid_x = round((a["x"] + b["x"]) * 0.5, 4)
@@ -725,46 +803,62 @@ def _refine_ring_cad(ring: list[dict[str, Any]], is_closed: bool, span_w: float,
                 mid_y = round((a["y"] + b["y"]) * 0.5, 4)
                 a["y"] = mid_y; b["y"] = mid_y
 
-    # 5. Enforce corner vs C1 tangent alignment on curved junctions
+    # 5. Corner-pinned micro-fairing on curved segments + clean C1 collinear handles
     n = len(dedup)
     cos_corner = math.cos(math.radians(30.0))
+    is_pinned = [True] * n
     for i in range(n):
         pt = dedup[i]
         has_prev = is_closed or i > 0
         has_next = is_closed or i < n - 1
-        h_in = pt.get("hIn")
-        h_out = pt.get("hOut")
-        if h_in is None and h_out is None:
+        h_in, h_out = pt.get("hIn"), pt.get("hOut")
+        prev_straight = (dedup[(i - 1) % n].get("hOut") is None and h_in is None) if has_prev else True
+        next_straight = (h_out is None and dedup[(i + 1) % n].get("hIn") is None) if has_next else True
+        if prev_straight or next_straight:
             pt["corner"] = True
             continue
         p_prev = dedup[(i - 1) % n] if has_prev else pt
         p_next = dedup[(i + 1) % n] if has_next else pt
-        vx_in = (pt["x"] - (h_in["x"] if h_in else p_prev["x"])) if has_prev else 0.0
-        vy_in = (pt["y"] - (h_in["y"] if h_in else p_prev["y"])) if has_prev else 0.0
-        vx_out = ((h_out["x"] if h_out else p_next["x"]) - pt["x"]) if has_next else 0.0
-        vy_out = ((h_out["y"] if h_out else p_next["y"]) - pt["y"]) if has_next else 0.0
-        l_in = math.hypot(vx_in, vy_in)
-        l_out = math.hypot(vx_out, vy_out)
-        if l_in < 1e-5 or l_out < 1e-5:
-            pt["corner"] = True
-            continue
-        dot = (vx_in * vx_out + vy_in * vy_out) / (l_in * l_out)
-        if dot < cos_corner:
+        vx_in = pt["x"] - (h_in["x"] if h_in else p_prev["x"])
+        vy_in = pt["y"] - (h_in["y"] if h_in else p_prev["y"])
+        vx_out = (h_out["x"] if h_out else p_next["x"]) - pt["x"]
+        vy_out = (h_out["y"] if h_out else p_next["y"]) - pt["y"]
+        l_in, l_out = math.hypot(vx_in, vy_in), math.hypot(vx_out, vy_out)
+        if l_in < 1e-5 or l_out < 1e-5 or ((vx_in * vx_out + vy_in * vy_out) / (l_in * l_out)) < cos_corner:
             pt["corner"] = True
         else:
             pt["corner"] = False
-            if h_in is not None and h_out is not None:
-                tx = vx_in / l_in + vx_out / l_out
-                ty = vy_in / l_in + vy_out / l_out
-                tl = math.hypot(tx, ty)
-                if tl > 1e-5:
-                    ux, uy = tx / tl, ty / tl
-                    seg_in = math.hypot(pt["x"] - p_prev["x"], pt["y"] - p_prev["y"])
-                    seg_out = math.hypot(p_next["x"] - pt["x"], p_next["y"] - pt["y"])
-                    ci = min(l_in, max(0.05, seg_in * 0.55))
-                    co = min(l_out, max(0.05, seg_out * 0.55))
-                    pt["hIn"] = {"x": round(pt["x"] - ux * ci, 4), "y": round(pt["y"] - uy * ci, 4)}
-                    pt["hOut"] = {"x": round(pt["x"] + ux * co, 4), "y": round(pt["y"] + uy * co, 4)}
+            is_pinned[i] = False
+
+    if n >= 4:
+        sm_pts = [(p["x"], p["y"]) for p in dedup]
+        for i in range(n):
+            if is_pinned[i]:
+                continue
+            pp = dedup[(i - 1) % n]
+            pn = dedup[(i + 1) % n]
+            tx = sm_pts[i][0] * 0.76 + (pp["x"] + pn["x"]) * 0.12
+            ty = sm_pts[i][1] * 0.76 + (pp["y"] + pn["y"]) * 0.12
+            if math.hypot(tx - sm_pts[i][0], ty - sm_pts[i][1]) <= 0.15:
+                dedup[i]["x"] = round(tx, 4)
+                dedup[i]["y"] = round(ty, 4)
+
+    for i in range(n):
+        if is_pinned[i]:
+            continue
+        pt = dedup[i]
+        p_prev = dedup[(i - 1) % n]
+        p_next = dedup[(i + 1) % n]
+        dx, dy = p_next["x"] - p_prev["x"], p_next["y"] - p_prev["y"]
+        dl = math.hypot(dx, dy)
+        if dl > 1e-5 and pt.get("hIn") is not None and pt.get("hOut") is not None:
+            ux, uy = dx / dl, dy / dl
+            s_in = math.hypot(pt["x"] - p_prev["x"], pt["y"] - p_prev["y"])
+            s_out = math.hypot(p_next["x"] - pt["x"], p_next["y"] - pt["y"])
+            ci = max(0.05, min(s_in * 0.36, math.hypot(pt["x"] - pt["hIn"]["x"], pt["y"] - pt["hIn"]["y"]) * 0.5 + s_in * 0.15))
+            co = max(0.05, min(s_out * 0.36, math.hypot(pt["hOut"]["x"] - pt["x"], pt["hOut"]["y"] - pt["y"]) * 0.5 + s_out * 0.15))
+            pt["hIn"] = {"x": round(pt["x"] - ux * ci, 4), "y": round(pt["y"] - uy * ci, 4)}
+            pt["hOut"] = {"x": round(pt["x"] + ux * co, 4), "y": round(pt["y"] + uy * co, 4)}
     return dedup
 
 
@@ -895,9 +989,16 @@ def _trace_mask_vtracer(
     corner_thresh: int,
     length_thresh: float,
     layer_group: str = "Carved Grooves & Panels",
+    smooth_mask: bool = True,
 ) -> list[dict[str, Any]]:
     vh, vw = mask_u8.shape[:2]
-    bw_img = 255 - mask_u8
+    if smooth_mask:
+        # Subpixel Gaussian mask smoothing before VTracer eliminates jagged staircase pixel teeth
+        sm = cv2.GaussianBlur(mask_u8, (3, 3), 0.72)
+        work_m = np.where(sm >= 118, 255, 0).astype(np.uint8)
+    else:
+        work_m = mask_u8
+    bw_img = 255 - work_m
     ok_b, pb = cv2.imencode(".png", cv2.cvtColor(bw_img, cv2.COLOR_GRAY2BGR))
     if not ok_b:
         return []
@@ -925,8 +1026,8 @@ def _trace_mask_vtracer(
             if (max(xs) - min(xs)) >= span_w * 0.94 and (max(ys) - min(ys)) >= span_h * 0.94:
                 continue
         ent["fillColor"] = None
-        ent["strokeColor"] = "#38bdf8"
-        ent["color"] = "#38bdf8"
+        ent["strokeColor"] = "#22c55e" if layer_group == "Raised Relief Motifs" else "#38bdf8"
+        ent["color"] = ent["strokeColor"]
         ent["relief"] = {"enabled": False, "shape": "smooth", "heightMm": 2.0, "radiusMm": 1.2, "mode": "max"}
         cleaned.append(ent)
     return _refine_cad_anchors(cleaned, span_w, span_h, snap_axis=True)
@@ -941,30 +1042,32 @@ def _extract_wood_relief_vectors(
     detail: float,
     corners: float,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Retinex low-light equalized wood relief extraction + closed-loop accuracy convergence loop."""
+    """Multi-layer clean closed-region relief vectorization + Retinex shadow equalization + convergence loop."""
     vh, vw = sub_bgr.shape[:2]
     span_w, span_h = vw * sx_mm, vh * sy_mm
     den = cv2.fastNlMeansDenoisingColored(sub_bgr, None, 6, 6, 7, 21)
-    epf_c = cv2.edgePreservingFilter(den, flags=cv2.NORMCONV_FILTER, sigma_s=20, sigma_r=0.22)
-    epf_f = cv2.edgePreservingFilter(den, flags=cv2.NORMCONV_FILTER, sigma_s=10, sigma_r=0.14)
+    epf_c = cv2.edgePreservingFilter(den, flags=cv2.NORMCONV_FILTER, sigma_s=22, sigma_r=0.22)
+    epf_f = cv2.edgePreservingFilter(den, flags=cv2.NORMCONV_FILTER, sigma_s=12, sigma_r=0.16)
 
-    Lc_raw = cv2.bilateralFilter(cv2.cvtColor(epf_c, cv2.COLOR_BGR2LAB)[:, :, 0], d=7, sigmaColor=22, sigmaSpace=16).astype(np.float32)
-    Lf_raw = cv2.bilateralFilter(cv2.cvtColor(epf_f, cv2.COLOR_BGR2LAB)[:, :, 0], d=5, sigmaColor=16, sigmaSpace=12).astype(np.float32)
-    # Apply local Multi-Scale Retinex equalization so low-light / shadowed carvings get full SNR without inflating stile noise
-    Lc = _equalize_illumination_retinex(Lc_raw, strength=0.60)
-    Lf = _equalize_illumination_retinex(Lf_raw, strength=0.58)
+    Lc_raw = cv2.bilateralFilter(cv2.cvtColor(epf_c, cv2.COLOR_BGR2LAB)[:, :, 0], d=7, sigmaColor=24, sigmaSpace=16).astype(np.float32)
+    Lf_raw = cv2.bilateralFilter(cv2.cvtColor(epf_f, cv2.COLOR_BGR2LAB)[:, :, 0], d=7, sigmaColor=20, sigmaSpace=14).astype(np.float32)
+    # Apply local Multi-Scale Retinex equalization so low-light / shadowed carvings match sunlit SNR cleanly
+    Lc = _equalize_illumination_retinex(Lc_raw, strength=0.62)
+    Lf = _equalize_illumination_retinex(Lf_raw, strength=0.60)
     Lf_u8 = np.clip(Lf, 0, 255).astype(np.uint8)
 
     r_f = max(5, int(round(min(vw, vh) * 0.006)) | 1)
-    r_m = max(11, int(round(min(vw, vh) * 0.017)) | 1)
+    r_m = max(13, int(round(min(vw, vh) * 0.018)) | 1)
     ker_f = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_f, r_f))
     ker_m = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_m, r_m))
 
-    # Coarse gate isolates genuine carved motifs & frame rails while keeping flat bare wood stiles clean
-    bh_c = cv2.morphologyEx(Lc, cv2.MORPH_BLACKHAT, ker_f) * 0.62 + cv2.morphologyEx(Lc, cv2.MORPH_BLACKHAT, ker_m) * 0.58
-    gx_c = cv2.Scharr(Lc, cv2.CV_32F, 1, 0) / 16.0
-    gy_c = cv2.Scharr(Lc, cv2.CV_32F, 0, 1) / 16.0
-    g_c = np.hypot(gx_c, gy_c)
+    # Coarse carving gate: balance directional X and Y gradients so vertical panel stiles aren't dropped by overhead light!
+    bh_c = cv2.morphologyEx(Lc, cv2.MORPH_BLACKHAT, ker_f) * 0.58 + cv2.morphologyEx(Lc, cv2.MORPH_BLACKHAT, ker_m) * 0.62
+    gx_c = np.abs(cv2.Scharr(Lc, cv2.CV_32F, 1, 0) / 16.0)
+    gy_c = np.abs(cv2.Scharr(Lc, cv2.CV_32F, 0, 1) / 16.0)
+    gx_sc = max(12.0, float(np.percentile(gx_c, 84)))
+    gy_sc = max(12.0, float(np.percentile(gy_c, 84)))
+    g_c = np.maximum(gx_c * (22.0 / gx_sc), gy_c * (22.0 / gy_sc))
 
     detail_bias = (0.70 - float(np.clip(detail, 0.15, 1.0))) * 14.0
     c_med = float(np.median(bh_c))
@@ -974,65 +1077,109 @@ def _extract_wood_relief_vectors(
 
     c_zone = (
         (bh_c >= max(float(np.percentile(bh_c, 77)), c_med + 3.8 * max(c_mad, 1.3), 17.5) + detail_bias * 0.35)
-        | (g_c >= max(float(np.percentile(g_c, 77)), gc_med + 3.5 * max(gc_mad, 1.3), 16.0) + detail_bias * 0.35)
+        | (g_c >= max(float(np.percentile(g_c, 76)), gc_med + 3.4 * max(gc_mad, 1.3), 15.5) + detail_bias * 0.35)
     ).astype(np.uint8)
-    k_dil = max(11, int(round(min(vw, vh) * 0.014)) | 1)
+    k_dil = max(11, int(round(min(vw, vh) * 0.015)) | 1)
     zone_dil = cv2.dilate(c_zone, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_dil, k_dil)))
+    k_rail = max(25, int(round(min(vw, vh) * 0.032)) | 1)
+    zone_closed = cv2.morphologyEx(zone_dil, cv2.MORPH_CLOSE, np.ones((k_rail, 3), np.uint8))
+    zone_closed = cv2.morphologyEx(zone_closed, cv2.MORPH_CLOSE, np.ones((3, k_rail), np.uint8))
 
-    # Fine relief details (petals, louvers, moldings) inside carved zones + thin Canny edge completion
+    # Multi-Layer Decomposition: crisp raised carving volumes (strictly interior petals/motifs) vs closed structural grooves
+    bg_surf = cv2.GaussianBlur(Lf, (0, 0), sigmaX=max(14.0, min(vw, vh) * 0.042))
+    elev = Lf - bg_surf
+    pos_floor = max(11.5, float(np.percentile(elev[zone_dil > 0] if zone_dil.any() else elev, 72)) * 0.78) + detail_bias * 0.30
+    raised_raw = np.where((zone_dil > 0) & (elev >= pos_floor), 255, 0).astype(np.uint8)
+    raised_raw = cv2.morphologyEx(raised_raw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    raised_raw = cv2.morphologyEx(raised_raw, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
+    # Recessed valleys, vertical stiles & horizontal rails normalized per-axis so frame rectangles close completely!
     bh_f = cv2.morphologyEx(Lf, cv2.MORPH_BLACKHAT, ker_f) * 0.65 + cv2.morphologyEx(Lf, cv2.MORPH_BLACKHAT, ker_m) * 0.55
-    gx_f = cv2.Scharr(Lf, cv2.CV_32F, 1, 0) / 16.0
-    gy_f = cv2.Scharr(Lf, cv2.CV_32F, 0, 1) / 16.0
-    g_f = np.hypot(gx_f, gy_f)
+    gx_f = np.abs(cv2.Scharr(Lf, cv2.CV_32F, 1, 0) / 16.0)
+    gy_f = np.abs(cv2.Scharr(Lf, cv2.CV_32F, 0, 1) / 16.0)
+    gxf_sc = max(10.0, float(np.percentile(gx_f, 84)))
+    gyf_sc = max(10.0, float(np.percentile(gy_f, 84)))
+    g_f = np.maximum(gx_f * (20.0 / gxf_sc), gy_f * (20.0 / gyf_sc))
 
-    bh_floor_f = max(float(np.percentile(bh_f, 70)), float(np.median(bh_f)) + 2.6 * max(float(np.median(np.abs(bh_f - np.median(bh_f)))), 1.1), 8.0) + detail_bias * 0.25
-    g_floor_f = max(float(np.percentile(g_f, 70)), float(np.median(g_f)) + 2.6 * max(float(np.median(np.abs(g_f - np.median(g_f)))), 1.1), 8.0) + detail_bias * 0.25
+    bh_floor_f = max(float(np.percentile(bh_f, 70)), float(np.median(bh_f)) + 2.6 * max(float(np.median(np.abs(bh_f - np.median(bh_f)))), 1.1), 8.2) + detail_bias * 0.25
+    g_floor_f = max(float(np.percentile(g_f, 71)), float(np.median(g_f)) + 2.5 * max(float(np.median(np.abs(g_f - np.median(g_f)))), 1.1), 8.0) + detail_bias * 0.25
 
-    comb = np.maximum(np.clip((bh_f - bh_floor_f) * 3.15, 0, 255), np.clip((g_f - g_floor_f) * 2.85, 0, 255) * 0.92)
-    comb_masked = np.where((zone_dil > 0) | (bh_c > c_med + 5.2 * max(c_mad, 1.3)), comb, 0.0).astype(np.uint8)
+    comb = np.maximum(np.clip((bh_f - bh_floor_f) * 3.15, 0, 255), np.clip((g_f - g_floor_f) * 2.90, 0, 255) * 0.92)
+    comb_masked = np.where((zone_closed > 0) | (bh_c > c_med + 5.2 * max(c_mad, 1.3)), comb, 0.0).astype(np.uint8)
+
+    # Directional rail healing bridges faint overhead-lit vertical panel borders & horizontal frame bars cleanly
+    v_rail = cv2.morphologyEx(np.where((gx_f * (20.0 / gxf_sc) >= g_floor_f * 0.85) & (zone_closed > 0), 255, 0).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((21, 1), np.uint8))
+    h_rail = cv2.morphologyEx(np.where((gy_f * (20.0 / gyf_sc) >= g_floor_f * 0.85) & (zone_closed > 0), 255, 0).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((1, 21), np.uint8))
 
     med_v = float(np.median(Lf_u8))
-    canny_edges = cv2.Canny(Lf_u8, max(14, int(med_v * 0.30)), max(42, int(med_v * 0.82)))
-    canny_zone = cv2.bitwise_and(canny_edges, cv2.dilate(zone_dil, np.ones((9, 9), np.uint8)) * 255)
+    canny_edges = cv2.Canny(Lf_u8, max(14, int(med_v * 0.28)), max(40, int(med_v * 0.78)))
+    canny_zone = cv2.bitwise_and(canny_edges, cv2.dilate(zone_closed, np.ones((9, 9), np.uint8)) * 255)
     canny_dil = cv2.dilate(canny_zone, np.ones((2, 2), np.uint8))
 
-    _, mask = cv2.threshold(comb_masked, max(14, int(round(22 + detail_bias * 0.4))), 255, cv2.THRESH_BINARY)
-    mask = cv2.bitwise_or(mask, canny_dil)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    _, groove_mask = cv2.threshold(comb_masked, max(15, int(round(22 + detail_bias * 0.4))), 255, cv2.THRESH_BINARY)
+    groove_mask = cv2.bitwise_or(groove_mask, canny_dil)
+    groove_mask = cv2.bitwise_or(groove_mask, cv2.bitwise_or(v_rail, h_rail))
+    groove_mask = cv2.morphologyEx(groove_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
 
+    # Filter out bare plank speckles/grain on both masks cleanly
     k_act = max(21, int(round(min(vw, vh) * 0.028)) | 1)
     act_map = cv2.GaussianBlur((comb_masked > 42).astype(np.float32), (k_act, k_act), 0)
-
-    num_l, lbls, stats, _ = cv2.connectedComponentsWithStats(mask)
-    clean_mask = np.zeros_like(mask)
-    min_area = max(24, int(vw * vh * 0.000020))
+    min_area = max(28, int(vw * vh * 0.000024))
     max_grain_w = max(16, int(vw * 0.014))
-    for i in range(1, num_l):
-        area = int(stats[i, cv2.CC_STAT_AREA])
-        if area < min_area:
-            continue
-        bx_i, by_i, bw_i, bh_i = int(stats[i, 0]), int(stats[i, 1]), int(stats[i, 2]), int(stats[i, 3])
-        comp_m = lbls[by_i : by_i + bh_i, bx_i : bx_i + bw_i] == i
-        sub_c = comb_masked[by_i : by_i + bh_i, bx_i : bx_i + bw_i][comp_m]
-        pk, mn = int(sub_c.max()), float(sub_c.mean())
-        act_mn = float(act_map[by_i : by_i + bh_i, bx_i : bx_i + bw_i][comp_m].mean())
-        if act_mn < 0.036 and pk < 92 and area < min_area * 12:
-            continue
-        if bh_i >= bw_i * 4.2 and bw_i <= max_grain_w and mn < 72.0 and pk < 102 and bh_i < vh * 0.22:
-            continue
-        if area < min_area * 4 and pk < 74:
-            continue
-        clean_mask[lbls == i] = 255
 
-    # Ground-truth design structure map: Retinex crevices + cleaned zone boundaries
-    target_mask = cv2.bitwise_or(clean_mask, cv2.bitwise_and(canny_zone, ((comb_masked > 10).astype(np.uint8)) * 255))
-    target_mask = cv2.bitwise_or(target_mask, cv2.dilate(((bh_c >= c_med + 5.6 * max(c_mad, 1.3)).astype(np.uint8)) * 255, np.ones((2, 2), np.uint8)))
+    def filter_mask_components(src_m: np.ndarray, min_a: int) -> np.ndarray:
+        nl, lbl, st, _ = cv2.connectedComponentsWithStats(src_m)
+        out_m = np.zeros_like(src_m)
+        for i in range(1, nl):
+            area = int(st[i, cv2.CC_STAT_AREA])
+            if area < min_a:
+                continue
+            bxi, byi, bwi, bhi = int(st[i, 0]), int(st[i, 1]), int(st[i, 2]), int(st[i, 3])
+            cm = lbl[byi : byi + bhi, bxi : bxi + bwi] == i
+            sc = comb_masked[byi : byi + bhi, bxi : bxi + bwi][cm]
+            pk, mn = int(sc.max()), float(sc.mean())
+            act_mn = float(act_map[byi : byi + bhi, bxi : bxi + bwi][cm].mean())
+            if act_mn < 0.036 and pk < 94 and area < min_a * 12:
+                continue
+            if bhi >= bwi * 4.2 and bwi <= max_grain_w and ((mn < 78.0 and pk < 108 and bhi < vh * 0.24) or (act_mn < 0.06 and bhi < vh * 0.42 and mn < 95.0)):
+                continue
+            if area < min_a * 4 and pk < 76:
+                continue
+            out_m[lbl == i] = 255
+        return out_m
 
-    corner_t = int(round(36 + corners * 16))
-    speckle_base = max(5, int(round(12 - detail * 6)))
+    clean_grooves = filter_mask_components(groove_mask, min_area)
+    clean_raised = filter_mask_components(raised_raw, max(44, int(min_area * 1.5)))
 
-    # Closed-Loop Convergence Iter 1: Primary Retinex De-Grained VTracer + Pro CAD Anchor Fitting
-    all_ents = _trace_mask_vtracer(clean_mask, off_x, off_y, sx_mm, sy_mm, speckle_base, corner_t, 3.6)
+    # Keep outer bevel frame borders intact while separating inner thick relief bodies cleanly
+    raised_frac = float((clean_raised > 0).sum()) / max(1, vw * vh)
+    groove_unique = clean_grooves
+    if raised_frac >= 0.015:
+        groove_unique = cv2.bitwise_and(clean_grooves, 255 - cv2.erode(clean_raised, np.ones((5, 5), np.uint8)))
+
+    target_mask = cv2.bitwise_or(clean_grooves, clean_raised)
+    target_mask = cv2.bitwise_or(target_mask, cv2.bitwise_and(canny_zone, ((comb_masked > 10).astype(np.uint8)) * 255))
+
+    corner_t = int(round(40 + corners * 18))
+    speckle_base = max(6, int(round(14 - detail * 7)))
+
+    # Closed-Loop Convergence Iter 1: Clean Layered Regions (Raised Relief Motifs + Carved Grooves & Panels)
+    all_ents: list[dict[str, Any]] = []
+    if raised_frac >= 0.012:
+        all_ents.extend(
+            _trace_mask_vtracer(
+                clean_raised, off_x, off_y, sx_mm, sy_mm,
+                max(8, speckle_base + 2), corner_t, 4.6,
+                layer_group="Raised Relief Motifs", smooth_mask=True,
+            )
+        )
+    all_ents.extend(
+        _trace_mask_vtracer(
+            groove_unique, off_x, off_y, sx_mm, sy_mm,
+            speckle_base, corner_t, 4.2,
+            layer_group="Carved Grooves & Panels", smooth_mask=True,
+        )
+    )
     cov, min_tile, uncovered = _measure_vector_coverage(all_ents, target_mask, off_x, off_y, span_w, span_h)
     iters = 1
 
@@ -1060,7 +1207,7 @@ def _extract_wood_relief_vectors(
                 inter = ix * iy
                 ea = max(1e-4, (x1e - x0e) * (y1e - y0e))
                 ba = max(1e-4, (bx1 - bx0) * (by1 - by0))
-                if inter / min(ea, ba) > 0.80 and abs(ea - ba) / max(ea, ba) < 0.35:
+                if inter / min(ea, ba) > 0.78 and abs(ea - ba) / max(ea, ba) < 0.35:
                     dup = True
                     break
             if not dup:
@@ -1070,15 +1217,13 @@ def _extract_wood_relief_vectors(
     while (cov < 0.945 or min_tile < 0.84) and iters < 4:
         iters += 1
         if iters == 2:
-            # Pass 2: Retinex boosted shadow/residual trace strictly inside uncovered carved zones
             dark_boost = cv2.bitwise_and(cv2.dilate(((comb_masked > 10).astype(np.uint8)) * 255, np.ones((3, 3), np.uint8)), uncovered)
             dark_boost = cv2.bitwise_or(dark_boost, cv2.bitwise_and(canny_dil, uncovered))
             dark_boost = cv2.morphologyEx(dark_boost, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
             if int((dark_boost > 0).sum()) > 32:
-                pass2 = _trace_mask_vtracer(dark_boost, off_x, off_y, sx_mm, sy_mm, max(3, speckle_base - 2), corner_t, 3.0)
+                pass2 = _trace_mask_vtracer(dark_boost, off_x, off_y, sx_mm, sy_mm, max(4, speckle_base - 2), corner_t, 3.6, "Carved Grooves & Panels", True)
                 merge_non_overlapping(all_ents, pass2)
         elif iters == 3:
-            # Pass 3: AI Depth-Anything-V2 + SFS structural contour recovery masked to remaining uncovered tiles
             ai_ents = _extract_ai_model_recovery_vectors(sub_bgr, off_x, off_y, sx_mm, sy_mm, corners)
             if ai_ents:
                 ai_filtered = []
@@ -1099,11 +1244,10 @@ def _extract_wood_relief_vectors(
                         ai_filtered.append(e)
                 merge_non_overlapping(all_ents, ai_filtered)
         elif iters == 4:
-            # Pass 4: Morphological Retinex gradient skeleton/boundary completion for residual faint details
             res_bin = cv2.bitwise_and(cv2.dilate(((g_f > g_floor_f * 0.72).astype(np.uint8)) * 255, np.ones((2, 2), np.uint8)), uncovered)
             res_bin = cv2.bitwise_and(res_bin, cv2.dilate(zone_dil, np.ones((11, 11), np.uint8)) * 255)
             if int((res_bin > 0).sum()) > 28:
-                pass4 = _trace_mask_vtracer(res_bin, off_x, off_y, sx_mm, sy_mm, 3, corner_t, 2.8)
+                pass4 = _trace_mask_vtracer(res_bin, off_x, off_y, sx_mm, sy_mm, 4, corner_t, 3.2, "Carved Grooves & Panels", True)
                 merge_non_overlapping(all_ents, pass4)
 
         cov, min_tile, uncovered = _measure_vector_coverage(all_ents, target_mask, off_x, off_y, span_w, span_h)
@@ -1329,8 +1473,11 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
                 "toneTotal": 2,
                 "relief": {"enabled": False, "shape": "flat", "heightMm": 0.4, "radiusMm": 1.0, "mode": "max"},
             })
+    # Edge-preserving color vectorization (clean smooth flat zones instead of noisy JPEG artifacts)
     elif not is_engraved_wood_plaque:
-        den_c = cv2.fastNlMeansDenoisingColored(sub, None, 5, 5, 7, 21)
+        den_c = cv2.fastNlMeansDenoisingColored(sub, None, 6, 6, 7, 21)
+        den_c = cv2.bilateralFilter(den_c, d=7, sigmaColor=22, sigmaSpace=14)
+        den_c = cv2.bilateralFilter(den_c, d=5, sigmaColor=16, sigmaSpace=10)
         ok_c, png_c = cv2.imencode(".png", den_c)
         if not ok_c:
             raise RuntimeError("Failed encoding denoised PNG for VTracer")
@@ -1414,15 +1561,12 @@ def _solve_photometric_sfs_fft(bgr: np.ndarray, fg_mask: np.ndarray) -> np.ndarr
     FZ = (-1j * WX * FP - 1j * WY * FQ) / denom
     z_sfs = np.real(np.fft.ifft2(FZ)).astype(np.float32)
 
-    # Combine oriented SFS surface with signed gradient-dipole crest energy for symmetric faceted relief
-    grad_energy = cv2.GaussianBlur(gmag, (5, 5), 1.4)
+    # Pure Poisson integrated Frankot-Chellappa surface (NO unsigned gradient crater-rim spikes!)
     vals = z_sfs[fg]
-    lo, hi = float(np.percentile(vals, 3)), float(np.percentile(vals, 97))
+    lo, hi = float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
     z_norm = np.clip((z_sfs - lo) / max(1e-4, hi - lo), 0.0, 1.0)
-    ge_hi = max(1e-4, float(np.percentile(grad_energy[fg], 96)))
-    crest = np.clip(grad_energy / ge_hi, 0.0, 1.0)
-    out = np.clip(z_norm * 0.58 + crest * 0.42, 0.0, 1.0) * fg.astype(np.float32)
-    return out
+    z_smooth = cv2.bilateralFilter(z_norm.astype(np.float32), d=5, sigmaColor=0.14, sigmaSpace=5.0)
+    return z_smooth * fg.astype(np.float32)
 
 
 def handle_reconstruct_3d(req: dict[str, Any]) -> dict[str, Any]:
@@ -1527,8 +1671,9 @@ def handle_reconstruct_3d(req: dict[str, Any]) -> dict[str, Any]:
             except Exception:
                 pass
 
-    # Compute downsample transport buffer (max edge 640px) for crisp browser WebGL mesh construction
-    max_t = 640
+    # Compute crisp up-to-1280px 16-bit depth transport buffer matching user topology preset (4K/2K/Flagship)
+    req_res = int(req.get("resolution", 384))
+    max_t = min(1280, max(640, req_res * 2))
     sc_t = min(1.0, max_t / max(cw, ch))
     tw, th = max(32, int(round(cw * sc_t))), max(32, int(round(ch * sc_t)))
     d_small = cv2.resize(depth_norm, (tw, th), interpolation=cv2.INTER_AREA)

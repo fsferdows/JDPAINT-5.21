@@ -155,7 +155,7 @@ export class Asset3DEngine {
     Asset3DEngine._solveSurfaceDepth(prep, { delight, invert, edgeStrength });
 
     await emit(3, 64, `Stage 3/5: Applying Volume-Preserving Taubin Fairing & Sobel Rolling-Ball Fillet (r=${filletRatio.toFixed(3)})...`);
-    const taubinPasses = (prep.isPlanarPanel && prep.neuralDepth) ? 2 : (prep.isPlanarPanel ? 4 : 5);
+    const taubinPasses = (prep.isPlanarPanel && prep.neuralDepth) ? 3 : (prep.isPlanarPanel ? 4 : 5);
     Asset3DEngine.taubinSmoothDepth(prep.depth, prep.fgMask, prep.resX, prep.resY, taubinPasses);
     Asset3DEngine.applySlopeAwareFillet(prep.depth, prep.fgMask, prep.resX, prep.resY, prep.aspect >= 1 ? widthMm : widthMm * prep.aspect, thicknessMm, filletRatio);
 
@@ -786,10 +786,10 @@ export class Asset3DEngine {
         const railHold = Math.max(0.0, Math.min(1.0, smoothDist[i] / railMargin));
         let zVal;
         if (nDepth) {
-          // Local Vision bridge returns de-tilted multi-scale SFS + morphological carved depth; preserve full geometric relief
+          // Local Vision bridge provides sculpted bas-relief depth (AI Depth + SFS + geodesic dome); avoid re-injecting raw grain noise
           const nd = invert ? 1.0 - nDepth[i] : nDepth[i];
-          const detailPunch = Math.max(0.0, Math.min(1.0, 0.5 + microDelta * 0.70));
-          zVal = Math.max(0.05, Math.min(0.99, nd * 0.80 + detailPunch * 0.20));
+          const cleanContour = Math.max(0.0, Math.min(1.0, 0.5 + (macroElev - 0.5) * 0.45));
+          zVal = Math.max(0.05, Math.min(0.99, nd * 0.94 + cleanContour * 0.06));
         } else {
           const macroBase = macroElev * (1.0 - 0.32 * railHold) + pSfs * (0.32 * railHold);
           zVal = Math.max(0.10, Math.min(1.0, macroBase * 0.68 + 0.16 + microDelta * 0.28));
@@ -799,7 +799,7 @@ export class Asset3DEngine {
       }
 
       const gfRad = nDepth ? 1 : 2;
-      const gfEps = nDepth ? 0.004 : 0.018;
+      const gfEps = nDepth ? 0.0025 : 0.018;
       const smoothPlanar = ImageVectorizer.guidedFilter(depth, resX, resY, gfRad, gfEps);
       for (let i = 0; i < total; i++) depth[i] = fgMask[i] ? Math.max(0.05, Math.min(0.99, smoothPlanar[i])) : 0;
       return;
@@ -1172,7 +1172,7 @@ export class Asset3DEngine {
       Asset3DEngine.inpaintTextureWatermark(texRgba, texSize, _wmMask, resX, resY);
     }
     Asset3DEngine.dilateTextureEdges(texRgba, texSize, fgMask, resX, resY, removeBg && !hasTransparency);
-    const maps = Asset3DEngine.synthesizePBRMaps(texRgba, texSize, delight, fgMask, resX, resY);
+    const maps = Asset3DEngine.synthesizePBRMaps(texRgba, texSize, delight, fgMask, resX, resY, depth);
 
     const aspectBox = fgBox.maxX > fgBox.minX && fgBox.maxY > fgBox.minY
       ? {
@@ -1469,7 +1469,7 @@ export class Asset3DEngine {
   /**
    * Synthesize Base Color, Tangent Normal, Roughness, Metallic, AND GLTF-packed ORM maps.
    */
-  static synthesizePBRMaps(rgba, size, delight = true, fgMask = null, fgW = 0, fgH = 0) {
+  static synthesizePBRMaps(rgba, size, delight = true, fgMask = null, fgW = 0, fgH = 0, depthField = null) {
     const n = size * size;
     const baseColor = new Uint8ClampedArray(rgba);
     const normal = new Uint8ClampedArray(n * 4);
@@ -1488,13 +1488,26 @@ export class Asset3DEngine {
     const fgScaleY = fgMask && (fgH || fgW) ? ((fgH || fgW) - 1) / Math.max(1, size - 1) : 0;
     const activeFgW = fgW || 0;
     const activeFgH = fgH || fgW || 0;
+    const hasDepth = !!(depthField && activeFgW > 2 && activeFgH > 2 && depthField.length === activeFgW * activeFgH);
+    const sampleDepth = (fx, fy) => {
+      const x0 = Math.max(0, Math.min(activeFgW - 2, fx | 0));
+      const y0 = Math.max(0, Math.min(activeFgH - 2, fy | 0));
+      const tx = Math.max(0, Math.min(1, fx - x0));
+      const ty = Math.max(0, Math.min(1, fy - y0));
+      const r0 = y0 * activeFgW, r1 = r0 + activeFgW;
+      const d0 = depthField[r0 + x0] * (1 - tx) + depthField[r0 + x0 + 1] * tx;
+      const d1 = depthField[r1 + x0] * (1 - tx) + depthField[r1 + x0 + 1] * tx;
+      return d0 * (1 - ty) + d1 * ty;
+    };
 
     for (let y = 0; y < size; y++) {
-      const sy = fgScaleY ? Math.min(activeFgH - 1, Math.round(y * fgScaleY)) : 0;
+      const fy = fgScaleY ? y * fgScaleY : 0;
+      const sy = fgScaleY ? Math.min(activeFgH - 1, Math.round(fy)) : 0;
       for (let x = 0; x < size; x++) {
         const i = y * size + x, p = i * 4;
         const r = rgba[p], g = rgba[p + 1], b = rgba[p + 2], a = rgba[p + 3];
-        const inFg = !fgMask || !activeFgW || fgMask[sy * activeFgW + Math.min(activeFgW - 1, Math.round(x * fgScaleX))] === 1;
+        const fx = fgScaleX ? x * fgScaleX : 0;
+        const inFg = !fgMask || !activeFgW || fgMask[sy * activeFgW + Math.min(activeFgW - 1, Math.round(fx))] === 1;
 
         if (delight && a > 16) {
           const localMean = Math.max(0.18, ImageVectorizer.getLocalMean(sat, size, size, x, y, rIllum));
@@ -1509,9 +1522,16 @@ export class Asset3DEngine {
 
         const xl = Math.max(0, x - 1), xr = Math.min(size - 1, x + 1);
         const yu = Math.max(0, y - 1), yd = Math.min(size - 1, y + 1);
-        const gradGain = inFg ? 3.0 : 0.35;
-        const dx = (lum[y * size + xr] - lum[y * size + xl]) * gradGain;
-        const dy = (lum[yd * size + x] - lum[yu * size + x]) * gradGain;
+        const texGain = inFg ? (hasDepth ? 1.05 : 2.6) : 0.30;
+        const tdx = (lum[y * size + xr] - lum[y * size + xl]) * texGain;
+        const tdy = (lum[yd * size + x] - lum[yu * size + x]) * texGain;
+        let dx = tdx, dy = tdy;
+        if (hasDepth && inFg) {
+          const gdx = (sampleDepth(fx + 0.75, fy) - sampleDepth(fx - 0.75, fy)) * 6.5;
+          const gdy = (sampleDepth(fx, fy + 0.75) - sampleDepth(fx, fy - 0.75)) * 6.5;
+          dx = gdx * 0.78 + tdx * 0.22;
+          dy = gdy * 0.78 + tdy * 0.22;
+        }
         let nx = -dx, ny = dy, nz = 1.0;
         const inv = 1.0 / Math.sqrt(nx * nx + ny * ny + 1.0);
         nx *= inv; ny *= inv; nz *= inv;
