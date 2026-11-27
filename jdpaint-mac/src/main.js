@@ -1068,6 +1068,7 @@ document.addEventListener('DOMContentLoaded', () => {
     await reliefEngine.loadImageHighAccuracyAsync(imgElement, opts, opts.onProgress || null);
     try {
       const visionRes = await CadKernelBridge.reconstruct3DViaVision(imgElement, {
+        resolution: Math.max(512, reliefEngine.resolution || 384),
         removeBg: opts.removeWhiteBg ?? true,
         delight: true,
         invert: !!opts.invert,

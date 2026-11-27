@@ -155,7 +155,7 @@ export class Asset3DEngine {
     Asset3DEngine._solveSurfaceDepth(prep, { delight, invert, edgeStrength });
 
     await emit(3, 64, `Stage 3/5: Applying Volume-Preserving Taubin Fairing & Sobel Rolling-Ball Fillet (r=${filletRatio.toFixed(3)})...`);
-    const taubinPasses = (prep.isPlanarPanel && prep.neuralDepth) ? 3 : (prep.isPlanarPanel ? 4 : 5);
+    const taubinPasses = (prep.isPlanarPanel && prep.neuralDepth) ? 1 : (prep.isPlanarPanel ? 3 : 5);
     Asset3DEngine.taubinSmoothDepth(prep.depth, prep.fgMask, prep.resX, prep.resY, taubinPasses);
     Asset3DEngine.applySlopeAwareFillet(prep.depth, prep.fgMask, prep.resX, prep.resY, prep.aspect >= 1 ? widthMm : widthMm * prep.aspect, thicknessMm, filletRatio);
 

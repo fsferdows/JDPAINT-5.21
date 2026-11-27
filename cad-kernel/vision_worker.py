@@ -314,29 +314,49 @@ def detect_furniture_roi(bgr: np.ndarray) -> dict[str, Any] | None:
 
 
 def _inpaint_watermarks(sub_bgr: np.ndarray, dc_sub: np.ndarray, L_sub: np.ndarray, l_med: float) -> tuple[np.ndarray, np.ndarray]:
-    """Suppress neutral bright overlays, anti-aliased fringe ink text & chromatic stamps."""
+    """Suppress neutral bright overlays, chromatic stamps, and adjacent dark footer typography."""
+    vh_w, vw_w = sub_bgr.shape[:2]
     b, g, r = cv2.split(sub_bgr)
     rgb_sat = np.maximum(np.maximum(r, g), b).astype(np.int16) - np.minimum(np.minimum(r, g), b).astype(np.int16)
     luma_raw = 0.2126 * r + 0.7152 * g + 0.0722 * b
 
     is_bright_wm = (L_sub > l_med + 14.0) & (rgb_sat < 22) & (dc_sub > 16.0)
-    # Guard against dark charcoal plaques (e.g. Khoj24 l_med ~ 45) while catching "aarsun" grey ink on wood doors
     is_neutral_ink = (l_med > 82.0) & (luma_raw < 74.0) & (rgb_sat < 14) & ((L_sub < l_med * 0.72) | (dc_sub > 14.0))
-    is_red_accent = (r.astype(np.int16) - g.astype(np.int16) > 56) & (dc_sub > 20.0)
+    # Pure crimson/red stamps sit noticeably above natural mahogany/teak grain highlights
+    is_red_accent = (r.astype(np.int16) - g.astype(np.int16) > 58) & (r.astype(np.int16) - b.astype(np.int16) > 36) & (dc_sub > 20.0)
     is_blue_accent = (b.astype(np.int16) - r.astype(np.int16) > 28) & (dc_sub > 18.0)
 
     cand = is_bright_wm | is_neutral_ink | is_red_accent | is_blue_accent
-    tot_px = sub_bgr.shape[0] * sub_bgr.shape[1]
-    wm_u8 = np.zeros((sub_bgr.shape[0], sub_bgr.shape[1]), dtype=np.uint8)
+    tot_px = vh_w * vw_w
+    wm_u8 = np.zeros((vh_w, vw_w), dtype=np.uint8)
     if 0 < int(cand.sum()) < int(tot_px * 0.055):
         n_lbl, lbls, stats, _ = cv2.connectedComponentsWithStats(cand.astype(np.uint8) * 255)
         max_comp = int(tot_px * 0.015)
         for ci in range(1, n_lbl):
             if 4 <= int(stats[ci, cv2.CC_STAT_AREA]) <= max_comp:
                 wm_u8[lbls == ci] = 255
+
+    # Catch dark/grey sub-tagline typography & TM stamps directly inside a detected watermark banner band
     if int(wm_u8.sum()) > 0:
-        wm_u8 = cv2.dilate(wm_u8, np.ones((5, 5), np.uint8), iterations=1)
-        cleaned = cv2.inpaint(sub_bgr, wm_u8, 5, cv2.INPAINT_TELEA)
+        band_ky = max(21, int(round(vh_w * 0.045)) | 1)
+        band_kx = max(41, int(round(vw_w * 0.14)) | 1)
+        wm_band = cv2.dilate(wm_u8, np.ones((band_ky, band_kx), np.uint8))
+        # Restrict small neutral tagline pickup strictly to outer header/footer banner zones (<14% top or >86% bottom)
+        outer_margin = np.zeros((vh_w, vw_w), dtype=bool)
+        outer_margin[: max(4, int(vh_w * 0.14)), :] = True
+        outer_margin[min(vh_w - 4, int(vh_w * 0.86)) :, :] = True
+        sub_ink = (wm_band > 0) & outer_margin & (luma_raw < 92.0) & (rgb_sat < 28) & ((dc_sub > 9.0) | (L_sub < l_med * 0.72))
+        if int(sub_ink.sum()) > 0:
+            n_s, lbl_s, st_s, _ = cv2.connectedComponentsWithStats(sub_ink.astype(np.uint8) * 255)
+            max_sub_h = max(14, int(round(vh_w * 0.038)))
+            for si in range(1, n_s):
+                sw_i, sh_i, sa_i = int(st_s[si, 2]), int(st_s[si, 3]), int(st_s[si, 4])
+                if 2 <= sa_i <= int(tot_px * 0.008) and sh_i <= max_sub_h and sw_i < vw_w * 0.45:
+                    wm_u8[lbl_s == si] = 255
+
+    if int(wm_u8.sum()) > 0:
+        wm_u8 = cv2.dilate(wm_u8, np.ones((7, 7), np.uint8), iterations=1)
+        cleaned = cv2.inpaint(sub_bgr, wm_u8, 7, cv2.INPAINT_TELEA)
         return cleaned, wm_u8
     return sub_bgr, wm_u8
 
@@ -623,7 +643,7 @@ def _run_rust_poisson(
     return np.frombuffer(out, dtype="<f4").reshape((h, w)).copy()
 
 
-def _solve_planar_relief_heightmap(sub_bgr: np.ndarray) -> np.ndarray:
+def _solve_planar_relief_heightmap(sub_bgr: np.ndarray, wm_mask: np.ndarray | None = None) -> np.ndarray:
     """Compute a volumetric de-tilted bas-relief heightmap fusing AI Depth-Anything-V2, SFS & Rust Screened Poisson."""
     import torch
 
@@ -674,43 +694,53 @@ def _solve_planar_relief_heightmap(sub_bgr: np.ndarray) -> np.ndarray:
     Lc_despiked = np.minimum(Lc, L_med5 + 0.030).astype(np.float32)
     Ld_u8 = np.clip(Lc_despiked * 255.0, 0, 255).astype(np.uint8)
 
-    # Smooth continuous meso-sculpting + recessed BlackHat crevice troughs (ZERO binary distance-transform stalagmites!)
-    z_macro_raw = (ai_flat * 0.45 + sfs_flat * 0.55) if ai_flat is not None else sfs_flat.copy()
-    z_macro = np.clip(cv2.GaussianBlur(z_macro_raw.astype(np.float32), (0, 0), sigmaX=max(2.0, m_dim * 0.0038)), 0.18, 0.90)
+    # Smooth architectural foundation bounded so stained/dark floral cavities stay a recessed floor, never a black crater
+    z_macro_raw = (ai_flat * 0.42 + sfs_flat * 0.58) if ai_flat is not None else sfs_flat.copy()
+    z_macro = np.clip(cv2.GaussianBlur(z_macro_raw.astype(np.float32), (0, 0), sigmaX=max(2.4, m_dim * 0.0045)), 0.28, 0.86)
+
+    # Multi-Scale Morphological White TopHat makes EVERY carved petal/leaf rise proudly (+Z) above its cavity floor
+    r_p1 = max(5, int(round(m_dim * 0.012)) | 1)
+    r_p2 = max(11, int(round(m_dim * 0.028)) | 1)
+    r_p3 = max(21, int(round(m_dim * 0.052)) | 1)
+    wh_1 = cv2.morphologyEx(Ld_u8, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_p1, r_p1))).astype(np.float32) / 255.0
+    wh_2 = cv2.morphologyEx(Ld_u8, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_p2, r_p2))).astype(np.float32) / 255.0
+    wh_3 = cv2.morphologyEx(Ld_u8, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_p3, r_p3))).astype(np.float32) / 255.0
+    petal_domes = np.clip(wh_1 * 0.45 + wh_2 * 0.55 + wh_3 * 0.35, 0.0, 0.62)
 
     r_bh = max(7, int(round(m_dim * 0.014)) | 1)
     ker_bh = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_bh, r_bh))
     bh_r = cv2.morphologyEx(Ld_u8, cv2.MORPH_BLACKHAT, ker_bh).astype(np.float32) / 255.0
-    bg_petal = cv2.GaussianBlur(Lc_despiked, (0, 0), sigmaX=max(7.0, m_dim * 0.024))
-    elev_petal = np.clip((Lc_despiked - bg_petal) * 1.15, -0.14, 0.24)
-    val_carve = np.clip(bh_r * 0.55, 0.0, 0.18)
+    val_carve = np.clip(bh_r * 0.72, 0.0, 0.28)
+    sculpt_raw = (petal_domes * 0.90 - val_carve * 0.80) * grain_gate
+    if wm_mask is not None and wm_mask.shape[:2] == sculpt_raw.shape[:2] and wm_mask.any():
+        wm_d = cv2.dilate((wm_mask > 0).astype(np.uint8) * 255, np.ones((7, 7), np.uint8)) > 0
+        sculpt_raw[wm_d] = 0.0
     sculpt_field = cv2.GaussianBlur(
-        ((elev_petal - val_carve * 0.65) * grain_gate).astype(np.float32),
+        sculpt_raw.astype(np.float32),
         (0, 0),
-        sigmaX=max(1.8, m_dim * 0.0032),
+        sigmaX=max(1.2, m_dim * 0.0022),
     )
 
-    guide_surf = np.clip(z_macro * 0.58 + (0.5 + sculpt_field * 0.92) * 0.42, 0.0, 1.0).astype(np.float32)
+    guide_surf = np.clip(z_macro * 0.48 + (0.36 + sculpt_field * 0.95) * 0.52, 0.02, 0.99).astype(np.float32)
     px = cv2.Scharr(guide_surf, cv2.CV_32F, 1, 0) / 32.0
     qy = cv2.Scharr(guide_surf, cv2.CV_32F, 0, 1) / 32.0
 
     rel = _run_rust_poisson(
         px,
         qy,
-        z_macro,
-        np.maximum(grain_gate, 0.10).astype(np.float32),
-        lam=0.0085,
-        iters=18,
-        grad_knee=0.020,
-        grad_scale=0.58,
+        guide_surf,
+        np.maximum(grain_gate, 0.14).astype(np.float32),
+        lam=0.0055,
+        iters=20,
+        grad_knee=0.032,
+        grad_scale=1.10,
     )
     if rel is None:
         rel = guide_surf
 
-    # Gentle edge-preserving polish removes micro plank ripple & needle chatter while preserving sculpted shoulders
-    rel = cv2.bilateralFilter(rel.astype(np.float32), d=7, sigmaColor=0.075, sigmaSpace=4.5)
-    rel = cv2.GaussianBlur(rel, (0, 0), sigmaX=max(0.75, m_dim * 0.0014))
-    lo, hi = float(np.percentile(rel, 2)), float(np.percentile(rel, 98))
+    # Crisp edge-preserving bilateral finish retains sharp petal ridges without Gaussian mush
+    rel = cv2.bilateralFilter(rel.astype(np.float32), d=5, sigmaColor=0.070, sigmaSpace=2.6)
+    lo, hi = float(np.percentile(rel, 1.5)), float(np.percentile(rel, 98.5))
     return np.clip((rel - lo) / max(1e-4, hi - lo), 0.04, 0.96).astype(np.float32)
 
 
@@ -1113,7 +1143,8 @@ def _trace_field_rust(
         return []
     vh, vw = field_u8.shape[:2]
     if smooth_sigma > 0.05:
-        field_in = cv2.GaussianBlur(field_u8, (3, 3), smooth_sigma)
+        k_sm = 5 if smooth_sigma >= 0.80 else 3
+        field_in = cv2.GaussianBlur(field_u8, (k_sm, k_sm), smooth_sigma)
     else:
         field_in = np.ascontiguousarray(field_u8, dtype=np.uint8)
 
@@ -1217,6 +1248,7 @@ def _extract_straight_cad_lines(
     sx_mm: float,
     sy_mm: float,
     detail: float,
+    ridge_gate: np.ndarray | None = None,
 ) -> tuple[list[dict[str, Any]], np.ndarray]:
     """Detect clean straight architectural rails/stiles/panels via OpenCV LSD + centerline double-wall fusion."""
     vh, vw = gray_eq_u8.shape[:2]
@@ -1227,8 +1259,9 @@ def _extract_straight_cad_lines(
     if raw is None or len(raw) == 0:
         return [], arch_mask
 
-    min_len = max(20.0, m_dim * (0.044 - float(np.clip(detail, 0.1, 1.0)) * 0.014))
+    min_len = max(28.0, m_dim * (0.062 - float(np.clip(detail, 0.1, 1.0)) * 0.015))
     zone_d = cv2.dilate(zone_closed, np.ones((7, 7), np.uint8)) > 0
+    ridge_d = cv2.dilate(ridge_gate, np.ones((5, 5), np.uint8)) > 0 if ridge_gate is not None else zone_d
     near_margin = max(12.0, vw * 0.105)
 
     kept: list[list[float]] = []
@@ -1242,13 +1275,16 @@ def _extract_straight_cad_lines(
         is_h = ang <= 2.2 or ang >= 177.8
         is_v = 87.8 <= ang <= 92.2
         is_miter = (36.0 <= ang <= 54.0) or (126.0 <= ang <= 144.0)
-        if not (is_h or is_v or is_miter or ln >= min_len * 1.95):
+        if not (is_h or is_v or is_miter or ln >= min_len * 2.0):
             continue
 
-        # Verify segment genuinely belongs to carved relief & not outer plank wood grain or bottom catalog footers
+        # Verify segment genuinely sits on a real carved edge/groove (never bare flat panel wood grain)
         xs_s = np.clip(np.round(np.linspace(x1, x2, 16)).astype(np.int32), 0, vw - 1)
         ys_s = np.clip(np.round(np.linspace(y1, y2, 16)).astype(np.int32), 0, vh - 1)
-        if float(zone_d[ys_s, xs_s].mean()) < 0.68:
+        if float(zone_d[ys_s, xs_s].mean()) < 0.70:
+            continue
+        ridge_cov = float(ridge_d[ys_s, xs_s].mean())
+        if ridge_cov < (0.56 if (is_v and ln < vh * 0.16) else 0.42):
             continue
         if wm_sup is not None and float((wm_sup[ys_s, xs_s] > 0).mean()) > 0.25:
             continue
@@ -1349,11 +1385,48 @@ def _extract_straight_cad_lines(
     for vi in v_idxs:
         merged[vi][4] = math.hypot(merged[vi][2] - merged[vi][0], merged[vi][3] - merged[vi][1])
 
-    entities: list[dict[str, Any]] = []
-    draw_th = max(3, int(round(m_dim * 0.0042)))
-    for x1, y1, x2, y2, ln in merged:
+    # Prune floating unanchored vertical wood-grain ticks while keeping ALL real frame rails, corner boxes, & pilaster flutes
+    h_segs = [merged[i] for i in h_idxs if merged[i][4] >= min_len]
+    v_set = set(v_idxs)
+    anchor_tol = max(16.0, m_dim * 0.022)
+    flute_dx = max(14.0, m_dim * 0.024)
+    final_segs: list[list[float]] = []
+    for idx_m, m in enumerate(merged):
+        x1, y1, x2, y2, ln = m
         if ln < min_len:
             continue
+        if idx_m in v_set and ln < vh * 0.15:
+            vx = 0.5 * (x1 + x2)
+            vy_lo, vy_hi = min(y1, y2), max(y1, y2)
+            top_anc = any(
+                (min(h[0], h[2]) - anchor_tol <= vx <= max(h[0], h[2]) + anchor_tol)
+                and (abs(0.5 * (h[1] + h[3]) - vy_lo) <= anchor_tol)
+                for h in h_segs
+            )
+            bot_anc = any(
+                (min(h[0], h[2]) - anchor_tol <= vx <= max(h[0], h[2]) + anchor_tol)
+                and (abs(0.5 * (h[1] + h[3]) - vy_hi) <= anchor_tol)
+                for h in h_segs
+            )
+            flute_peers = 0
+            for j in v_idxs:
+                if j == idx_m or merged[j][4] < min_len:
+                    continue
+                ox = 0.5 * (merged[j][0] + merged[j][2])
+                oy_lo, oy_hi = min(merged[j][1], merged[j][3]), max(merged[j][1], merged[j][3])
+                ov_y = min(vy_hi, oy_hi) - max(vy_lo, oy_lo)
+                if abs(ox - vx) <= flute_dx and ov_y >= 0.72 * max(ln, merged[j][4]):
+                    flute_peers += 1
+            xs_c = np.clip(np.round(np.linspace(x1, x2, 16)).astype(np.int32), 0, vw - 1)
+            ys_c = np.clip(np.round(np.linspace(y1, y2, 16)).astype(np.int32), 0, vh - 1)
+            r_cov = float(ridge_d[ys_c, xs_c].mean())
+            if not ((top_anc and bot_anc) or (flute_peers >= 2 and (top_anc or bot_anc or r_cov >= 0.60)) or (ln >= vh * 0.115 and r_cov >= 0.78)):
+                continue
+        final_segs.append(m)
+
+    entities: list[dict[str, Any]] = []
+    draw_th = max(3, int(round(m_dim * 0.0042)))
+    for x1, y1, x2, y2, ln in final_segs:
         p1i = (int(round(x1)), int(round(y1)))
         p2i = (int(round(x2)), int(round(y2)))
         cv2.line(arch_mask, p1i, p2i, 255, draw_th)
@@ -1500,13 +1573,13 @@ def _extract_wood_relief_vectors(
     ker_f = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_f, r_f))
     ker_m = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_m, r_m))
 
-    # Coarse carving gate balanced per axis so overhead lighting doesn't drop vertical rails/stiles
+    # Coarse carving gate using capped axis equalization so faint flat-wood vertical grain isn't over-amplified
     bh_c = cv2.morphologyEx(Lc, cv2.MORPH_BLACKHAT, ker_f) * 0.58 + cv2.morphologyEx(Lc, cv2.MORPH_BLACKHAT, ker_m) * 0.62
     gx_c = np.abs(cv2.Scharr(Lc, cv2.CV_32F, 1, 0) / 16.0)
     gy_c = np.abs(cv2.Scharr(Lc, cv2.CV_32F, 0, 1) / 16.0)
-    gx_sc = max(12.0, float(np.percentile(gx_c, 84)))
-    gy_sc = max(12.0, float(np.percentile(gy_c, 84)))
-    g_c = np.maximum(gx_c * (22.0 / gx_sc), gy_c * (22.0 / gy_sc))
+    gx_sc = max(15.0, float(np.percentile(gx_c, 84)))
+    gy_sc = max(15.0, float(np.percentile(gy_c, 84)))
+    g_c = np.maximum(gx_c * min(1.32, 22.0 / gx_sc), gy_c * min(1.32, 22.0 / gy_sc))
 
     detail_bias = (0.70 - float(np.clip(detail, 0.15, 1.0))) * 14.0
     c_med = float(np.median(bh_c))
@@ -1516,7 +1589,7 @@ def _extract_wood_relief_vectors(
 
     c_zone = (
         (bh_c >= max(float(np.percentile(bh_c, 77)), c_med + 3.8 * max(c_mad, 1.3), 17.5) + detail_bias * 0.35)
-        | (g_c >= max(float(np.percentile(g_c, 76)), gc_med + 3.4 * max(gc_mad, 1.3), 15.5) + detail_bias * 0.35)
+        | (g_c >= max(float(np.percentile(g_c, 77)), gc_med + 3.6 * max(gc_mad, 1.3), 16.5) + detail_bias * 0.35)
     ).astype(np.uint8)
     k_dil = max(11, int(round(m_dim * 0.015)) | 1)
     zone_dil = cv2.dilate(c_zone, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_dil, k_dil)))
@@ -1528,42 +1601,56 @@ def _extract_wood_relief_vectors(
     if wm_mask is not None and wm_mask.shape[:2] == (vh, vw) and wm_mask.any():
         wm_sup = cv2.dilate((wm_mask > 0).astype(np.uint8) * 255, np.ones((11, 11), np.uint8))
 
-    # Stage 1: Architectural Straight CAD Lines (clean straight door stiles, rails & molding panels via OpenCV LSD)
-    arch_lines, arch_line_mask = _extract_straight_cad_lines(
-        Lf_u8, zone_closed, wm_sup, off_x, off_y, sx_mm, sy_mm, detail
-    )
-
-    # Stage 2: Tight Crevice-Split Carved Petals & Motifs (kills the blurred 4.2% sigma potato blob overlap!)
+    # Stage 2 prep first so straight CAD lines verify against true carved BlackHat ridges (blocking panel grain ticks)
     bh_f = cv2.morphologyEx(Lf, cv2.MORPH_BLACKHAT, ker_f) * 0.65 + cv2.morphologyEx(Lf, cv2.MORPH_BLACKHAT, ker_m) * 0.55
     gx_f = np.abs(cv2.Scharr(Lf, cv2.CV_32F, 1, 0) / 16.0)
     gy_f = np.abs(cv2.Scharr(Lf, cv2.CV_32F, 0, 1) / 16.0)
-    gxf_sc = max(10.0, float(np.percentile(gx_f, 84)))
-    gyf_sc = max(10.0, float(np.percentile(gy_f, 84)))
-    g_f = np.maximum(gx_f * (20.0 / gxf_sc), gy_f * (20.0 / gyf_sc))
+    gxf_sc = max(13.0, float(np.percentile(gx_f, 84)))
+    gyf_sc = max(13.0, float(np.percentile(gy_f, 84)))
+    g_f = np.maximum(gx_f * min(1.30, 20.0 / gxf_sc), gy_f * min(1.30, 20.0 / gyf_sc))
 
-    bh_floor_f = max(float(np.percentile(bh_f, 70)), float(np.median(bh_f)) + 2.6 * max(float(np.median(np.abs(bh_f - np.median(bh_f)))), 1.1), 8.2) + detail_bias * 0.25
-    g_floor_f = max(float(np.percentile(g_f, 71)), float(np.median(g_f)) + 2.5 * max(float(np.median(np.abs(g_f - np.median(g_f)))), 1.1), 8.0) + detail_bias * 0.25
+    bh_floor_f = max(float(np.percentile(bh_f, 71)), float(np.median(bh_f)) + 2.7 * max(float(np.median(np.abs(bh_f - np.median(bh_f)))), 1.1), 8.6) + detail_bias * 0.25
+    g_floor_f = max(float(np.percentile(g_f, 72)), float(np.median(g_f)) + 2.6 * max(float(np.median(np.abs(g_f - np.median(g_f)))), 1.1), 8.5) + detail_bias * 0.25
 
     comb = np.maximum(np.clip((bh_f - bh_floor_f) * 3.15, 0, 255), np.clip((g_f - g_floor_f) * 2.90, 0, 255) * 0.92)
     comb_masked = np.where((zone_closed > 0) | (bh_c > c_med + 5.2 * max(c_mad, 1.3)), comb, 0.0).astype(np.uint8)
+    ridge_gate = ((comb_masked > 24) | (bh_f >= bh_floor_f * 1.05)).astype(np.uint8)
 
-    # Tight 1.4% surface separates individual leaves/petals explicitly cut by dark carved crevices
-    bg_tight = cv2.GaussianBlur(Lf, (0, 0), sigmaX=max(7.0, m_dim * 0.0145))
-    elev_tight = Lf - bg_tight
-    crevice_cut = (bh_f >= bh_floor_f * 1.12) & (zone_closed > 0)
-    pos_vals = elev_tight[zone_dil > 0] if zone_dil.any() else elev_tight
-    pos_floor_t = max(8.5, float(np.percentile(pos_vals, 68)) * 0.76) + detail_bias * 0.24
-    raised_raw = np.where((zone_dil > 0) & (elev_tight >= pos_floor_t) & (~crevice_cut), 255, 0).astype(np.uint8)
+    # Stage 1: Architectural Straight CAD Lines verified against genuine ridge depth (zero flat-panel wood grain!)
+    arch_lines, arch_line_mask = _extract_straight_cad_lines(
+        Lf_u8, zone_closed, wm_sup, off_x, off_y, sx_mm, sy_mm, detail, ridge_gate=ridge_gate
+    )
+
+    # Whole-Petal Multi-Scale Morphological White TopHat separates FULL carved leaves/petals cleanly to thin fine crevices
+    r_l = max(21, int(round(m_dim * 0.036)) | 1)
+    ker_l = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_l, r_l))
+    wh_petal = (
+        cv2.morphologyEx(Lf_u8, cv2.MORPH_TOPHAT, ker_f).astype(np.float32) * 0.48
+        + cv2.morphologyEx(Lf_u8, cv2.MORPH_TOPHAT, ker_m).astype(np.float32) * 0.56
+        + cv2.morphologyEx(Lf_u8, cv2.MORPH_TOPHAT, ker_l).astype(np.float32) * 0.34
+    )
+    bh_fine_crev = cv2.morphologyEx(Lf, cv2.MORPH_BLACKHAT, ker_f)
+    bh_fine_fl = max(
+        float(np.percentile(bh_fine_crev, 76)),
+        float(np.median(bh_fine_crev)) + 2.8 * max(float(np.median(np.abs(bh_fine_crev - np.median(bh_fine_crev)))), 1.0),
+        8.2,
+    )
+    crevice_cut = (bh_fine_crev >= bh_fine_fl * 1.15) & (zone_closed > 0)
+    pos_vals = wh_petal[zone_dil > 0] if zone_dil.any() else wh_petal
+    pos_floor_t = max(8.5, float(np.percentile(pos_vals, 52)) * 0.68) + detail_bias * 0.22
+    raised_raw = np.where((zone_dil > 0) & (wh_petal >= pos_floor_t) & (~crevice_cut), 255, 0).astype(np.uint8)
+    raised_raw = cv2.morphologyEx(raised_raw, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
     raised_raw = cv2.morphologyEx(raised_raw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
 
+    # Smooth morphological groove mask without jagged Canny pixel worms
     med_v = float(np.median(Lf_u8))
-    canny_edges = cv2.Canny(Lf_u8, max(14, int(med_v * 0.28)), max(40, int(med_v * 0.78)))
-    canny_zone = cv2.bitwise_and(canny_edges, cv2.dilate(zone_closed, np.ones((9, 9), np.uint8)) * 255)
+    canny_edges = cv2.Canny(Lf_u8, max(16, int(med_v * 0.30)), max(44, int(med_v * 0.82)))
+    canny_zone = cv2.bitwise_and(canny_edges, cv2.dilate(zone_closed, np.ones((7, 7), np.uint8)) * 255)
     canny_dil = cv2.dilate(canny_zone, np.ones((2, 2), np.uint8))
 
-    _, groove_mask = cv2.threshold(comb_masked, max(15, int(round(22 + detail_bias * 0.4))), 255, cv2.THRESH_BINARY)
-    groove_mask = cv2.bitwise_or(groove_mask, canny_dil)
-    groove_mask = cv2.morphologyEx(groove_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    _, groove_mask = cv2.threshold(comb_masked, max(18, int(round(26 + detail_bias * 0.4))), 255, cv2.THRESH_BINARY)
+    groove_mask = cv2.morphologyEx(groove_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    groove_mask = cv2.morphologyEx(groove_mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
 
     # Noise/speckle threshold dynamically driven by user noise_px & 4K canvas scale
     noise_scale = max(0.35, float(noise_px) / 10.0)
@@ -1614,7 +1701,8 @@ def _extract_wood_relief_vectors(
             if act_mn < 0.045 and pk < 96 and area < min_a * 10:
                 continue
             if bhi >= bwi * 3.5 and bwi <= max_grain_w:
-                if (mn < 88.0 and pk < 116 and bhi < vh * 0.32) or (act_mn < 0.075 and bhi < vh * 0.50 and mn < 102.0):
+                mean_w = area / max(1, bhi)
+                if (bhi >= bwi * 4.5 and bhi < vh * 0.22 and mean_w < max(8.5, vw * 0.0115)) or (bhi >= bwi * 3.9 and bhi < vh * 0.16 and mean_w < max(6.0, vw * 0.0088)) or (mn < 88.0 and pk < 116 and bhi < vh * 0.32) or (act_mn < 0.075 and bhi < vh * 0.50 and mn < 102.0):
                     continue
             if not keep_rails and area < min_a * 1.8 and pk < 92:
                 continue
@@ -1659,7 +1747,8 @@ def _extract_wood_relief_vectors(
             target_mask[bot_i:, :] = 0
 
     speckle_px = max(24.0, float(min_area) * 0.90)
-    straight_tol = max(0.85, 1.30 - detail * 0.42)
+    straight_tol = max(0.88, 1.32 - detail * 0.38)
+    organic_corners = max(0.25, corners * 0.85)
 
     # Stage 3: Rust Multi-Core Subpixel Vectorization + Closed-Loop Convergence Verification
     all_ents: list[dict[str, Any]] = list(arch_lines)
@@ -1667,8 +1756,8 @@ def _extract_wood_relief_vectors(
         all_ents.extend(
             _trace_field_rust(
                 clean_raised, off_x, off_y, sx_mm, sy_mm,
-                detail=detail, corners=corners, min_area_px=speckle_px * 1.15,
-                straight_tol_px=straight_tol, layer_group="Raised Relief Motifs", smooth_sigma=0.72,
+                detail=detail, corners=organic_corners, min_area_px=speckle_px * 1.15,
+                straight_tol_px=straight_tol, layer_group="Raised Relief Motifs", smooth_sigma=0.84,
             ) or _trace_mask_vtracer(
                 clean_raised, off_x, off_y, sx_mm, sy_mm,
                 max(10, int(round(18 - detail * 8))), int(round(40 + corners * 18)), 5.0,
@@ -1678,8 +1767,8 @@ def _extract_wood_relief_vectors(
     all_ents.extend(
         _trace_field_rust(
             groove_unique, off_x, off_y, sx_mm, sy_mm,
-            detail=detail, corners=corners, min_area_px=speckle_px,
-            straight_tol_px=straight_tol, layer_group="Carved Grooves & Panels", smooth_sigma=0.68,
+            detail=detail, corners=organic_corners, min_area_px=speckle_px,
+            straight_tol_px=straight_tol, layer_group="Carved Grooves & Panels", smooth_sigma=0.82,
         ) or _trace_mask_vtracer(
             groove_unique, off_x, off_y, sx_mm, sy_mm,
             max(8, int(round(16 - detail * 8))), int(round(40 + corners * 18)), 4.6,
@@ -1719,20 +1808,19 @@ def _extract_wood_relief_vectors(
                 base.append(e)
                 boxes.append((x0e, y0e, x1e, y1e, len(ps)))
 
-    while (cov < 0.945 or min_tile < 0.84) and iters < 4:
+    while (cov < 0.960 or min_tile < 0.86) and iters < 4:
         iters += 1
         if iters == 2:
-            dark_boost = cv2.bitwise_and(cv2.dilate(((comb_masked > 10).astype(np.uint8)) * 255, np.ones((3, 3), np.uint8)), uncovered)
-            dark_boost = cv2.bitwise_or(dark_boost, cv2.bitwise_and(canny_dil, uncovered))
+            dark_boost = cv2.bitwise_and(cv2.dilate(((comb_masked > 16).astype(np.uint8)) * 255, np.ones((3, 3), np.uint8)), uncovered)
             if exclusion_m.any():
                 dark_boost = cv2.bitwise_and(dark_boost, 255 - exclusion_m)
-            dark_boost = cv2.morphologyEx(dark_boost, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-            dark_boost = filter_mask_components(dark_boost, max(36, int(min_area * 0.9)), keep_rails=True, skip_arch=True)
+            dark_boost = cv2.morphologyEx(dark_boost, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+            dark_boost = filter_mask_components(dark_boost, max(40, int(min_area * 1.0)), keep_rails=True, skip_arch=True)
             if int((dark_boost > 0).sum()) > 32:
                 pass2 = _trace_field_rust(
                     dark_boost, off_x, off_y, sx_mm, sy_mm,
-                    detail=detail, corners=corners, min_area_px=max(20.0, speckle_px * 0.85),
-                    straight_tol_px=straight_tol, layer_group="Carved Grooves & Panels", smooth_sigma=0.65,
+                    detail=detail, corners=corners, min_area_px=max(24.0, speckle_px * 0.92),
+                    straight_tol_px=straight_tol, layer_group="Carved Grooves & Panels", smooth_sigma=0.82,
                 )
                 merge_non_overlapping(all_ents, pass2)
         elif iters == 3:
@@ -1775,7 +1863,7 @@ def _extract_wood_relief_vectors(
         "coverage_pct": round(cov * 100.0, 1),
         "min_tile_pct": round(min_tile * 100.0, 1),
         "iterations": iters,
-        "converged": bool(cov >= 0.945 and min_tile >= 0.84),
+        "converged": bool(cov >= 0.960 and min_tile >= 0.86),
     }
 
     group_order = {"Architectural Frame": 0, "Raised Relief Motifs": 1, "Carved Grooves & Panels": 2}
@@ -2129,10 +2217,11 @@ def handle_reconstruct_3d(req: dict[str, Any]) -> dict[str, Any]:
     roi = None if (is_logo or not remove_bg) else detect_furniture_roi(bgr)
     is_planar = bool((not remove_bg) or (roi is not None))
 
+    wm_mask_3d = None
     if roi is not None:
         x0, y0, x1, y1 = roi["x0"], roi["y0"], roi["x1"], roi["y1"]
         crop_bgra = bgra[y0 : y1 + 1, x0 : x1 + 1].copy()
-        cleaned_bgr, _ = _inpaint_watermarks(
+        cleaned_bgr, wm_mask_3d = _inpaint_watermarks(
             crop_bgra[:, :, :3],
             roi["dc"][y0 : y1 + 1, x0 : x1 + 1],
             roi["L"][y0 : y1 + 1, x0 : x1 + 1],
@@ -2142,6 +2231,12 @@ def handle_reconstruct_3d(req: dict[str, Any]) -> dict[str, Any]:
     else:
         x0, y0, x1, y1 = 0, 0, iw - 1, ih - 1
         crop_bgra = bgra.copy()
+        if not is_logo:
+            L_f3 = cv2.cvtColor(crop_bgra[:, :, :3], cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
+            l_m3 = float(np.median(L_f3))
+            dc_3 = np.abs(L_f3 - cv2.GaussianBlur(L_f3, (0, 0), sigmaX=max(12.0, min(iw, ih) * 0.025)))
+            cleaned_bgr, wm_mask_3d = _inpaint_watermarks(crop_bgra[:, :, :3], dc_3, L_f3, l_m3)
+            crop_bgra[:, :, :3] = cleaned_bgr
 
     # Low-res NLM denoise + Lanczos + crisp unsharp restoration for sharp 4K PBR texture
     ch, cw = crop_bgra.shape[:2]
@@ -2153,6 +2248,8 @@ def handle_reconstruct_3d(req: dict[str, Any]) -> dict[str, Any]:
         rgb_up = cv2.addWeighted(rgb_up, 1.16, cv2.GaussianBlur(rgb_up, (0, 0), 1.0), -0.16, 0)
         a_up = cv2.resize(crop_bgra[:, :, 3], (nw, nh), interpolation=cv2.INTER_LINEAR)
         crop_bgra = np.dstack([rgb_up, a_up])
+        if wm_mask_3d is not None:
+            wm_mask_3d = cv2.resize(wm_mask_3d, (nw, nh), interpolation=cv2.INTER_NEAREST)
         ch, cw = crop_bgra.shape[:2]
 
     # Run cached Depth-Anything-V2-Small-hf on M1 GPU only for non-planar 3D objects/scenes
@@ -2174,7 +2271,7 @@ def handle_reconstruct_3d(req: dict[str, Any]) -> dict[str, Any]:
     # Foreground Mask Extraction tailored strictly per class
     if is_planar:
         fg_mask = np.full((ch, cw), 255, dtype=np.uint8)
-        depth_norm = _solve_planar_relief_heightmap(crop_bgra[:, :, :3])
+        depth_norm = _solve_planar_relief_heightmap(crop_bgra[:, :, :3], wm_mask=wm_mask_3d)
     elif is_logo:
         alpha = crop_bgra[:, :, 3]
         if float((alpha < 220).mean()) > 0.05:

@@ -332,12 +332,13 @@ fn arm_max_perp(raw: &[Pt2], start: usize, steps: usize, n: usize) -> f32 {
     max_p
 }
 
-/// Detect structural sharp corners via straight-arm verification + acute cusp detection & Taubin fairing.
+/// Detect genuine structural straight-arm corners while keeping organic floral curves smooth C1 Beziers.
 fn detect_corners_and_fair(raw: &[Pt2], corner_cos_thresh: f32) -> (Vec<Pt2>, Vec<bool>) {
     let n = raw.len();
-    let k = (n / 8).clamp(3, 9);
+    let k = (n / 8).clamp(4, 10);
     let mut pinned = vec![false; n];
-    if n >= 8 {
+    // Never pin staircase corners on small organic contours (< 44 vertices); keep them smooth C1 curves
+    if n >= 44 {
         for i in 0..n {
             let p_prev = raw[(i + n - k) % n];
             let p_cur = raw[i];
@@ -345,14 +346,7 @@ fn detect_corners_and_fair(raw: &[Pt2], corner_cos_thresh: f32) -> (Vec<Pt2>, Ve
             let d1 = p_cur.sub(p_prev).norm();
             let d2 = p_next.sub(p_cur).norm();
             let cs = d1.dot(d2);
-            // Acute cusp (>= ~82 deg turn) OR orthogonal straight-arm CAD corner (>= turn_deg with straight arms)
-            if cs < 0.14 {
-                let s1 = p_cur.sub(raw[(i + n - 2) % n]).norm();
-                let s2 = raw[(i + 2) % n].sub(p_cur).norm();
-                if s1.dot(s2) < 0.72 {
-                    pinned[i] = true;
-                }
-            } else if cs < corner_cos_thresh && k >= 4 {
+            if cs < corner_cos_thresh && k >= 5 {
                 let perp_in = arm_max_perp(raw, (i + n - k) % n, k, n);
                 let perp_out = arm_max_perp(raw, i, k, n);
                 if perp_in <= 0.85 && perp_out <= 0.85 {
@@ -406,10 +400,10 @@ fn detect_corners_and_fair(raw: &[Pt2], corner_cos_thresh: f32) -> (Vec<Pt2>, Ve
         pinned = best_pinned;
     }
 
-    // Two-pass corner-pinned Taubin smoothing removes subpixel staircasing without shrinking curves
+    // Three-pass corner-pinned Taubin smoothing melts pixel jitter while keeping straight corners locked
     let mut pts = raw.to_vec();
     let mut tmp = pts.clone();
-    for _pass in 0..2 {
+    for _pass in 0..3 {
         for (lambda, mu) in [(0.42f32, -0.44f32)] {
             for i in 0..n {
                 if pinned[i] {
@@ -591,8 +585,8 @@ fn fit_span_schneider(
         return;
     }
     let chord_len = pts[n - 1].sub(pts[0]).len();
-    // Only collapse genuine architectural runs >= 7.5px into straight CAD segments so smooth petal curves stay C1 Bezier
-    if (n == 2 && chord_len >= 7.5) || (chord_len >= 7.5 && check_straight_run(pts, straight_tol)) {
+    // Collapse genuine straight CAD edges >= 9px & >= 6 samples so small organic curves always remain smooth C1 Beziers
+    if n >= 6 && chord_len >= 9.0 && check_straight_run(pts, straight_tol) {
         let p0 = pts[0];
         let p3 = pts[n - 1];
         out.push(CubicSeg {
