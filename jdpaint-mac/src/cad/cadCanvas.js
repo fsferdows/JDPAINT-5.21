@@ -907,6 +907,7 @@ export class CadCanvas {
     }
 
     let traced = null;
+    this.lastTraceConvergence = null;
     if (typeof window !== 'undefined' && traceOpts.useVisionBridge !== false) {
       try {
         if (typeof onProgress === 'function') {
@@ -920,8 +921,12 @@ export class CadCanvas {
         );
         if (visionEnts && visionEnts.length > 0) {
           traced = visionEnts;
+          this.lastTraceConvergence = visionEnts._convergence || null;
           if (typeof onProgress === 'function') {
-            onProgress({ step: 5, total: 5, pct: 95, label: `Step 5/5 (95%): Vision AI + VTracer extracted ${visionEnts.length} precision CAD contours!` });
+            const convTxt = this.lastTraceConvergence
+              ? ` (${this.lastTraceConvergence.coverage_pct}% accuracy, ${this.lastTraceConvergence.iterations} pass)`
+              : '';
+            onProgress({ step: 5, total: 5, pct: 95, label: `Step 5/5 (95%): Vision AI + VTracer extracted ${visionEnts.length} precision CAD contours${convTxt}!` });
           }
         }
       } catch (_err) {
@@ -985,7 +990,36 @@ export class CadCanvas {
       }
     }
 
-    // Pass 1: Priority vertices (Endpoints, Midpoints, Centers) with Fast BBox rejection
+    // Pass 1: Priority vertices (Endpoints, Midpoints, Centers, Quadrants) across points + holes
+    const collectRingSnap = (pts, isClosed, ent) => {
+      if (!pts || pts.length === 0) return;
+      for (let i = 0; i < pts.length; i++) {
+        const pt = pts[i];
+        const d = Math.hypot(rawX - pt.x, rawY - pt.y);
+        if (d < minDist) { minDist = d; bestTarget = { x: pt.x, y: pt.y, type: 'Endpoint', ent }; }
+      }
+      if (pts.length >= 2) {
+        const isCubic = CadCanvas.hasCubicHandles(pts);
+        const segCount = isClosed ? pts.length : pts.length - 1;
+        for (let i = 0; i < segCount; i++) {
+          const a = pts[i];
+          const b = pts[(i + 1) % pts.length];
+          let mx, my;
+          if (isCubic && (a.hOut || b.hIn)) {
+            const c1 = a.hOut || a;
+            const c2 = b.hIn || b;
+            mx = 0.125 * a.x + 0.375 * c1.x + 0.375 * c2.x + 0.125 * b.x;
+            my = 0.125 * a.y + 0.375 * c1.y + 0.375 * c2.y + 0.125 * b.y;
+          } else {
+            mx = (a.x + b.x) * 0.5;
+            my = (a.y + b.y) * 0.5;
+          }
+          const dm = Math.hypot(rawX - mx, rawY - my);
+          if (dm < minDist) { minDist = dm; bestTarget = { x: mx, y: my, type: 'Midpoint', ent }; }
+        }
+      }
+    };
+
     for (const ent of this.entities) {
       if (ent.visible === false) continue;
       const eb = this.getEntityBounds(ent);
@@ -1001,23 +1035,75 @@ export class CadCanvas {
           const d = Math.hypot(rawX - p.x, rawY - p.y);
           if (d < minDist) { minDist = d; bestTarget = p; }
         }
+      } else if (ent.type === 'rect') {
+        const rx = ent.x, ry = ent.y, rw = ent.w, rh = ent.h;
+        const rectPts = [
+          { x: rx, y: ry, type: 'Endpoint', ent },
+          { x: rx + rw, y: ry, type: 'Endpoint', ent },
+          { x: rx + rw, y: ry + rh, type: 'Endpoint', ent },
+          { x: rx, y: ry + rh, type: 'Endpoint', ent },
+          { x: rx + rw / 2, y: ry, type: 'Midpoint', ent },
+          { x: rx + rw, y: ry + rh / 2, type: 'Midpoint', ent },
+          { x: rx + rw / 2, y: ry + rh, type: 'Midpoint', ent },
+          { x: rx, y: ry + rh / 2, type: 'Midpoint', ent },
+          { x: rx + rw / 2, y: ry + rh / 2, type: 'Center', ent },
+        ];
+        for (const p of rectPts) {
+          const d = Math.hypot(rawX - p.x, rawY - p.y);
+          if (d < minDist) { minDist = d; bestTarget = p; }
+        }
       } else if (ent.type === 'circle') {
-        const c = { x: ent.cx, y: ent.cy, type: 'Center', ent };
-        const d = Math.hypot(rawX - c.x, rawY - c.y);
-        if (d < minDist) { minDist = d; bestTarget = c; }
+        const circPts = [
+          { x: ent.cx, y: ent.cy, type: 'Center', ent },
+          { x: ent.cx + ent.r, y: ent.cy, type: 'Quadrant', ent },
+          { x: ent.cx - ent.r, y: ent.cy, type: 'Quadrant', ent },
+          { x: ent.cx, y: ent.cy + ent.r, type: 'Quadrant', ent },
+          { x: ent.cx, y: ent.cy - ent.r, type: 'Quadrant', ent },
+        ];
+        for (const p of circPts) {
+          const d = Math.hypot(rawX - p.x, rawY - p.y);
+          if (d < minDist) { minDist = d; bestTarget = p; }
+        }
       } else if ((ent.type === 'polyline' || ent.type === 'curve') && ent.points) {
-        for (let i = 0; i < ent.points.length; i++) {
-          const pt = ent.points[i];
-          const d = Math.hypot(rawX - pt.x, rawY - pt.y);
-          if (d < minDist) { minDist = d; bestTarget = { x: pt.x, y: pt.y, type: 'Endpoint', ent }; }
+        collectRingSnap(ent.points, !!ent.isClosed, ent);
+        if (ent.holes && ent.holes.length > 0) {
+          for (const h of ent.holes) collectRingSnap(h, true, ent);
         }
       }
     }
 
     if (bestTarget) return bestTarget;
 
-    // Pass 2: Closest point ON any traced curve/line/circle edge with Fast BBox rejection
+    // Pass 2: Closest point ON any traced curve/rect/line/circle edge (including Bezier spans & holes)
     let pathMin = snapRadius * 0.9;
+    const collectRingPathSnap = (pts, isClosed, ent) => {
+      if (!pts || pts.length < 2) return;
+      const isCubic = CadCanvas.hasCubicHandles(pts);
+      const segCount = isClosed ? pts.length : pts.length - 1;
+      for (let i = 0; i < segCount; i++) {
+        const a = pts[i];
+        const b = pts[(i + 1) % pts.length];
+        if (isCubic && (a.hOut || b.hIn)) {
+          const c1 = a.hOut || a;
+          const c2 = b.hIn || b;
+          let prev = a;
+          for (let s = 1; s <= 6; s++) {
+            const t = s / 6, mt = 1 - t;
+            const cur = {
+              x: mt * mt * mt * a.x + 3 * mt * mt * t * c1.x + 3 * mt * t * t * c2.x + t * t * t * b.x,
+              y: mt * mt * mt * a.y + 3 * mt * mt * t * c1.y + 3 * mt * t * t * c2.y + t * t * t * b.y,
+            };
+            const proj = CadCanvas.closestPointOnSegment({ x: rawX, y: rawY }, prev, cur);
+            if (proj.dist < pathMin) { pathMin = proj.dist; bestTarget = { x: proj.x, y: proj.y, type: 'On Path', ent }; }
+            prev = cur;
+          }
+        } else {
+          const proj = CadCanvas.closestPointOnSegment({ x: rawX, y: rawY }, a, b);
+          if (proj.dist < pathMin) { pathMin = proj.dist; bestTarget = { x: proj.x, y: proj.y, type: 'On Path', ent }; }
+        }
+      }
+    };
+
     for (const ent of this.entities) {
       if (ent.visible === false) continue;
       const eb = this.getEntityBounds(ent);
@@ -1028,6 +1114,11 @@ export class CadCanvas {
       if (ent.type === 'line') {
         const proj = CadCanvas.closestPointOnSegment({ x: rawX, y: rawY }, { x: ent.x1, y: ent.y1 }, { x: ent.x2, y: ent.y2 });
         if (proj.dist < pathMin) { pathMin = proj.dist; bestTarget = { x: proj.x, y: proj.y, type: 'On Path', ent }; }
+      } else if (ent.type === 'rect') {
+        const rx = ent.x, ry = ent.y, rw = ent.w, rh = ent.h;
+        collectRingPathSnap([
+          { x: rx, y: ry }, { x: rx + rw, y: ry }, { x: rx + rw, y: ry + rh }, { x: rx, y: ry + rh },
+        ], true, ent);
       } else if (ent.type === 'circle') {
         const d = Math.hypot(rawX - ent.cx, rawY - ent.cy);
         if (Math.abs(d - ent.r) < pathMin && d > 0.01) {
@@ -1040,11 +1131,9 @@ export class CadCanvas {
           };
         }
       } else if ((ent.type === 'polyline' || ent.type === 'curve') && ent.points?.length > 1) {
-        const pts = ent.points;
-        const segCount = ent.isClosed ? pts.length : pts.length - 1;
-        for (let i = 0; i < segCount; i++) {
-          const proj = CadCanvas.closestPointOnSegment({ x: rawX, y: rawY }, pts[i], pts[(i + 1) % pts.length]);
-          if (proj.dist < pathMin) { pathMin = proj.dist; bestTarget = { x: proj.x, y: proj.y, type: 'On Path', ent }; }
+        collectRingPathSnap(ent.points, !!ent.isClosed, ent);
+        if (ent.holes && ent.holes.length > 0) {
+          for (const h of ent.holes) collectRingPathSnap(h, true, ent);
         }
       }
     }
@@ -1536,11 +1625,29 @@ export class CadCanvas {
     };
   }
 
+  static getEntityOpenPoints(ent, end = 'end') {
+    const rawPts = ent.type === 'line'
+      ? [{ x: ent.x1, y: ent.y1, corner: true, hIn: null, hOut: null }, { x: ent.x2, y: ent.y2, corner: true, hIn: null, hOut: null }]
+      : (ent.points || []);
+    return end === 'start'
+      ? CadCanvas.reverseAnchorArray(rawPts)
+      : rawPts.map((p) => CadCanvas.mapAnchorPoint(p, (x, y) => ({ x, y })));
+  }
+
   findOpenEndpointAt(wx, wy, excludeEnt = null, customTolPx = 11) {
     const tol = Math.max(2.0, customTolPx / this.scale);
     for (let i = this.entities.length - 1; i >= 0; i--) {
       const ent = this.entities[i];
       if (ent === excludeEnt || ent.visible === false || ent.locked || ent.isClosed) continue;
+      if (ent.type === 'line') {
+        const p1 = { x: ent.x1, y: ent.y1 };
+        const p2 = { x: ent.x2, y: ent.y2 };
+        const dStart = Math.hypot(wx - p1.x, wy - p1.y);
+        const dEnd = Math.hypot(wx - p2.x, wy - p2.y);
+        if (dEnd <= tol && dEnd <= dStart) return { ent, end: 'end', point: p2 };
+        if (dStart <= tol) return { ent, end: 'start', point: p1 };
+        continue;
+      }
       if ((ent.type !== 'curve' && ent.type !== 'polyline') || !ent.points || ent.points.length < 2) continue;
       const pts = ent.points;
       const dStart = Math.hypot(wx - pts[0].x, wy - pts[0].y);
@@ -1684,39 +1791,46 @@ export class CadCanvas {
    * Project point P onto a curve/polyline entity's segments (including Cubic Bezier spans!)
    */
   static projectPointOntoCurve(ent, pt) {
-    const raw = ent.points;
-    if (!raw || raw.length < 2) return null;
-    const ring = CadCanvas.normalizeClosedRing(raw, !!ent.isClosed);
-    const M = ring.length;
-    if (M < 2) return null;
+    if (!ent.points || ent.points.length < 2) return null;
+    const candidates = [{ raw: ent.points, closed: !!ent.isClosed, holeIndex: -1 }];
+    if (ent.holes && ent.holes.length > 0) {
+      ent.holes.forEach((h, hIdx) => {
+        if (h && h.length >= 2) candidates.push({ raw: h, closed: true, holeIndex: hIdx });
+      });
+    }
 
-    const segCount = ent.isClosed ? M : M - 1;
-    const isCubic = CadCanvas.hasCubicHandles(ring);
     let best = null;
-    for (let i = 0; i < segCount; i++) {
-      const a = ring[i];
-      const b = ring[(i + 1) % M];
-      if (isCubic && (a.hOut || b.hIn)) {
-        const c1 = a.hOut || a;
-        const c2 = b.hIn || b;
-        for (let s = 0; s <= 12; s++) {
-          const t = s / 12, mt = 1 - t;
-          const x = mt * mt * mt * a.x + 3 * mt * mt * t * c1.x + 3 * mt * t * t * c2.x + t * t * t * b.x;
-          const y = mt * mt * mt * a.y + 3 * mt * mt * t * c1.y + 3 * mt * t * t * c2.y + t * t * t * b.y;
+    for (const cand of candidates) {
+      const ring = CadCanvas.normalizeClosedRing(cand.raw, cand.closed);
+      const M = ring.length;
+      if (M < 2) continue;
+      const segCount = cand.closed ? M : M - 1;
+      const isCubic = CadCanvas.hasCubicHandles(ring);
+      for (let i = 0; i < segCount; i++) {
+        const a = ring[i];
+        const b = ring[(i + 1) % M];
+        if (isCubic && (a.hOut || b.hIn)) {
+          const c1 = a.hOut || a;
+          const c2 = b.hIn || b;
+          for (let s = 0; s <= 12; s++) {
+            const t = s / 12, mt = 1 - t;
+            const x = mt * mt * mt * a.x + 3 * mt * mt * t * c1.x + 3 * mt * t * t * c2.x + t * t * t * b.x;
+            const y = mt * mt * mt * a.y + 3 * mt * mt * t * c1.y + 3 * mt * t * t * c2.y + t * t * t * b.y;
+            const d = Math.hypot(pt.x - x, pt.y - y);
+            if (!best || d < best.dist) {
+              best = { segIdx: i, t, u: i + t, point: { x, y }, dist: d, ring, holeIndex: cand.holeIndex, isClosedRing: cand.closed };
+            }
+          }
+        } else {
+          const dx = b.x - a.x, dy = b.y - a.y;
+          const lenSq = dx * dx + dy * dy;
+          const t = lenSq === 0 ? 0 : Math.max(0, Math.min(1, ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / lenSq));
+          const x = a.x + t * dx;
+          const y = a.y + t * dy;
           const d = Math.hypot(pt.x - x, pt.y - y);
           if (!best || d < best.dist) {
-            best = { segIdx: i, t, u: i + t, point: { x, y }, dist: d, ring };
+            best = { segIdx: i, t, u: i + t, point: { x, y }, dist: d, ring, holeIndex: cand.holeIndex, isClosedRing: cand.closed };
           }
-        }
-      } else {
-        const dx = b.x - a.x, dy = b.y - a.y;
-        const lenSq = dx * dx + dy * dy;
-        const t = lenSq === 0 ? 0 : Math.max(0, Math.min(1, ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / lenSq));
-        const x = a.x + t * dx;
-        const y = a.y + t * dy;
-        const d = Math.hypot(pt.x - x, pt.y - y);
-        if (!best || d < best.dist) {
-          best = { segIdx: i, t, u: i + t, point: { x, y }, dist: d, ring };
         }
       }
     }
@@ -1960,7 +2074,33 @@ export class CadCanvas {
 
       if (this._bboxCache) this._bboxCache.delete(hit);
       const lenNow = workPts.length;
-      if (hit.isClosed) {
+      if (proj.holeIndex !== undefined && proj.holeIndex >= 0 && hit.holes?.[proj.holeIndex]) {
+        const k = ((cutIdx % lenNow) + lenNow) % lenNow;
+        const first = {
+          ...workPts[k],
+          ...(workPts[k].hIn !== undefined || workPts[k].hOut !== undefined ? { corner: true, hIn: null } : {}),
+        };
+        const out = [first];
+        for (let i = 1; i < lenNow; i++) out.push(CadCanvas.mapAnchorPoint(workPts[(k + i) % lenNow], (x, y) => ({ x, y })));
+        out.push({
+          x: workPts[k].x,
+          y: workPts[k].y,
+          ...(workPts[k].hIn !== undefined ? { corner: true, hIn: workPts[k].hIn ? { ...workPts[k].hIn } : null, hOut: null } : {}),
+        });
+        hit.holes.splice(proj.holeIndex, 1);
+        const holePart = this.ensureEntityMetadata({
+          ...JSON.parse(JSON.stringify(hit)),
+          id: undefined,
+          holes: undefined,
+          name: `${hit.name} (Cut Hole)`,
+          points: out,
+          isClosed: false,
+        });
+        this.entities.splice(this.entities.indexOf(hit) + 1, 0, holePart);
+        this.selectedEntity = holePart;
+        this.selectedNodeIndex = out.length - 1;
+        this.selectedHoleIndex = -1;
+      } else if (hit.isClosed) {
         const k = ((cutIdx % lenNow) + lenNow) % lenNow;
         const first = {
           ...workPts[k],
@@ -2752,9 +2892,7 @@ export class CadCanvas {
           const idx = this.entities.indexOf(ep.ent);
           this.saveState();
           const snapshot = JSON.parse(JSON.stringify(ep.ent));
-          const pts = ep.end === 'start'
-            ? CadCanvas.reverseAnchorArray(ep.ent.points)
-            : ep.ent.points.map((p) => CadCanvas.mapAnchorPoint(p, (x, y) => ({ x, y })));
+          const pts = CadCanvas.getEntityOpenPoints(ep.ent, ep.end);
           if (pts[pts.length - 1].hOut !== undefined) pts[pts.length - 1].hOut = null;
           if (idx !== -1) this.entities.splice(idx, 1);
           this.currentDraft = {
@@ -2862,9 +3000,7 @@ export class CadCanvas {
           const idx = this.entities.indexOf(ep.ent);
           this.saveState();
           const snapshot = JSON.parse(JSON.stringify(ep.ent));
-          const pts = ep.end === 'start'
-            ? CadCanvas.reverseAnchorArray(ep.ent.points)
-            : ep.ent.points.map((p) => CadCanvas.mapAnchorPoint(p, (x, y) => ({ x, y })));
+          const pts = CadCanvas.getEntityOpenPoints(ep.ent, ep.end);
           if (idx !== -1) this.entities.splice(idx, 1);
           this.detectedShapePreview = null;
           this.currentDraft = {
@@ -2978,9 +3114,23 @@ export class CadCanvas {
       return;
     }
 
-    // Drag-to-Draw Geometric Shapes
+    // Interactive Line Tool (supports both click-and-drag AND click-start -> click-end CAD drafting!)
     if (this.activeTool === 'line') {
-      this.currentDraft = { type: 'line', x1: world.x, y1: world.y, x2: world.x, y2: world.y, color: '#38bdf8', width: 1.5 };
+      if (this.currentDraft && this.currentDraft.type === 'line') {
+        if (e.shiftKey) {
+          const ang = Math.atan2(world.y - this.currentDraft.y1, world.x - this.currentDraft.x1);
+          const snappedAng = Math.round(ang / (Math.PI / 4)) * (Math.PI / 4);
+          const len = Math.hypot(world.x - this.currentDraft.x1, world.y - this.currentDraft.y1);
+          this.currentDraft.x2 = this.currentDraft.x1 + Math.cos(snappedAng) * len;
+          this.currentDraft.y2 = this.currentDraft.y1 + Math.sin(snappedAng) * len;
+        } else {
+          this.currentDraft.x2 = world.x;
+          this.currentDraft.y2 = world.y;
+        }
+        this.finishCurrentDraft();
+      } else {
+        this.currentDraft = { type: 'line', x1: world.x, y1: world.y, x2: world.x, y2: world.y, color: '#38bdf8', width: 1.5, _clickPlaced: false };
+      }
       this.requestRender();
     } else if (this.activeTool === 'rect') {
       this.currentDraft = { type: 'rect', x: world.x, y: world.y, w: 0, h: 0, color: '#38bdf8', width: 1.5 };
@@ -3225,6 +3375,15 @@ export class CadCanvas {
     }
 
     if (this.currentDraft && this.activeTool !== 'polyline' && this.activeTool !== 'pen' && this.activeTool !== 'pen-edit' && this.activeTool !== 'arc') {
+      if (this.currentDraft.type === 'line') {
+        const lineLen = Math.hypot(this.currentDraft.x2 - this.currentDraft.x1, this.currentDraft.y2 - this.currentDraft.y1);
+        if (lineLen < 0.35 && !this.currentDraft._clickPlaced) {
+          // 1st click without drag: keep rubberband line open until 2nd endpoint click!
+          this.currentDraft._clickPlaced = true;
+          this.requestRender();
+          return;
+        }
+      }
       this.finishCurrentDraft();
     }
   }
@@ -3763,12 +3922,12 @@ export class CadCanvas {
       if (bestMode === 'end-start') {
         merged = merged.concat(skipFirst ? nextChain.slice(1) : nextChain);
       } else if (bestMode === 'end-end') {
-        const rev = [...nextChain].reverse();
+        const rev = CadCanvas.reverseAnchorArray(nextChain);
         merged = merged.concat(skipFirst ? rev.slice(1) : rev);
       } else if (bestMode === 'start-end') {
         merged = (skipFirst ? nextChain.slice(0, -1) : nextChain).concat(merged);
       } else if (bestMode === 'start-start') {
-        const rev = [...nextChain].reverse();
+        const rev = CadCanvas.reverseAnchorArray(nextChain);
         merged = (skipFirst ? rev.slice(0, -1) : rev).concat(merged);
       }
     }

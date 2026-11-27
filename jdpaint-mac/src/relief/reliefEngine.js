@@ -314,14 +314,14 @@ export class ReliefEngine {
           const zNorm = Math.max(0.05, Math.min(1.0, baseLevel + rawDelta));
           woodBuf[i] = Math.pow(zNorm, gamma);
         }
-        // Sculpt high-frequency specular grain ripples into fluid carving forms while preserving ROI border walls
-        const guidedWood = ImageVectorizer.guidedFilter(woodBuf, N, N, Math.max(3, Math.round(N * 0.008)), 0.045);
+        // Preserve crisp carved groove boundaries in offline wood mode while damping coarse plank grain
+        const guidedWood = ImageVectorizer.guidedFilter(woodBuf, N, N, Math.max(2, Math.round(N * 0.005)), 0.015);
         const blurredWood = ImageVectorizer.gaussianBlur3x3(guidedWood, N, N);
         for (let i = 0; i < N * N; i++) {
           const inRoiBox = roiMask[i] || wmMask[i];
-          this.data[i] = inRoiBox ? Math.max(0, Math.min(1.0, guidedWood[i] * 0.62 + blurredWood[i] * 0.38)) : 0;
+          this.data[i] = inRoiBox ? Math.max(0, Math.min(1.0, guidedWood[i] * 0.80 + blurredWood[i] * 0.20)) : 0;
         }
-        ReliefEngine._taubinFairBuffer(this.data, N, 7, 3.2);
+        ReliefEngine._taubinFairBuffer(this.data, N, 3, 5.5);
         this.notify();
         return;
       }

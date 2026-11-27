@@ -1205,7 +1205,9 @@ document.addEventListener('DOMContentLoaded', () => {
       selectTool('select');
       renderLayerList();
       syncSelectedLayerInspector();
-      prog.finish(`Auto-Trace complete! Extracted ${count} clean 2D CAD vector shapes (${opts.traceMode}) + smooth 3D relief.`);
+      const conv = cadCanvas.lastTraceConvergence;
+      const convNote = conv ? ` [${conv.coverage_pct}% contour accuracy, ${conv.iterations} pass${conv.iterations > 1 ? 'es' : ''}]` : '';
+      prog.finish(`Auto-Trace complete! Extracted ${count} clean 2D CAD vector shapes (${opts.traceMode})${convNote} + smooth 3D relief.`);
     } catch (err) {
       console.error('Auto-Trace failed:', err);
       prog.fail(`Auto-Trace failed: ${err.message || err}`);

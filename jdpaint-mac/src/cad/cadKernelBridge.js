@@ -140,7 +140,17 @@ export class CadKernelBridge {
     });
     if (!resp.ok) return null;
     const data = await resp.json();
-    return data?.ok && Array.isArray(data.entities) && data.entities.length > 0 ? data.entities : null;
+    if (data?.ok && Array.isArray(data.entities) && data.entities.length > 0) {
+      if (data.convergence) {
+        Object.defineProperty(data.entities, '_convergence', {
+          value: data.convergence,
+          enumerable: false,
+          configurable: true,
+        });
+      }
+      return data.entities;
+    }
+    return null;
   }
 
   static async reconstruct3DViaVision(imgElement, options = {}) {
