@@ -1682,18 +1682,13 @@ export class ImageVectorizer {
       rejectFullFrame: true,
     }));
 
-    // Build structural groove mask: bridge 1-2px collinear gaps along rails/louvers & filter ONLY chaotic 3px inter-petal valleys
+    // Filter isolated tight 3px inter-petal pocket blotches while preserving structural groove geometry
     const bridgedG = new Uint8Array(grooveMask);
     const trapR = 3;
     for (let y = yMin; y <= yMax; y++) {
       const row = y * w;
       for (let x = xMin; x <= xMax; x++) {
         const i = row + x;
-        if (!bridgedG[i] && roiMask[i] && smoothRaised[i] < rTh * 0.72 && smoothGroove[i] >= gTh * 0.36) {
-          const hGap = (grooveMask[i - 1] && grooveMask[i + 1]) || (x > 2 && x < w - 3 && grooveMask[i - 2] && grooveMask[i + 2]);
-          const vGap = (grooveMask[i - w] && grooveMask[i + w]) || (y > 2 && y < h - 3 && grooveMask[i - 2 * w] && grooveMask[i + 2 * w]);
-          if (hGap || vGap) bridgedG[i] = 1;
-        }
         if (bridgedG[i]) {
           // Keep clean linear horizontal louvers & vertical panel grooves intact; suppress only tight 3px 4-way pocket blotches
           const isLinearRun = (x > 3 && x < w - 4 && grooveMask[i - 2] && grooveMask[i + 2])
@@ -1806,7 +1801,7 @@ export class ImageVectorizer {
         cornerRadius: 0,
         isClosed: true,
         color: '#22d3ee',
-        fillColor: '#c29258',
+        fillColor: null,
         strokeColor: '#22d3ee',
         width: 1.4,
         name: 'Panel Perimeter Frame',

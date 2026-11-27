@@ -4114,7 +4114,7 @@ export class CadCanvas {
           }
         }
         if (edgeHit) return ent;
-        if (ent.isClosed && (this.showFills || this.showColorFills)) {
+        if (ent.isClosed && ent.layerGroup !== 'Architectural Frame' && (this.showFills || this.showColorFills)) {
           let parity = 0;
           for (const ring of rings) {
             if (ring.length >= 3 && CadCanvas.pointInRing(x, y, ring)) parity ^= 1;
@@ -4901,11 +4901,26 @@ export class CadCanvas {
     ctx.lineJoin = 'round';
 
     const fillClosed = (targetEnt) => {
+      if (!isSelected && targetEnt.source === 'trace') {
+        if (targetEnt.layerGroup === 'Architectural Frame' || targetEnt.layerGroup === 'Carved Grooves & Panels') return;
+        const eb = this.getEntityBounds(targetEnt);
+        if (
+          eb
+          && (eb.maxX - eb.minX) >= this.workpieceWidth * 0.86
+          && (eb.maxY - eb.minY) >= this.workpieceHeight * 0.86
+          && targetEnt.layerGroup !== 'BW Vector'
+          && targetEnt.layerGroup !== 'Engraved Wood Design'
+        ) {
+          return;
+        }
+      }
       const useColor = this.showColorFills && targetEnt.fillColor && targetEnt.isClosed !== false;
       if (!useColor && !this.showFills) return;
       ctx.save();
       ctx.fillStyle = useColor ? targetEnt.fillColor : strokeCol;
-      ctx.globalAlpha = useColor ? (isSelected ? 0.30 : (targetEnt.source === 'trace' ? 0.14 : 0.22)) : (isSelected ? 0.16 : 0.065);
+      ctx.globalAlpha = useColor
+        ? (isSelected ? 0.30 : (targetEnt.source === 'trace' ? (targetEnt.layerGroup === 'Raised Petals & Motifs' ? 0.08 : 0.16) : 0.22))
+        : (isSelected ? 0.16 : (targetEnt.source === 'trace' ? 0.045 : 0.065));
       ctx.fill('evenodd');
       ctx.restore();
     };

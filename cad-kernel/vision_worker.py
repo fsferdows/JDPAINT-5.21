@@ -218,24 +218,27 @@ def detect_furniture_roi(bgr: np.ndarray) -> dict[str, Any] | None:
 
 
 def _inpaint_watermarks(sub_bgr: np.ndarray, dc_sub: np.ndarray, L_sub: np.ndarray, l_med: float) -> tuple[np.ndarray, np.ndarray]:
-    """Suppress neutral bright overlays, anti-aliased fringe text & chromatic stamps."""
+    """Suppress neutral bright overlays, anti-aliased fringe ink text & chromatic stamps."""
     b, g, r = cv2.split(sub_bgr)
     rgb_sat = np.maximum(np.maximum(r, g), b).astype(np.int16) - np.minimum(np.minimum(r, g), b).astype(np.int16)
     luma_raw = (0.2126 * r + 0.7152 * g + 0.0722 * b)
 
-    is_bright_wm = (L_sub > l_med + 5.0) & ((dc_sub > 15.0) | ((L_sub > 78.0) & (rgb_sat < 30)))
-    is_neutral_ink = (luma_raw < 38.0) & (np.abs(r.astype(np.int16) - b.astype(np.int16)) < 14) & (dc_sub > 11.0)
-    is_logo_accent = ((r.astype(np.int16) - g.astype(np.int16) > 42) & (dc_sub > 17.0)) | (dc_sub > 23.0)
+    is_bright_wm = (L_sub > l_med + 12.0) & (rgb_sat < 26) & (dc_sub > 16.0)
+    is_neutral_ink = (luma_raw < 35.0) & (rgb_sat < 14) & (dc_sub > 15.0)
+    is_logo_accent = (r.astype(np.int16) - g.astype(np.int16) > 36) & (dc_sub > 18.0)
 
-    dark_cand = is_neutral_ink | is_logo_accent
-    wm = is_bright_wm.copy()
-    if 0 < int(dark_cand.sum()) < int(sub_bgr.shape[0] * sub_bgr.shape[1] * 0.05):
-        wm |= dark_cand
-
-    wm_u8 = (wm.astype(np.uint8)) * 255
+    cand = is_bright_wm | is_neutral_ink | is_logo_accent
+    tot_px = sub_bgr.shape[0] * sub_bgr.shape[1]
+    wm_u8 = np.zeros((sub_bgr.shape[0], sub_bgr.shape[1]), dtype=np.uint8)
+    if 0 < int(cand.sum()) < int(tot_px * 0.045):
+        n_lbl, lbls, stats, _ = cv2.connectedComponentsWithStats(cand.astype(np.uint8) * 255)
+        max_comp = int(tot_px * 0.015)
+        for ci in range(1, n_lbl):
+            if 4 <= int(stats[ci, cv2.CC_STAT_AREA]) <= max_comp:
+                wm_u8[lbls == ci] = 255
     if int(wm_u8.sum()) > 0:
-        wm_u8 = cv2.dilate(wm_u8, np.ones((5, 5), np.uint8), iterations=1)
-        cleaned = cv2.inpaint(sub_bgr, wm_u8, 5, cv2.INPAINT_TELEA)
+        wm_u8 = cv2.dilate(wm_u8, np.ones((3, 3), np.uint8), iterations=1)
+        cleaned = cv2.inpaint(sub_bgr, wm_u8, 4, cv2.INPAINT_TELEA)
         return cleaned, wm_u8
     return sub_bgr, wm_u8
 
@@ -450,9 +453,9 @@ def _parse_svg_paths_to_entities(
 
         rings.sort(key=ring_area, reverse=True)
         outer = rings[0]
-        if ring_area(outer) < 0.05:
+        if ring_area(outer) < 0.04:
             continue
-        holes = [r for r in rings[1:] if ring_area(r) >= 0.03]
+        holes = [r for r in rings[1:] if ring_area(r) >= 0.025]
 
         entities.append({
             "type": "curve",
@@ -476,6 +479,116 @@ def _parse_svg_paths_to_entities(
             },
         })
     return entities
+
+
+def _extract_wood_relief_vectors(
+    sub_bgr: np.ndarray,
+    off_x: float,
+    off_y: float,
+    sx_mm: float,
+    sy_mm: float,
+    detail: float,
+    corners: float,
+) -> list[dict[str, Any]]:
+    """De-grain carved relief wood surfaces and extract smooth closed VTracer Cubic Bezier outlines."""
+    vh, vw = sub_bgr.shape[:2]
+    den = cv2.fastNlMeansDenoisingColored(sub_bgr, None, 6, 6, 7, 21)
+    epf = cv2.edgePreservingFilter(den, flags=cv2.NORMCONV_FILTER, sigma_s=18, sigma_r=0.20)
+    lab = cv2.cvtColor(epf, cv2.COLOR_BGR2LAB)
+    L_u8 = lab[:, :, 0]
+    L_sm = cv2.bilateralFilter(L_u8, d=7, sigmaColor=22, sigmaSpace=16).astype(np.float32)
+
+    r_f = max(5, int(round(min(vw, vh) * 0.0065)) | 1)
+    r_m = max(11, int(round(min(vw, vh) * 0.018)) | 1)
+    bh_f = cv2.morphologyEx(L_sm, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_f, r_f)))
+    bh_m = cv2.morphologyEx(L_sm, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_m, r_m)))
+    bh = bh_f * 0.62 + bh_m * 0.58
+
+    gx = cv2.Scharr(L_sm, cv2.CV_32F, 1, 0) / 16.0
+    gy = cv2.Scharr(L_sm, cv2.CV_32F, 0, 1) / 16.0
+    gmag = np.hypot(gx, gy)
+
+    detail_bias = (0.70 - float(np.clip(detail, 0.15, 1.0))) * 14.0
+    bh_med = float(np.median(bh))
+    bh_mad = float(np.median(np.abs(bh - bh_med)))
+    bh_floor = max(float(np.percentile(bh, 76)), bh_med + 3.6 * max(bh_mad, 1.25), 11.5) + detail_bias * 0.25
+
+    g_med = float(np.median(gmag))
+    g_mad = float(np.median(np.abs(gmag - g_med)))
+    g_floor = max(float(np.percentile(gmag, 74)), g_med + 3.1 * max(g_mad, 1.25), 10.5) + detail_bias * 0.25
+
+    bh_score = np.clip((bh - bh_floor) * 3.1, 0, 255)
+    g_score = np.clip((gmag - g_floor) * 2.9, 0, 255) * 0.92
+    comb = np.maximum(bh_score, g_score).astype(np.uint8)
+
+    _, mask = cv2.threshold(comb, max(16, int(round(26 + detail_bias * 0.5))), 255, cv2.THRESH_BINARY)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+    # Measure local carving density to filter flat bare-stile wood grain speckles while keeping strong flutes & rails
+    k_act = max(21, int(round(min(vw, vh) * 0.030)) | 1)
+    act_map = cv2.GaussianBlur((comb > 46).astype(np.float32), (k_act, k_act), 0)
+
+    num_l, lbls, stats, _ = cv2.connectedComponentsWithStats(mask)
+    clean_mask = np.zeros_like(mask)
+    min_area = max(30, int(vw * vh * 0.000030))
+    max_grain_w = max(16, int(vw * 0.014))
+    for i in range(1, num_l):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        bx_i = int(stats[i, cv2.CC_STAT_LEFT])
+        by_i = int(stats[i, cv2.CC_STAT_TOP])
+        bw_i = int(stats[i, cv2.CC_STAT_WIDTH])
+        bh_i = int(stats[i, cv2.CC_STAT_HEIGHT])
+        comp_m = lbls[by_i : by_i + bh_i, bx_i : bx_i + bw_i] == i
+        sub_c = comb[by_i : by_i + bh_i, bx_i : bx_i + bw_i][comp_m]
+        p75 = float(np.percentile(sub_c, 75))
+        mn = float(sub_c.mean())
+        pk = int(sub_c.max())
+        act_mn = float(act_map[by_i : by_i + bh_i, bx_i : bx_i + bw_i][comp_m].mean())
+        if p75 < 56.0 and area < min_area * 12:
+            continue
+        if act_mn < 0.045 and pk < 102 and area < min_area * 12:
+            continue
+        if bh_i >= bw_i * 4.0 and bw_i <= max_grain_w and mn < 74.0 and p75 < 92.0 and bh_i < vh * 0.22:
+            continue
+        if area < min_area * 4 and pk < 88 and mn < 48:
+            continue
+        clean_mask[lbls == i] = 255
+
+    bw_img = 255 - clean_mask
+    ok_b, pb = cv2.imencode(".png", cv2.cvtColor(bw_img, cv2.COLOR_GRAY2BGR))
+    if not ok_b:
+        return []
+    svg_wood = vtracer.convert_raw_image_to_svg(
+        bytes(pb),
+        img_format="png",
+        colormode="binary",
+        mode="spline",
+        filter_speckle=max(5, int(round(12 - detail * 6))),
+        corner_threshold=int(round(36 + corners * 16)),
+        length_threshold=4.0,
+        splice_threshold=45,
+        path_precision=4,
+    )
+    ents = _parse_svg_paths_to_entities(svg_wood, off_x, off_y, sx_mm, sy_mm, "Carved Grooves & Panels")
+    span_w = vw * sx_mm
+    span_h = vh * sy_mm
+    cleaned_ents: list[dict[str, Any]] = []
+    for ent in ents:
+        pts = ent.get("points") or []
+        if not pts:
+            continue
+        xs = [p["x"] for p in pts]
+        ys = [p["y"] for p in pts]
+        if (max(xs) - min(xs)) >= span_w * 0.94 and (max(ys) - min(ys)) >= span_h * 0.94:
+            continue
+        ent["fillColor"] = None
+        ent["strokeColor"] = "#38bdf8"
+        ent["color"] = "#38bdf8"
+        ent["relief"] = {"enabled": False, "shape": "smooth", "heightMm": 2.0, "radiusMm": 1.2, "mode": "max"}
+        cleaned_ents.append(ent)
+    return cleaned_ents
 
 
 def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
@@ -522,21 +635,18 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
             sub = np.clip(sub.astype(np.float32) * alpha_f + 255.0 * (1.0 - alpha_f), 0, 255).astype(np.uint8)
 
     sh0, sw0 = sub.shape[:2]
-    if max(sw0, sh0) < 1100:
-        sc = min(2.4, 1280.0 / max(sw0, sh0))
+    if roi is not None:
+        if min(sw0, sh0) < 1200:
+            sc = min(3.2, 1200.0 / max(1, min(sw0, sh0)))
+            if max(sw0, sh0) * sc > 2800:
+                sc = 2800.0 / max(1, max(sw0, sh0))
+            if sc > 1.02:
+                sub = cv2.resize(sub, (int(round(sw0 * sc)), int(round(sh0 * sc))), interpolation=cv2.INTER_LANCZOS4)
+    elif max(sw0, sh0) < 1100:
+        sc = min(2.4, 1280.0 / max(1, max(sw0, sh0)))
         sub = cv2.resize(sub, (int(round(sw0 * sc)), int(round(sh0 * sc))), interpolation=cv2.INTER_LANCZOS4)
 
-    den = cv2.fastNlMeansDenoisingColored(sub, None, 5, 5, 7, 21)
-    sm = den.copy()
-    if roi is not None or trace_mode == "wood":
-        for _ in range(3):
-            sm = cv2.bilateralFilter(sm, d=7, sigmaColor=20, sigmaSpace=20)
-        lab = cv2.cvtColor(sm, cv2.COLOR_BGR2LAB)
-        clahe = cv2.createCLAHE(clipLimit=1.55, tileGridSize=(8, 8))
-        lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-        sm = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-    vh, vw = sm.shape[:2]
+    vh, vw = sub.shape[:2]
     off_x = bx + (x0 / iw) * bw
     off_y = by + (y0 / ih) * bh
     span_w = ((x1 - x0 + 1) / iw) * bw
@@ -544,15 +654,16 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
     sx_mm = span_w / max(1, vw)
     sy_mm = span_h / max(1, vh)
 
-    ok, png_b = cv2.imencode(".png", sm)
-    if not ok:
-        raise RuntimeError("Failed encoding denoised PNG for VTracer")
-
     entities: list[dict[str, Any]] = []
     # Check if denoised wood ROI is a high-contrast 2-tone engraved wood plaque (e.g. Khoj24) vs continuous 3D relief
     is_engraved_wood_plaque = False
     if roi is not None and trace_mode in ("auto", "wood"):
-        gray_r = cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY)
+        den_plaque = cv2.fastNlMeansDenoisingColored(sub, None, 5, 5, 7, 21)
+        for _ in range(3):
+            den_plaque = cv2.bilateralFilter(den_plaque, d=7, sigmaColor=20, sigmaSpace=20)
+        lab_p = cv2.cvtColor(den_plaque, cv2.COLOR_BGR2LAB)
+        lab_p[:, :, 0] = cv2.createCLAHE(clipLimit=1.55, tileGridSize=(8, 8)).apply(lab_p[:, :, 0])
+        gray_r = cv2.cvtColor(cv2.cvtColor(lab_p, cv2.COLOR_LAB2BGR), cv2.COLOR_BGR2GRAY)
         otsu_t, _ = cv2.threshold(gray_r, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         lo_r = gray_r[gray_r <= otsu_t]
         hi_r = gray_r[gray_r > otsu_t]
@@ -562,12 +673,19 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
             sep_r = (w1_r * w2_r * (m1_r - m2_r) ** 2) / (float(gray_r.var()) + 1e-6)
             if sep_r >= 0.78 and abs(m2_r - m1_r) >= 62.0:
                 is_engraved_wood_plaque = True
-                dark_design = (hi_r.size > lo_r.size)
-                bg_est = cv2.medianBlur(gray_r, max(15, int(round(min(vw, vh) * 0.08)) | 1)).astype(np.float32)
-                diff_f = np.clip((bg_est - gray_r.astype(np.float32)) if dark_design else (gray_r.astype(np.float32) - bg_est), 0, 255).astype(np.uint8)
+                dark_design = hi_r.size > lo_r.size
+                gray_raw = cv2.cvtColor(den_plaque, cv2.COLOR_BGR2GRAY)
+                dw_s, dh_s = max(32, vw // 4), max(32, vh // 4)
+                sm_g = cv2.resize(gray_raw, (dw_s, dh_s), interpolation=cv2.INTER_AREA)
+                bg_small = cv2.medianBlur(sm_g, max(15, int(round(min(dw_s, dh_s) * 0.24)) | 1))
+                bg_est = cv2.resize(bg_small, (vw, vh), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+                diff_f = np.clip((bg_est - gray_raw.astype(np.float32)) if dark_design else (gray_raw.astype(np.float32) - bg_est), 0, 255).astype(np.uint8)
                 d_th, _ = cv2.threshold(diff_f, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                bw_mask = np.where(diff_f >= max(36, int(d_th)), 255, 0).astype(np.uint8)
-                bw_mask = cv2.morphologyEx(bw_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+                otsu_raw, _ = cv2.threshold(gray_raw, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                bw_diff = diff_f >= max(24, int(d_th * 0.78))
+                bw_core = (gray_raw <= int(otsu_raw * 0.94)) if dark_design else (gray_raw >= int(otsu_raw * 1.06))
+                bw_mask = np.where(bw_diff | bw_core, 255, 0).astype(np.uint8)
+                bw_mask = cv2.morphologyEx(bw_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
                 bw_mask = cv2.morphologyEx(bw_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
                 bw_eng = 255 - bw_mask
                 ok_e, pb_e = cv2.imencode(".png", cv2.cvtColor(bw_eng, cv2.COLOR_GRAY2BGR))
@@ -588,7 +706,8 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
                     )
 
     if not is_engraved_wood_plaque and (is_logo or trace_mode in ("bw-logo", "lineart")):
-        gray = cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY)
+        den_logo = cv2.fastNlMeansDenoisingColored(sub, None, 4, 4, 7, 21)
+        gray = cv2.cvtColor(den_logo, cv2.COLOR_BGR2GRAY)
         if np.median(np.concatenate([gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]])) < 120:
             gray = 255 - gray
         ok2, pb2 = cv2.imencode(".png", cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR))
@@ -606,81 +725,35 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
         entities.extend(
             _parse_svg_paths_to_entities(svg_bin, off_x, off_y, sx_mm, sy_mm, "BW Vector")
         )
-    elif not is_engraved_wood_plaque:
-        layer_diff = 12 if (roi is not None or trace_mode == "wood") else max(5, int(18 - color_count))
-        svg_col = vtracer.convert_raw_image_to_svg(
-            bytes(png_b),
-            img_format="png",
-            colormode="color",
-            hierarchical="stacked",
-            mode="spline",
-            filter_speckle=max(12, int(36 - detail * 18)),
-            color_precision=min(7, max(4, int(round(color_count * 0.7)))),
-            layer_difference=layer_diff,
-            corner_threshold=int(32 + corners * 32),
-            length_threshold=5.0,
-            splice_threshold=45,
-            path_precision=4,
-        )
-        raw_ents = _parse_svg_paths_to_entities(svg_col, off_x, off_y, sx_mm, sy_mm, "Vector Layer")
-        # Drop nearly full-frame background box when ignore_bg is on
-        for ent in raw_ents:
-            if ignore_bg and ent["points"]:
-                xs = [p["x"] for p in ent["points"]]
-                ys = [p["y"] for p in ent["points"]]
-                if (max(xs) - min(xs)) >= span_w * 0.96 and (max(ys) - min(ys)) >= span_h * 0.96 and not ent.get("holes"):
-                    continue
-            entities.append(ent)
-
-    if roi is not None and not is_engraved_wood_plaque:
-        # Complement solid panels with thinned junction-split V-grooves + symmetric slope bevels
-        gray_f = cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        r_bh = max(7, int(round(min(vw, vh) * 0.016)) | 1)
-        kern_bh = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_bh, r_bh))
-        blackhat = cv2.morphologyEx(gray_f, cv2.MORPH_BLACKHAT, kern_bh)
-        g_mag = np.hypot(
-            cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3),
-            cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=3),
-        ) * 0.25
-        bh_norm = np.clip((blackhat - np.percentile(blackhat, 66)) * 2.5, 0, 255)
-        edge_crest = np.clip((g_mag - np.percentile(g_mag, 74)) * 2.1, 0, 255) * 0.72
-        comb_val = np.maximum(bh_norm, edge_crest).astype(np.uint8)
-        _, bin_bh = cv2.threshold(comb_val, 38, 255, cv2.THRESH_BINARY)
-        bin_bh = cv2.morphologyEx(bin_bh, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-        num_l, lbls, stats, _ = cv2.connectedComponentsWithStats(bin_bh)
-        clean_bh = np.zeros_like(bin_bh)
-        min_comp = max(32, int(vw * vh * 0.00010))
-        for i in range(1, num_l):
-            if stats[i, cv2.CC_STAT_AREA] >= min_comp:
-                clean_bh[lbls == i] = 255
-        skel = skeletonize(clean_bh > 0).astype(np.uint8)
-        chains = _skeleton_to_open_polylines(skel, min_pts=max(14, int(min(vw, vh) * 0.022)))
-        for ci, ch in enumerate(chains[:320]):
-            anchors = [
-                {
-                    "x": round(off_x + pt[0] * sx_mm, 4),
-                    "y": round(off_y + pt[1] * sy_mm, 4),
-                    "corner": True,
-                    "hIn": None,
-                    "hOut": None,
-                }
-                for pt in ch
-            ]
-            entities.append({
-                "type": "curve",
-                "points": anchors,
-                "holes": [],
-                "isClosed": False,
-                "color": "#38bdf8",
-                "fillColor": "#38bdf8",
-                "strokeColor": "#38bdf8",
-                "width": 1.3,
-                "name": f"Carved Groove #{ci + 1}",
-                "layerGroup": "Carved Grooves & Panels",
-                "toneLevel": 1,
-                "toneTotal": 2,
-                "relief": {"enabled": False, "shape": "smooth", "heightMm": 2.0, "radiusMm": 1.2, "mode": "max"},
-            })
+    elif roi is not None and not is_engraved_wood_plaque:
+        wood_ents = _extract_wood_relief_vectors(sub, off_x, off_y, sx_mm, sy_mm, detail, corners)
+        entities.extend(wood_ents)
+        if len(entities) < 10:
+            den_c = cv2.fastNlMeansDenoisingColored(sub, None, 5, 5, 7, 21)
+            ok_c, png_c = cv2.imencode(".png", den_c)
+            if ok_c:
+                svg_col = vtracer.convert_raw_image_to_svg(
+                    bytes(png_c),
+                    img_format="png",
+                    colormode="color",
+                    hierarchical="stacked",
+                    mode="spline",
+                    filter_speckle=max(12, int(36 - detail * 18)),
+                    color_precision=min(7, max(4, int(round(color_count * 0.7)))),
+                    layer_difference=12,
+                    corner_threshold=int(32 + corners * 32),
+                    length_threshold=5.0,
+                    splice_threshold=45,
+                    path_precision=4,
+                )
+                for ent in _parse_svg_paths_to_entities(svg_col, off_x, off_y, sx_mm, sy_mm, "Vector Layer"):
+                    pts = ent.get("points") or []
+                    if pts:
+                        xs = [p["x"] for p in pts]
+                        ys = [p["y"] for p in pts]
+                        if (max(xs) - min(xs)) >= span_w * 0.94 and (max(ys) - min(ys)) >= span_h * 0.94:
+                            continue
+                    entities.append(ent)
 
         if roi["has_bg"]:
             entities.insert(0, {
@@ -692,7 +765,7 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
                 "cornerRadius": 0,
                 "isClosed": True,
                 "color": "#22d3ee",
-                "fillColor": "#c29258",
+                "fillColor": None,
                 "strokeColor": "#22d3ee",
                 "width": 1.4,
                 "name": "Panel Perimeter Frame",
@@ -701,11 +774,38 @@ def handle_vectorize(req: dict[str, Any]) -> dict[str, Any]:
                 "toneTotal": 2,
                 "relief": {"enabled": False, "shape": "flat", "heightMm": 0.4, "radiusMm": 1.0, "mode": "max"},
             })
+    elif not is_engraved_wood_plaque:
+        den_c = cv2.fastNlMeansDenoisingColored(sub, None, 5, 5, 7, 21)
+        ok_c, png_c = cv2.imencode(".png", den_c)
+        if not ok_c:
+            raise RuntimeError("Failed encoding denoised PNG for VTracer")
+        svg_col = vtracer.convert_raw_image_to_svg(
+            bytes(png_c),
+            img_format="png",
+            colormode="color",
+            hierarchical="stacked",
+            mode="spline",
+            filter_speckle=max(12, int(36 - detail * 18)),
+            color_precision=min(7, max(4, int(round(color_count * 0.7)))),
+            layer_difference=max(5, int(18 - color_count)),
+            corner_threshold=int(32 + corners * 32),
+            length_threshold=5.0,
+            splice_threshold=45,
+            path_precision=4,
+        )
+        raw_ents = _parse_svg_paths_to_entities(svg_col, off_x, off_y, sx_mm, sy_mm, "Vector Layer")
+        for ent in raw_ents:
+            if ignore_bg and ent["points"]:
+                xs = [p["x"] for p in ent["points"]]
+                ys = [p["y"] for p in ent["points"]]
+                if (max(xs) - min(xs)) >= span_w * 0.94 and (max(ys) - min(ys)) >= span_h * 0.94:
+                    continue
+            entities.append(ent)
 
     return {
         "ok": True,
         "engine": "opencv-vtracer-vision",
-        "entities": entities[:820],
+        "entities": entities[:1100],
         "roi": None if roi is None else {"x0": x0, "y0": y0, "x1": x1, "y1": y1, "has_bg": roi["has_bg"]},
     }
 
